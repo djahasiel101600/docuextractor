@@ -3,10 +3,16 @@
 # All containers join the shared external "jdp-network" (created once by
 # scripts/deploy/setup-ubuntu.sh) so they can reach other services already on it.
 # Your Cloudflare Tunnel already runs on the host and is attached to that same
-# network, so it reaches the app at http://frontend:80 internally. This project
-# therefore exposes NO host ports: the backend is reached only by the frontend
-# nginx (which proxies /api, /admin and /static), and the frontend only by the
-# tunnel, both over jdp-network.
+# network, so it reaches the app at http://docuextract-frontend:80 internally.
+# This project therefore exposes NO host ports: the backend is reached only by
+# the frontend nginx (which proxies /api, /admin and /static), and the frontend
+# only by the tunnel, both over jdp-network.
+#
+# Service names are prefixed with 'docuextract-' on purpose: jdp-network is
+# SHARED with many other projects, and Compose publishes each service name as a
+# network-scoped DNS alias. Generic names like 'frontend'/'backend'/'db' would
+# collide with other stacks (e.g. freeshow already owns the 'frontend' alias),
+# so every name here is unique to this project.
 #
 # Secrets and tuning live in .env (see .env.example). Compose interpolates ${...}
 # from .env and the `env_file` entries pass them into the containers.
@@ -14,7 +20,7 @@
 name: docuextract
 
 services:
-  db:
+  docuextract-db:
     image: postgres:17-alpine
     restart: unless-stopped
     networks:
@@ -32,7 +38,7 @@ services:
       retries: 10
       start_period: 15s
 
-  backend:
+  docuextract-backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -42,20 +48,21 @@ services:
       - jdp-network
     env_file:
       - .env
-    # DATABASE_URL must point at the "db" service, e.g.
-    #   postgres://USER:PASSWORD@db:5432/DBNAME   (URL-encode any special chars)
+    # DATABASE_URL must point at the "docuextract-db" service, e.g.
+    #   postgres://USER:PASSWORD@docuextract-db:5432/DBNAME  (URL-encode specials)
     # DB_SSL_REQUIRE=false because Postgres is reached over the private network.
     volumes:
       - docuextract-storage:/app/storage
     # Apply migrations (preserving existing rows) then hand off to Gunicorn.
-    # $$ lets the container shell read GUNICORN_WORKERS from env_file at runtime.
-    command: >
-      sh -c "python manage.py migrate --noinput &&
-             exec gunicorn config.wsgi:application
-             --bind 0.0.0.0:8000
-             --workers $${GUNICORN_WORKERS:-3}
-             --timeout 120
-             --access-logfile - --error-logfile -"
+    # Written as a LIST so the whole `sh -c` payload stays on one line. A folded
+    # block scalar (command: >) would turn these indented continuation lines into
+    # literal newlines, dropping the gunicorn flags after `exec` and leaving it
+    # bound to 127.0.0.1 (nginx would then 502). $$ escapes compose interpolation
+    # so the container shell reads GUNICORN_WORKERS from env_file at runtime.
+    command:
+      - sh
+      - -c
+      - python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${GUNICORN_WORKERS:-3} --timeout 120 --access-logfile - --error-logfile -
     healthcheck:
       # /api/ is the app's health endpoint: 200 when the DB is reachable, 503 otherwise.
       test: [ "CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/api/', timeout=5)" ]
@@ -64,10 +71,10 @@ services:
       retries: 5
       start_period: 40s
     depends_on:
-      db:
+      docuextract-db:
         condition: service_healthy
 
-  frontend:
+  docuextract-frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
@@ -77,9 +84,9 @@ services:
     restart: unless-stopped
     networks:
       - jdp-network
-    # No `ports:` mapping. An already-running Cloudflare Tunnel on jdp-network
-    # reaches this service internally at http://frontend:80, so nothing is bound
-    # to a host interface.
+    # No `ports:` mapping. Your already-running Cloudflare Tunnel on jdp-network
+    # reaches this service internally at http://docuextract-frontend:80, so
+    # nothing is bound to a host interface.
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1/" ]
       interval: 30s
@@ -87,7 +94,7 @@ services:
       retries: 3
       start_period: 10s
     depends_on:
-      backend:
+      docuextract-backend:
         condition: service_healthy
 
 networks:
