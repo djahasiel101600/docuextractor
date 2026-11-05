@@ -2,8 +2,11 @@
 #
 # All containers join the shared external "jdp-network" (created once by
 # scripts/deploy/setup-ubuntu.sh) so they can reach other services already on it.
-# Only the Cloudflare Tunnel reaches the internet; the app is served by the
-# frontend container, which proxies /api, /admin and /static to the backend.
+# Your Cloudflare Tunnel already runs on the host and is attached to that same
+# network, so it reaches the app at http://frontend:80 internally. This project
+# therefore exposes NO host ports: the backend is reached only by the frontend
+# nginx (which proxies /api, /admin and /static), and the frontend only by the
+# tunnel, both over jdp-network.
 #
 # Secrets and tuning live in .env (see .env.example). Compose interpolates ${...}
 # from .env and the `env_file` entries pass them into the containers.
@@ -74,10 +77,9 @@ services:
     restart: unless-stopped
     networks:
       - jdp-network
-    # Loopback-only host mapping for local smoke tests (curl 127.0.0.1:8080).
-    # Cloudflare Tunnel talks to this service over jdp-network, not the host port.
-    ports:
-      - "127.0.0.1:8080:80"
+    # No `ports:` mapping. An already-running Cloudflare Tunnel on jdp-network
+    # reaches this service internally at http://frontend:80, so nothing is bound
+    # to a host interface.
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1/" ]
       interval: 30s
@@ -86,20 +88,6 @@ services:
       start_period: 10s
     depends_on:
       backend:
-        condition: service_healthy
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    networks:
-      - jdp-network
-    # Token-based tunnel (configure the tunnel + public hostname -> http://frontend:80
-    # in the Cloudflare Zero Trust dashboard). No inbound ports are ever opened.
-    command: tunnel --no-autoupdate
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env}
-    depends_on:
-      frontend:
         condition: service_healthy
 
 networks:

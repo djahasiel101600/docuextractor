@@ -77,7 +77,7 @@ fi
 if [[ ! -f .env ]]; then
   log "No .env found — creating from .env.example. EDIT IT before continuing."
   cp .env.example .env
-  err "Edit $REPO_ROOT/.env (secrets, domain, tunnel token), then re-run this script."
+  err "Edit $REPO_ROOT/.env (secrets, DB URL, CORS origins), then re-run this script."
   exit 1
 fi
 
@@ -90,7 +90,7 @@ require_env() {
     replace-with-*|change-this-*) err "$key still has a placeholder value ('$value')"; exit 1 ;;
   esac
 }
-for key in DJANGO_SECRET_KEY POSTGRES_PASSWORD DATABASE_URL CORS_ALLOWED_ORIGINS CLOUDFLARE_TUNNEL_TOKEN; do
+for key in DJANGO_SECRET_KEY POSTGRES_PASSWORD DATABASE_URL CORS_ALLOWED_ORIGINS; do
   require_env "$key"
 done
 log ".env passed the placeholder check."
@@ -113,22 +113,27 @@ done
 docker compose ps
 
 # --- 5. Smoke test through the frontend proxy --------------------------------
-log "Smoke test: frontend -> /api/ -> backend (via loopback:8080)"
-if curl -fsS http://127.0.0.1:8080/api/ >/dev/null; then
-  log "OK: /api/ proxied successfully. Public URL should work once the tunnel is active."
+# Verify the reverse-proxy chain from *inside* the frontend container rather than
+# by re-mapping a host port (the design intent is that ports stay unpublished).
+log "Smoke test: frontend nginx -> /api/ -> backend (checked inside the frontend container)"
+if docker compose exec -T frontend wget -qO- http://127.0.0.1/api/ >/dev/null; then
+  log "OK: nginx proxies /api/ to the backend successfully."
 else
   err "The /api/ proxy check failed. Inspect: docker compose logs backend frontend"
 fi
 
 PUBLIC_HOSTNAME="$(grep -E '^PUBLIC_HOSTNAME=' .env | cut -d= -f2- || true)"
-log "Done."
+log "Done. Services are reachable only through the existing Cloudflare Tunnel on ${NETWORK_NAME}."
 cat <<EOF
 
 Next steps:
-  * In Cloudflare Zero Trust -> Networks -> Tunnels, confirm your tunnel's
-    Public Hostname maps ${PUBLIC_HOSTNAME:-your hostname} -> HTTP://frontend:80
-    (the 'frontend' service on ${NETWORK_NAME}).
-  * Verify from the internet:  curl -I https://${PUBLIC_HOSTNAME:-your-hostname}/
-  * Stream logs:  docker compose logs -f backend cloudflared
-  * Apply updates later:  git pull && sudo bash scripts/deploy/setup-ubuntu.sh --no-install
+  * In Cloudflare Zero Trust -> Networks -> Tunnels, add a Public Hostname that
+    maps ${PUBLIC_HOSTNAME:-your-hostname} -> HTTP://frontend:80, choosing the
+    tunnel that is already attached to the ${NETWORK_NAME} Docker network.
+    (The compose file exports no host port; the tunnel resolves the service name
+    'frontend' via Docker's embedded DNS, exactly like 'backend' and 'db'.)
+  * Verify from the internet:  curl -I https://${PUBLIC_HOSTNAME:-your-hostname}/api/
+    (expect a JSON health response from the backend).
+  * Stream logs:  docker compose logs -f backend
+  * Apply updates later:  git pull && docker compose up -d --build
 EOF

@@ -153,16 +153,15 @@ Generated files are not served from a public static directory. The API only stre
 
 ## Deploying to Ubuntu + Docker (Cloudflare Tunnel)
 
-The production stack runs as four containers on a shared external Docker network named `jdp-network`:
+The production stack runs as three containers on a shared external Docker network named `jdp-network`:
 
 | Service | Image | Role |
 | --- | --- | --- |
 | `db` | `postgres:17-alpine` | Primary database (private volume, never exposed). |
 | `backend` | `Dockerfile.backend` | Django + DRF under Gunicorn; static files served with WhiteNoise. |
 | `frontend` | `Dockerfile.frontend` | nginx serving the built SPA and reverse-proxying `/api`, `/admin`, `/static` to `backend`. |
-| `cloudflared` | `cloudflare/cloudflared` | Outbound-only Cloudflare Tunnel to your domain; opens no inbound ports. |
 
-Only the tunnel reaches the internet. The tunnel's public hostname points at `http://frontend:80`; nginx then serves the SPA and forwards API/admin traffic to the backend over `jdp-network`. Uploaded PDFs persist on the `docuextract-storage` volume and Postgres data on `docuextract-postgres`, so both survive restarts and redeploys.
+This project exposes **no host ports**. Your Cloudflare Tunnel already runs on the host and is attached to `jdp-network`, so it reaches the app at `http://frontend:80` internally; nginx then serves the SPA and forwards API/admin traffic to the backend over the same network. Uploaded PDFs persist on the `docuextract-storage` volume and Postgres data on `docuextract-postgres`, so both survive restarts and redeploys.
 
 ### One-time server setup
 
@@ -171,7 +170,7 @@ Only the tunnel reaches the internet. The tunnel's public hostname points at `ht
 sudo bash scripts/deploy/setup-ubuntu.sh
 ```
 
-The script installs Docker + the Compose plugin, creates `jdp-network` if it does not already exist, copies `.env.example` to `.env`, refuses to start until every placeholder secret is replaced, then builds and starts the stack and runs a loopback smoke test of the `/api` proxy.
+The script installs Docker + the Compose plugin, creates `jdp-network` if it does not already exist, copies `.env.example` to `.env`, refuses to start until every placeholder secret is replaced, then builds and starts the stack and verifies the `/api` proxy from inside the frontend container (no port is opened on the host).
 
 ### Configuration
 
@@ -180,13 +179,10 @@ All runtime configuration is read from `.env` (git-ignored). Fill in `.env` foll
 - `DJANGO_DEBUG=false` and a strong `DJANGO_SECRET_KEY`.
 - `DATABASE_URL=postgres://USER:PASSWORD@db:5432/DBNAME` (the `db` service name) and `DB_SSL_REQUIRE=false` (Postgres is reached on the private network, not over TLS).
 - `DJANGO_ALLOWED_HOSTS` and `CORS_ALLOWED_ORIGINS` must both list the public origin (e.g. `https://app.example.com`). Because the browser sends an `Origin` header even for same-origin writes, `LocalApiOriginMiddleware` rejects the API if the public origin is missing from `CORS_ALLOWED_ORIGINS`.
-- `CLOUDFLARE_TUNNEL_TOKEN` from the Cloudflare Zero Trust dashboard.
 
 ### Cloudflare Tunnel
 
-1. Zero Trust → Networks → Tunnels → create a tunnel and copy its token into `CLOUDFLARE_TUNNEL_TOKEN`.
-2. Add a **Public Hostname**: `app.example.com` → service `HTTP://frontend:80`. The hostname resolves to the `frontend` container because `cloudflared` shares `jdp-network` with it.
-3. No router/port forwarding is required — the tunnel is outbound-only.
+Your Cloudflare Tunnel already runs on this server and is joined to `jdp-network`, so nothing is added to the compose file for it. In the Cloudflare Zero Trust dashboard, add (or point) a **Public Hostname** on that existing tunnel to service `HTTP://frontend:80`. The name `frontend` resolves to this stack's container via `jdp-network`'s embedded DNS. No router/port forwarding is required — the tunnel is outbound-only and this project opens no host ports.
 
 ### Updating a deployment
 
@@ -202,11 +198,10 @@ Migrations run automatically on backend startup and preserve existing rows.
 ```bash
 docker compose ps                 # health of each service
 docker compose logs -f backend    # extraction / API logs
-docker compose logs -f cloudflared# tunnel connectivity
 docker compose exec backend python manage.py createsuperuser
 ```
 
-See the [Security notes](#security-notes) below for hardening already applied (non-root backend, loopback-only host port, persistent volumes, health-gated startup order).
+See the [Security notes](#security-notes) below for hardening already applied (non-root backend, no published host ports, persistent volumes, health-gated startup order).
 
 ## Troubleshooting
 
