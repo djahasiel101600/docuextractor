@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "DocuExtract: Start frontend and backend",
+      "type": "npm",
+      "script": "dev:full",
+      "problemMatcher": []
+    },
+    {
+      "label": "DocuExtract: Apply database migrations",
+      "type": "npm",
+      "script": "db:migrate",
+      "problemMatcher": []
+    },
+    {
+      "label": "DocuExtract: Run backend tests",
+      "type": "npm",
+      "script": "test:backend",
+      "problemMatcher": []
+    },
+    {
+      "label": "DocuExtract: Build frontend",
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "name": "DocuExtract - Bulk PDF Data Extraction & Reconciliation System",
+  "description": "Local React and Django application for PDF extraction, OCR, validation, diagnostics, and CSV reporting."
+}

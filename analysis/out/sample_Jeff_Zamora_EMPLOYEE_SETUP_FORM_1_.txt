@@ -1,0 +1,88 @@
+EMPLOYEE SETUP SHEET
+Deductions
+Federal Tax Info 
+Filing Status 
+ Married            Single
+Allowances
+Additional Withholding Amount
+$
+Other Rate
+$ Per Hour/Pay Period
+Overtime Rate
+$
+Pay Information
+      Hourly
+      Salary 
+Employee Type                
+      Full Time 
+     Temporary
+      1099  
+     Part Time
+Pay Type
+     Check
+     Direct Deposit
+Employee Status                
+      Active  
+      Terminated
+      New Hire 
+       Inactive
+State Tax Info 
+Filing Status 
+ Married             
+ 
+Single
+ 
+ 
+  Head of Household            Other
+Income Tax Filing State
+Unemployment Filing State
+Allowances
+Additional Withholding Amount $
+     Checking             Savings
+     Checking             Savings
+     Checking             Savings
+Address  
+ 
+ 
+ 
+ 
+City 
+ 
+ 
+State 
+ 
+ 
+Zip
+Direct Deposit Information
+Last Name
+Email Address
+SSN#
+Hire Date
+DOB
+First Name
+Company Name
+Gender
+      Male
+      Female 
+$ or %*
+Routing Number  (9 digits)
+Account Number
+Bank Name
+Deduction Name
+Amount / $ or %
+*With ﬁ xed dollar amount or percentage, the “remainder” will be deposited into the last account entered.
+Department Code
+(optional)
+Regular Pay Rate
+$Per Hour   
+or Salary/Pay Period
+Jeff
+Zamora
+Spotter.ai
+07/12/93
+jeppzamora@gmail.c
+Cavite,Philippines
+Trece Martir
+Cavite
+4109
+$220/week

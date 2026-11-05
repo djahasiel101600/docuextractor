@@ -1,0 +1,36 @@
+# Version control / editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Secrets — never bake these into an image. Config arrives via docker compose
+# env_file (.env on the host) at runtime, not from the build context.
+.env
+.env.*
+
+# Node / build artifacts (reinstalled/regenerated inside the image)
+node_modules
+dist
+build
+coverage
+*.log
+
+# Python virtualenvs and caches (deps are installed from requirements.txt)
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Runtime data that must live on a mounted volume, not in the image
+storage
+
+# Local analysis scratch output
+analysis/out
+
+# OS cruft
+.DS_Store

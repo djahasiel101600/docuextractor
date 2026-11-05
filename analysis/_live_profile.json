@@ -1,0 +1,87 @@
+﻿{
+    "id":  "profile-hr-applications",
+    "name":  "Employment \u0026 HR Candidate Onboarding",
+    "description":  "Rules for extracting candidate resumes and onboarding declarations from standard HR form templates.",
+    "version":  "1.0.0",
+    "fields":  [
+                   {
+                       "id":  "candidate_name",
+                       "name":  "Candidate Name",
+                       "label":  "Candidate Name",
+                       "description":  "Full legal name of candidate.",
+                       "type":  "text",
+                       "required":  true,
+                       "filenameRules":  {
+                                             "enabled":  true,
+                                             "patterns":  [
+                                                              "^(.+?)_W[56789]\\.pdf$"
+                                                          ],
+                                             "captureGroup":  1,
+                                             "caseInsensitive":  true
+                                         },
+                       "contentRules":  {
+                                            "enabled":  true,
+                                            "labels":  [
+                                                           "Name of individual who is the beneficial owner"
+                                                       ],
+                                            "positionHint":  "after_label"
+                                        },
+                       "priority":  "pdf_first",
+                       "normalization":  {
+                                             "trim":  true,
+                                             "caseTransform":  "titlecase",
+                                             "removeExtraSpaces":  true
+                                         },
+                       "validation":  {
+                                          "minLength":  3
+                                      }
+                   },
+                   {
+                       "id":  "field_1793589323133",
+                       "name":  "Permanent Address",
+                       "label":  "New Field",
+                       "type":  "address",
+                       "required":  false,
+                       "filenameRules":  {
+                                             "enabled":  false,
+                                             "patterns":  [
+
+                                                          ],
+                                             "captureGroup":  1,
+                                             "caseInsensitive":  true
+                                         },
+                       "contentRules":  {
+                                            "enabled":  true,
+                                            "labels":  [
+                                                           "Permanent residence addressPermanent residence address (street apt. or suite no. or rural route). Do not use a P.O. box or in-care-of address."
+                                                       ],
+                                            "positionHint":  "after_label"
+                                        },
+                       "priority":  "pdf_first",
+                       "normalization":  {
+                                             "trim":  true,
+                                             "caseTransform":  "none",
+                                             "removeExtraSpaces":  true
+                                         },
+                       "validation":  {
+
+                                      }
+                   }
+               ],
+    "aiSettings":  {
+                       "enabled":  true,
+                       "baseUrl":  "http://127.0.0.1:11434",
+                       "model":  "beam:cloud",
+                       "timeoutSeconds":  120,
+                       "allowCloudModels":  true
+                   },
+    "ocrSettings":  {
+                        "enabledFallback":  true,
+                        "autoDetectScanned":  true,
+                        "minTextLengthThreshold":  50,
+                        "language":  "eng",
+                        "quality":  "standard"
+                    },
+    "createdAt":  "2026-11-02T02:22:24.756771Z",
+    "updatedAt":  "2026-11-03T10:32:04.801124Z"
+}

@@ -1,0 +1,112 @@
+# DocuExtract production stack for Ubuntu + Docker.
+#
+# All containers join the shared external "jdp-network" (created once by
+# scripts/deploy/setup-ubuntu.sh) so they can reach other services already on it.
+# Only the Cloudflare Tunnel reaches the internet; the app is served by the
+# frontend container, which proxies /api, /admin and /static to the backend.
+#
+# Secrets and tuning live in .env (see .env.example). Compose interpolates ${...}
+# from .env and the `env_file` entries pass them into the containers.
+
+name: docuextract
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    networks:
+      - jdp-network
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - docuextract-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: docuextract-backend
+    restart: unless-stopped
+    networks:
+      - jdp-network
+    env_file:
+      - .env
+    # DATABASE_URL must point at the "db" service, e.g.
+    #   postgres://USER:PASSWORD@db:5432/DBNAME   (URL-encode any special chars)
+    # DB_SSL_REQUIRE=false because Postgres is reached over the private network.
+    volumes:
+      - docuextract-storage:/app/storage
+    # Apply migrations (preserving existing rows) then hand off to Gunicorn.
+    # $$ lets the container shell read GUNICORN_WORKERS from env_file at runtime.
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             exec gunicorn config.wsgi:application
+             --bind 0.0.0.0:8000
+             --workers $${GUNICORN_WORKERS:-3}
+             --timeout 120
+             --access-logfile - --error-logfile -"
+    healthcheck:
+      # /api/ is the app's health endpoint: 200 when the DB is reachable, 503 otherwise.
+      test: [ "CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/api/', timeout=5)" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    image: docuextract-frontend
+    restart: unless-stopped
+    networks:
+      - jdp-network
+    # Loopback-only host mapping for local smoke tests (curl 127.0.0.1:8080).
+    # Cloudflare Tunnel talks to this service over jdp-network, not the host port.
+    ports:
+      - "127.0.0.1:8080:80"
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://127.0.0.1/" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    networks:
+      - jdp-network
+    # Token-based tunnel (configure the tunnel + public hostname -> http://frontend:80
+    # in the Cloudflare Zero Trust dashboard). No inbound ports are ever opened.
+    command: tunnel --no-autoupdate
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env}
+    depends_on:
+      frontend:
+        condition: service_healthy
+
+networks:
+  # Pre-existing shared network that already connects Postgres / Tunnel infra.
+  jdp-network:
+    external: true
+
+volumes:
+  docuextract-postgres:
+  docuextract-storage:

@@ -1,0 +1,52 @@
+# DocuExtract backend: Django 5.2 + DRF served by Gunicorn, static via WhiteNoise.
+# Build context is the repository root, e.g.:
+#   docker build -f Dockerfile.backend -t docuextract-backend .
+FROM python:3.13-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Runtime system deps:
+#  - tesseract-ocr + language packs for the OCR fallback (matches README: apt install tesseract-ocr)
+#  - libglib2.0-0 / fontconfig keep PyMuPDF + Pillow happy for raster rendering
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    fontconfig \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backend
+
+# Install Python dependencies first for better layer caching.
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install -r requirements.txt
+
+# Application source.
+COPY backend/ ./
+
+# Create the persistent storage dir owned by the unprivileged runtime user,
+# then collect static files. DJANGO_DEBUG=true is used only for this build step
+# so collectstatic runs without production secrets / a live database.
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --home-dir /app --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/storage \
+    && DJANGO_DEBUG=true python manage.py collectstatic --noinput \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+# OCR uses the system Tesseract on PATH; DOCUEXTRACT_STORAGE_DIR matches the
+# volume mounted in docker-compose. TESSERACT_CMD is intentionally unset so
+# pytesseract resolves `tesseract` from PATH inside the container.
+ENV DJANGO_SETTINGS_MODULE=config.settings \
+    DOCUEXTRACT_STORAGE_DIR=/app/storage
+
+EXPOSE 8000
+
+# Serve over the internal Docker network only. Gunicorn worker count is tuned
+# via GUNICORN_WORKERS in .env. Timeouts are generous for large PDF work.
+CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers ${GUNICORN_WORKERS:-3} --timeout 120 --access-logfile - --error-logfile -"]
