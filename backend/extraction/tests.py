@@ -11,6 +11,7 @@ import fitz
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import override_settings
+from django.test import SimpleTestCase
 from PIL import Image
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
@@ -20,7 +21,9 @@ from .services.document_extraction import (
     _choose_content_candidate,
     _drop_duplicate_form_widgets,
     _needs_selective_ai_review,
+    _normalize_ocrspace_lines,
     _ocr_pdf,
+    _ocr_pdf_ocrspace,
     process_pdf,
 )
 from .services.job_processing import process_job
@@ -1794,6 +1797,201 @@ def create_blank_form_pdf():
             ("ssn_field", "", (70, 132, 160, 148)),
         ],
     )
+
+
+class OcrSpaceFallbackTests(SimpleTestCase):
+    """Opt-in OCR.space cloud OCR fallback (parse, pipeline, priority, gating)."""
+
+    def _blank_scan_pdf(self):
+        document = fitz.open()
+        document.new_page()
+        pdf_bytes = document.tobytes()
+        document.close()
+        return pdf_bytes
+
+    def _profile(self):
+        profile = copy.deepcopy(PROFILE)
+        profile["ocrSettings"].update(
+            {"enabledFallback": True, "autoDetectScanned": True}
+        )
+        return profile
+
+    def _ocr_space_page(self):
+        return {
+            "pageNumber": 1,
+            "rawText": "Full Name: Jane Doe",
+            "lines": ["Full Name: Jane Doe"],
+            "words": [
+                {"text": "Full", "x0": 72, "y0": 60,
+                    "x1": 90, "y1": 72, "confidence": 0.9},
+                {"text": "Name:", "x0": 92, "y0": 60,
+                    "x1": 118, "y1": 72, "confidence": 0.9},
+                {"text": "Jane", "x0": 122, "y0": 60,
+                    "x1": 147, "y1": 72, "confidence": 0.9},
+                {"text": "Doe", "x0": 150, "y0": 60,
+                    "x1": 175, "y1": 72, "confidence": 0.9},
+            ],
+            "width": 612,
+            "height": 792,
+        }
+
+    def test_normalize_ocrspace_lines_parses_words_confidence_and_boxes(self):
+        payload = [
+            {"words": [
+                {"text": "Full", "confidence": "95",
+                    "scale": [72, 60, 90, 72]},
+                {"text": "Jane", "confidence": 80,
+                    "scale": [122, 60, 147, 72]},
+            ]}
+        ]
+
+        line_texts, words = _normalize_ocrspace_lines(payload)
+
+        self.assertEqual(line_texts, ["Full Jane"])
+        self.assertEqual(words[0]["text"], "Full")
+        self.assertEqual(words[0]["confidence"], 0.95)
+        self.assertEqual(words[0]["scale"], [72, 60, 90, 72])
+        self.assertEqual(words[1]["confidence"], 0.8)
+
+    def test_normalize_ocrspace_lines_is_fail_open_on_unexpected_shapes(self):
+        for bad in (None, 123, {}, "plain text\nsecond line"):
+            line_texts, words = _normalize_ocrspace_lines(bad)
+            self.assertIsInstance(line_texts, list)
+            self.assertIsInstance(words, list)
+        # A plain string still yields usable lines and no word boxes.
+        line_texts, words = _normalize_ocrspace_lines("Full Name: Jane Doe")
+        self.assertEqual(line_texts, ["Full Name: Jane Doe"])
+        self.assertEqual(words, [])
+
+    def test_ocr_pdf_ocrspace_scales_boxes_to_pdf_points(self):
+        pdf_bytes = self._blank_scan_pdf()
+        payload = {
+            "ocredText": [
+                {"words": [
+                    {"text": "Full", "confidence": "90",
+                        "scale": [144, 120, 180, 144]},
+                    {"text": "Name:", "confidence": "90",
+                        "scale": [184, 120, 236, 144]},
+                    {"text": "Jane", "confidence": "90",
+                        "scale": [244, 120, 294, 144]},
+                    {"text": "Doe", "confidence": "90",
+                        "scale": [300, 120, 350, 144]},
+                ]}
+            ]
+        }
+
+        with patch(
+            "extraction.services.document_extraction._ocrspace_request",
+            return_value=payload,
+        ) as request:
+            pages = _ocr_pdf_ocrspace(
+                pdf_bytes, "eng", api_key="test-key", timeout=5
+            )
+
+        request.assert_called_once()
+        page = pages[0]
+        self.assertEqual(page["pageNumber"], 1)
+        # Default render scale is 2.0, so image pixels halve back to PDF points.
+        self.assertEqual(page["words"][0]["x0"], 72.0)
+        self.assertEqual(page["words"][0]["y0"], 60.0)
+        self.assertEqual(page["words"][0]["confidence"], 0.9)
+        self.assertIn("Full Name: Jane Doe", page["rawText"])
+
+    def test_ocr_space_candidate_answers_field_tesseract_missed(self):
+        profile = self._profile()
+        pdf_bytes = self._blank_scan_pdf()
+
+        with (
+            override_settings(
+                OCR_ENABLED=False,
+                OCR_SPACE_ENABLED=True,
+                OCR_SPACE_API_KEY="test-key",
+                OCR_SPACE_PRIORITY="after_ocr",
+            ),
+            patch(
+                "extraction.services.document_extraction._ocr_pdf_ocrspace",
+                return_value=[self._ocr_space_page()],
+            ) as run_ocrspace,
+        ):
+            extracted = process_pdf(pdf_bytes, "scan.pdf", profile)
+
+        run_ocrspace.assert_called_once()
+        self.assertEqual(extracted["finalValues"]["full_name"], "Jane Doe")
+        diagnostic = extracted["diagnostics"]["full_name"]
+        self.assertEqual(diagnostic["source"], "ocr_space")
+        self.assertEqual(diagnostic["status"], "OCR_SPACE_EXTRACTED")
+        self.assertEqual(diagnostic["ocrSpaceValue"], "Jane Doe")
+        self.assertIsNotNone(diagnostic["ocrSpaceConfidenceScore"])
+        self.assertGreater(diagnostic["ocrSpaceConfidenceScore"], 0.0)
+        self.assertIn("ocr_space", diagnostic["candidateScores"])
+        self.assertEqual(extracted["extractionMethodUsed"], "OCR_EXTRACTED")
+
+    def test_after_ocr_priority_prefers_tesseract_over_ocr_space(self):
+        field = copy.deepcopy(PROFILE["fields"][0])
+        ocr = ("Jane Doe", "Full Name:",
+               "Full Name: Jane Doe", 1, "layout_aware", 0.8)
+        ocr_space = (
+            "John Doe", "Full Name:", "Full Name: John Doe", 1,
+            "layout_aware", 0.95,
+        )
+
+        # OCR.space scores higher, yet after_ocr must keep local Tesseract.
+        selected, ambiguous, reason = _choose_content_candidate(
+            None, ocr, field, None, ocr_space, "after_ocr"
+        )
+        self.assertEqual(selected["source"], "ocr")
+        self.assertFalse(ambiguous)
+
+        # With no Tesseract result, the OCR.space fallback wins.
+        selected, _, _ = _choose_content_candidate(
+            None, None, field, None, ocr_space, "after_ocr"
+        )
+        self.assertEqual(selected["source"], "ocr_space")
+
+    def test_ocr_space_remote_failure_is_swallowed_and_job_continues(self):
+        profile = self._profile()
+        pdf_bytes = self._blank_scan_pdf()
+
+        with (
+            override_settings(
+                OCR_ENABLED=False,
+                OCR_SPACE_ENABLED=True,
+                OCR_SPACE_API_KEY="test-key",
+            ),
+            patch(
+                "extraction.services.document_extraction._ocr_pdf_ocrspace",
+                side_effect=RuntimeError("OCR.space returned HTTP 503."),
+            ),
+            patch(
+                "extraction.services.document_extraction.logger.warning",
+            ) as warn,
+        ):
+            extracted = process_pdf(pdf_bytes, "scan.pdf", profile)
+
+        warn.assert_called()
+        self.assertEqual(extracted["ocrSpaceError"],
+                         "OCR.space returned HTTP 503.")
+        self.assertFalse(extracted["finalValues"]["full_name"])
+        self.assertEqual(extracted["extractionMethodUsed"], "NATIVE_PDF_TEXT")
+
+    def test_ocr_space_not_invoked_when_disabled_or_key_missing(self):
+        profile = self._profile()
+        pdf_bytes = self._blank_scan_pdf()
+
+        for enabled, api_key in ((False, "test-key"), (True, "")):
+            with (
+                override_settings(
+                    OCR_ENABLED=False,
+                    OCR_SPACE_ENABLED=enabled,
+                    OCR_SPACE_API_KEY=api_key,
+                ),
+                patch(
+                    "extraction.services.document_extraction._ocr_pdf_ocrspace",
+                ) as run_ocrspace,
+            ):
+                process_pdf(pdf_bytes, "scan.pdf", profile)
+
+            run_ocrspace.assert_not_called()
 
 
 class BlankFormAuthoringTests(APITestCase):

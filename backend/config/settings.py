@@ -210,3 +210,26 @@ if TESSERACT_CMD:
     import pytesseract
 
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+# --- OCR.space cloud OCR fallback (opt-in) -----------------------------------
+# Offloads OCR to the free OCR.space API for CPU/RAM-constrained hosts. All
+# values are read from the environment only; the API key is never hardcoded.
+# Parsing is defensive so a malformed env value can never crash startup
+# (fail-open: default to disabled / sane numeric defaults).
+OCR_SPACE_ENABLED = os.getenv(
+    "OCR_SPACE_ENABLED", "false").strip().lower() == "true"
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "").strip()
+
+try:
+    OCR_SPACE_TIMEOUT_SECONDS = int(
+        os.getenv("OCR_SPACE_TIMEOUT_SECONDS", "30"))
+except (TypeError, ValueError):
+    OCR_SPACE_TIMEOUT_SECONDS = 30
+OCR_SPACE_TIMEOUT_SECONDS = max(1, min(OCR_SPACE_TIMEOUT_SECONDS, 300))
+
+# Where OCR.space sits in the candidate pipeline. "after_ocr" (default) runs it
+# only when local Tesseract failed or produced no/below-threshold text.
+OCR_SPACE_PRIORITY = os.getenv(
+    "OCR_SPACE_PRIORITY", "after_ocr").strip().lower()
+if OCR_SPACE_PRIORITY not in ("after_ocr", "before_ocr", "override"):
+    OCR_SPACE_PRIORITY = "after_ocr"

@@ -1,9 +1,16 @@
 from datetime import datetime
 from difflib import SequenceMatcher
 from functools import lru_cache
+from io import BytesIO
+import base64
+import json
+import logging
 import math
 import re
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import fitz
 import pytesseract
@@ -12,6 +19,11 @@ from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 from .ollama import extract_with_ollama
+
+logger = logging.getLogger(__name__)
+
+# Free OCR.space cloud OCR endpoint (opt-in fallback for constrained hosts).
+OCR_SPACE_PARSE_URL = "https://api.ocr.space/parse/image"
 
 SELECTIVE_AI_REVIEW_SCORE_THRESHOLD = 0.9
 # Minimum confidence a purely spatial (label->widget geometry) AcroForm match
@@ -373,6 +385,225 @@ def _ocr_pdf(
         if timings is not None:
             timings["pdf_rendering_ms"] = round(render_seconds * 1000, 3)
             timings["ocr_execution_ms"] = round(ocr_seconds * 1000, 3)
+        return pages
+    finally:
+        if owns_document:
+            document.close()
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse HTTP redirects so a base64 API key is never replayed to a
+    attacker-controlled redirect target (SSRF / credential-leak guard)."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _ocrspace_request(image_b64, *, api_key, timeout, language, url=OCR_SPACE_PARSE_URL):
+    """POST one base64 PNG page image to the OCR.space /parse endpoint.
+
+    Returns the decoded JSON object. Raises RuntimeError on any transport or
+    protocol failure (timeout, 4xx/5xx, malformed JSON); callers must treat
+    that as "remote OCR unavailable" and continue with other candidates."""
+    form = urlencode(
+        {
+            "apikey": api_key,
+            "base64Image": f"data:image/PNG;base64,{image_b64}",
+            "filetype": "PNG",
+            "language": language,
+            "OCREngine": "2",
+            "scale": "true",
+            "isTable": "true",
+            "detectOrientation": "true",
+        }
+    ).encode("utf-8")
+    request = Request(
+        url,
+        data=form,
+        headers={"Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        opener = build_opener(ProxyHandler({}), _NoRedirectHandler)
+        with opener.open(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise RuntimeError(f"OCR.space returned HTTP {exc.code}.") from exc
+    except (TimeoutError, URLError, OSError) as exc:
+        raise RuntimeError(f"OCR.space request failed: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "OCR.space returned a malformed JSON response.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("OCR.space returned an unexpected JSON payload.")
+    return data
+
+
+def _normalize_ocrspace_lines(payload):
+    """Convert an OCR.space ``ocredText`` payload into (line_texts, words).
+
+    ``words`` items are dicts ``{"text", "confidence" (0..1), "scale"}`` where
+    ``scale`` is ``[x1, y1, x2, y2]`` in image-pixel coordinates (or ``None``
+    when the response carried no boxes). Accepts several response shapes and
+    never raises, so a format change degrades to fewer candidates rather than
+    crashing extraction (fail-open)."""
+    line_texts = []
+    words = []
+    if isinstance(payload, str):
+        line_texts.extend(payload.splitlines())
+        return [t for t in line_texts if t.strip()], words
+    if not isinstance(payload, list):
+        return line_texts, words
+    for line in payload:
+        if isinstance(line, str):
+            if line.strip():
+                line_texts.append(line)
+            continue
+        if not isinstance(line, dict):
+            continue
+        raw_words = line.get("words") or line.get("textWords") or []
+        if isinstance(line.get("text"), str):
+            if line["text"].strip():
+                line_texts.append(line["text"])
+        elif isinstance(raw_words, list):
+            joined = " ".join(
+                str(word.get("text", "")).strip()
+                for word in raw_words
+                if isinstance(word, dict) and str(word.get("text", "")).strip()
+            )
+            if joined:
+                line_texts.append(joined)
+        if not isinstance(raw_words, list):
+            continue
+        for word in raw_words:
+            if not isinstance(word, dict):
+                continue
+            text = str(word.get("text", "")).strip()
+            if not text:
+                continue
+            conf = word.get("confidence", word.get("conf"))
+            try:
+                confidence = (
+                    max(0.0, min(1.0, float(conf) / 100))
+                    if conf is not None
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                confidence = 0.0
+            box = word.get("scale") or word.get(
+                "boundingBox") or word.get("box")
+            coords = None
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                try:
+                    coords = [float(value) for value in box]
+                except (TypeError, ValueError):
+                    coords = None
+            words.append(
+                {"text": text, "confidence": confidence, "scale": coords}
+            )
+    return line_texts, words
+
+
+def _ocr_pdf_ocrspace(
+    pdf_bytes,
+    language,
+    *,
+    document=None,
+    page_indices=None,
+    timings=None,
+    render_scale=2.0,
+    api_key=None,
+    timeout=None,
+):
+    """Render selected pages and OCR them through the OCR.space cloud API.
+
+    Returns page dicts in the SAME shape as ``_ocr_pdf`` (pageNumber, rawText,
+    lines, words[], width, height) so the downstream text index and label
+    matcher work unchanged. Records ``ocr_space_execution_ms`` in ``timings``.
+    Raises RuntimeError on transport failure; ``process_pdf`` converts that
+    into a logged warning plus fallback to the pre-existing candidates."""
+    if api_key is None:
+        api_key = settings.OCR_SPACE_API_KEY
+    if timeout is None:
+        timeout = settings.OCR_SPACE_TIMEOUT_SECONDS
+    if not api_key:
+        raise RuntimeError(
+            "OCR.space is enabled but no API key is configured.")
+    owns_document = document is None
+    if owns_document:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    ocr_seconds = 0.0
+    try:
+        selected_indices = (
+            page_indices
+            if page_indices is not None
+            else range(min(document.page_count, settings.MAX_PDF_PAGES))
+        )
+        for page_index in selected_indices:
+            page = document.load_page(page_index)
+            page_area = max(page.rect.width * page.rect.height, 1)
+            scale = min(
+                max(render_scale, 1.0),
+                3.0,
+                math.sqrt(20_000_000 / page_area),
+            )
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(scale, scale), alpha=False)
+            image = Image.frombytes(
+                "RGB", (pixmap.width, pixmap.height), pixmap.samples
+            )
+            image_width, image_height = image.size
+            image_buffer = BytesIO()
+            image.save(image_buffer, format="PNG")
+            image.close()
+            image_b64 = base64.b64encode(
+                image_buffer.getvalue()).decode("ascii")
+            ocr_started = time.perf_counter()
+            try:
+                data = _ocrspace_request(
+                    image_b64, api_key=api_key, timeout=timeout, language=language
+                )
+            finally:
+                ocr_seconds += time.perf_counter() - ocr_started
+            payload = data.get("ocredText")
+            if payload is None:
+                payload = data.get("OcrResponse") or data.get("ParsedResults")
+            line_texts, raw_words = _normalize_ocrspace_lines(payload)
+            scale_x = page.rect.width / image_width
+            scale_y = page.rect.height / image_height
+            words = []
+            for word in raw_words:
+                box = word.get("scale")
+                if not box:
+                    continue
+                x1, y1, x2, y2 = box
+                words.append(
+                    {
+                        "text": word["text"],
+                        "x0": x1 * scale_x,
+                        "y0": y1 * scale_y,
+                        "x1": x2 * scale_x,
+                        "y1": y2 * scale_y,
+                        "confidence": word["confidence"],
+                    }
+                )
+            page_lines = [text for text in line_texts if text.strip()]
+            if not page_lines and words:
+                page_lines = [" ".join(word["text"] for word in words)]
+            pages.append(
+                {
+                    "pageNumber": page_index + 1,
+                    "rawText": "\n".join(page_lines),
+                    "lines": page_lines,
+                    "words": words,
+                    "width": float(page.rect.width),
+                    "height": float(page.rect.height),
+                }
+            )
+        if timings is not None:
+            timings["ocr_space_execution_ms"] = round(ocr_seconds * 1000, 3)
         return pages
     finally:
         if owns_document:
@@ -1556,18 +1787,41 @@ def _score_text_candidate(candidate, field):
     return round(score, 3)
 
 
-def _choose_content_candidate(native_candidate, ocr_candidate, field, form_candidate=None):
+def _choose_content_candidate(
+    native_candidate,
+    ocr_candidate,
+    field,
+    form_candidate=None,
+    ocr_space_candidate=None,
+    ocr_space_priority="after_ocr",
+):
     candidates = []
     for source, candidate in (
         ("form_field", form_candidate),
         ("pdf_text", native_candidate),
         ("ocr", ocr_candidate),
+        ("ocr_space", ocr_space_candidate),
     ):
         score = _score_text_candidate(candidate, field)
         if score is not None:
             candidates.append(
                 {"source": source, "candidate": candidate, "score": score}
             )
+    # OCR.space is a cloud fallback whose position relative to local Tesseract
+    # is decided by priority so the two never compete for the same field:
+    # "after_ocr" keeps Tesseract, "before_ocr" keeps OCR.space, "override"
+    # lets both compete on evidence score.
+    has_ocr = any(item["source"] == "ocr" for item in candidates)
+    has_ocr_space = any(item["source"] == "ocr_space" for item in candidates)
+    if has_ocr and has_ocr_space:
+        if ocr_space_priority == "after_ocr":
+            candidates = [
+                item for item in candidates if item["source"] != "ocr_space"
+            ]
+        elif ocr_space_priority == "before_ocr":
+            candidates = [
+                item for item in candidates if item["source"] != "ocr"
+            ]
     if not candidates:
         return None, False, "No native-text, form-field, or OCR candidate was found."
     if len(candidates) == 1:
@@ -1686,6 +1940,7 @@ def process_pdf(pdf_bytes, filename, profile):
         "text_parsing_ms": 0.0,
         "pdf_rendering_ms": 0.0,
         "ocr_execution_ms": 0.0,
+        "ocr_space_execution_ms": 0.0,
         "ollama_model_check_ms": 0.0,
         "ollama_request_ms": 0.0,
         "ollama_queue_ms": 0.0,
@@ -1845,6 +2100,49 @@ def process_pdf(pdf_bytes, filename, profile):
             except pytesseract.TesseractError as exc:
                 ocr_error = f"OCR failed: {exc}"
 
+        # Opt-in OCR.space cloud fallback. Runs only when enabled and a key is
+        # present, over the same page set local OCR deemed worth reading, and is
+        # fully fail-open: any remote error is logged and swallowed so the job
+        # continues with the native/Tesseract candidates already gathered.
+        ocr_space_pages = []
+        ocr_space_index = None
+        ocr_space_error = ""
+        should_ocr_space = (
+            settings.OCR_SPACE_ENABLED
+            and bool(settings.OCR_SPACE_API_KEY)
+            and bool(ocr_page_indices)
+        )
+        timings["ocr_space_pages_selected"] = (
+            len(ocr_page_indices) if should_ocr_space else 0
+        )
+        if should_ocr_space:
+            try:
+                ocr_space_pages = _ocr_pdf_ocrspace(
+                    pdf_bytes,
+                    ocr_settings.get("language", "eng"),
+                    document=document,
+                    page_indices=ocr_page_indices,
+                    timings=timings,
+                    render_scale=(
+                        3.0 if ocr_settings.get("quality") == "high" else 2.0
+                    ),
+                )
+                parsing_started = time.perf_counter()
+                ocr_space_index = _build_text_index(
+                    ocr_space_pages, all_labels, label_similarity_threshold
+                )
+                timings["text_parsing_ms"] += round(
+                    (time.perf_counter() - parsing_started) * 1000, 3
+                )
+            except Exception as exc:  # noqa: BLE001 - fail-open cloud fallback
+                ocr_space_pages = []
+                ocr_space_index = None
+                ocr_space_error = str(exc)
+                logger.warning(
+                    "OCR.space fallback failed; continuing without remote OCR: %s",
+                    exc,
+                )
+
         ai_settings = profile.get("aiSettings", {})
         if not isinstance(ai_settings, dict):
             ai_settings = {}
@@ -1857,6 +2155,17 @@ def process_pdf(pdf_bytes, filename, profile):
                         field,
                         all_labels,
                         ocr_index,
+                        label_similarity_threshold,
+                    )
+        ocr_space_results = {}
+        if ocr_space_pages and ocr_space_index is not None:
+            for field in fields:
+                if field.get("contentRules", {}).get("enabled"):
+                    ocr_space_results[field["id"]] = _extract_from_text(
+                        ocr_space_pages,
+                        field,
+                        all_labels,
+                        ocr_space_index,
                         label_similarity_threshold,
                     )
         ai_values = {}
@@ -1916,13 +2225,22 @@ def process_pdf(pdf_bytes, filename, profile):
                 filename, field)
             native_candidate = native_results[field_id]
             ocr_candidate = ocr_results.get(field_id)
+            ocr_space_candidate = ocr_space_results.get(field_id)
             form_candidate = form_results.get(field_id)
             pdf_value = native_candidate[0]
             ocr_value = ocr_candidate[0] if ocr_candidate else None
+            ocr_space_value = (
+                ocr_space_candidate[0] if ocr_space_candidate else None
+            )
             form_value = form_candidate[0] if form_candidate else None
             content_candidate, content_ambiguous, selection_reason = (
                 _choose_content_candidate(
-                    native_candidate, ocr_candidate, field, form_candidate
+                    native_candidate,
+                    ocr_candidate,
+                    field,
+                    form_candidate,
+                    ocr_space_candidate,
+                    settings.OCR_SPACE_PRIORITY,
                 )
             )
             priority = field.get("priority", "pdf_first")
@@ -1935,7 +2253,12 @@ def process_pdf(pdf_bytes, filename, profile):
             elif filename_value and priority in ("strict_match", "consensus"):
                 comparable_candidates = [
                     candidate
-                    for candidate in (native_candidate, ocr_candidate, form_candidate)
+                    for candidate in (
+                        native_candidate,
+                        ocr_candidate,
+                        ocr_space_candidate,
+                        form_candidate,
+                    )
                     if candidate and candidate[0]
                 ]
                 normalized_filename = normalize_value(
@@ -1992,7 +2315,12 @@ def process_pdf(pdf_bytes, filename, profile):
             if form_value:
                 conventional_pool = (form_value, filename_value)
             else:
-                conventional_pool = (pdf_value, ocr_value, filename_value)
+                conventional_pool = (
+                    pdf_value,
+                    ocr_value,
+                    ocr_space_value,
+                    filename_value,
+                )
             conventional_values = [
                 value
                 for value in conventional_pool
@@ -2033,6 +2361,9 @@ def process_pdf(pdf_bytes, filename, profile):
             form_candidate_score = _score_text_candidate(
                 form_candidate, field
             )
+            ocr_space_candidate_score = _score_text_candidate(
+                ocr_space_candidate, field
+            )
             source = (
                 "manual"
                 if not raw_value
@@ -2040,7 +2371,7 @@ def process_pdf(pdf_bytes, filename, profile):
                 if selected_source
                 else "ai"
             )
-            used_ocr = used_ocr or source == "ocr"
+            used_ocr = used_ocr or source in ("ocr", "ocr_space")
             used_ai = used_ai or source == "ai"
             status = (
                 "AMBIGUOUS"
@@ -2053,6 +2384,10 @@ def process_pdf(pdf_bytes, filename, profile):
             )
             if value and source == "ocr" and not conflict:
                 status = "OCR_EXTRACTED"
+            if value and source == "ocr_space" and not conflict:
+                # Per-field diagnostic badge only; the document-level enum stays
+                # OCR_EXTRACTED (via used_ocr) so no model migration is needed.
+                status = "OCR_SPACE_EXTRACTED"
             if value and source == "ai" and not conflict:
                 status = "AI_EXTRACTED"
             if value and status == "MATCHED" and source == "filename":
@@ -2091,6 +2426,7 @@ def process_pdf(pdf_bytes, filename, profile):
                 "filenameValue": filename_value,
                 "pdfValue": pdf_value,
                 "ocrValue": ocr_value,
+                "ocrSpaceValue": ocr_space_value,
                 "formValue": form_value,
                 "aiValue": ai_value,
                 "aiEvidence": ai_evidence,
@@ -2127,6 +2463,9 @@ def process_pdf(pdf_bytes, filename, profile):
                 "ocrConfidenceScore": (
                     ocr_candidate[5] if ocr_candidate else None
                 ),
+                "ocrSpaceConfidenceScore": (
+                    ocr_space_candidate[5] if ocr_space_candidate else None
+                ),
                 "formConfidenceScore": (
                     form_candidate[5] if form_candidate else None
                 ),
@@ -2137,6 +2476,12 @@ def process_pdf(pdf_bytes, filename, profile):
                 "pdfPageNumber": native_candidate[3],
                 "ocrEvidence": ocr_candidate[2] if ocr_candidate else None,
                 "ocrPageNumber": ocr_candidate[3] if ocr_candidate else None,
+                "ocrSpaceEvidence": (
+                    ocr_space_candidate[2] if ocr_space_candidate else None
+                ),
+                "ocrSpacePageNumber": (
+                    ocr_space_candidate[3] if ocr_space_candidate else None
+                ),
                 "formEvidence": form_candidate[2] if form_candidate else None,
                 "formPageNumber": form_candidate[3] if form_candidate else None,
                 "aiPageNumber": ai_page_number,
@@ -2146,6 +2491,7 @@ def process_pdf(pdf_bytes, filename, profile):
                         ("form_field", form_candidate_score),
                         ("pdf_text", pdf_candidate_score),
                         ("ocr", ocr_candidate_score),
+                        ("ocr_space", ocr_space_candidate_score),
                     )
                     if score is not None
                 },
@@ -2184,6 +2530,7 @@ def process_pdf(pdf_bytes, filename, profile):
             else "NATIVE_PDF_TEXT"
         ),
         "ocrError": ocr_error,
+        "ocrSpaceError": ocr_space_error,
         "aiError": ai_error,
         "processingMetrics": timings,
     }
