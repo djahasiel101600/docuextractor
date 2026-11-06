@@ -21,6 +21,9 @@ import {
   Folder,
   Search,
   X,
+  History,
+  Gauge,
+  Clock,
 } from 'lucide-react';
 import {
   ExtractionProfile,
@@ -137,6 +140,74 @@ function groupUnsupportedFiles(items: DiscoveredFileItem[]): UnsupportedGroup[] 
     .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
 }
 
+// --- Processing time estimation (tunable heuristic) ------------------------
+// Rough wall-clock seconds per document per configured target field. Kept as
+// constants at the top of the component file so the estimate is easy to adjust
+// after real profiling. Very large archives will only ever get a rough figure.
+const ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MIN = 2;
+const ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MAX = 5;
+
+// --- "Re-use last archive" cache -------------------------------------------
+const ARCHIVE_CACHE_STORAGE_KEY = 'docuextract.lastArchiveMeta';
+
+interface ArchiveCacheMeta {
+  zipName: string;
+  pdfCount: number;
+  unsupportedCount: number;
+  corruptedCount: number;
+  totalBytes: number;
+  savedAt: number;
+}
+
+// The full result (including binary PDF data + the source blob) is kept in a
+// module-scoped variable so "Re-use last archive" restores instantly WITH
+// working processing fidelity across Step 1/Step 2 remounts (tab switches).
+// Blobs/ArrayBuffers cannot live in localStorage, so only a lightweight,
+// JSON-safe summary is mirrored there for display. If the summary is found but
+// the in-memory archive is gone (a hard refresh), the re-use affordance is
+// dropped and the user simply uploads again - a graceful, non-crashing fallback.
+let inMemoryArchiveCache: ArchiveDiscoveryResult | null = null;
+
+function sumPdfBytes(result: ArchiveDiscoveryResult): number {
+  return result.pdfFiles.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
+}
+
+function buildArchiveMeta(result: ArchiveDiscoveryResult): ArchiveCacheMeta {
+  return {
+    zipName: result.zipName,
+    pdfCount: result.pdfFiles.length,
+    unsupportedCount: result.unsupportedFiles.length,
+    corruptedCount: result.corruptedFiles.length,
+    totalBytes: sumPdfBytes(result),
+    savedAt: Date.now(),
+  };
+}
+
+function readArchiveMeta(): ArchiveCacheMeta | null {
+  try {
+    const raw = localStorage.getItem(ARCHIVE_CACHE_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as ArchiveCacheMeta) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeArchiveMeta(meta: ArchiveCacheMeta): void {
+  try {
+    localStorage.setItem(ARCHIVE_CACHE_STORAGE_KEY, JSON.stringify(meta));
+  } catch {
+    // Quota exceeded or storage disabled (private mode): safe to ignore.
+  }
+}
+
+function removeArchiveMeta(): void {
+  try {
+    localStorage.removeItem(ARCHIVE_CACHE_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export const JobSetupView: React.FC<JobSetupViewProps> = ({
   profiles,
   selectedProfileId,
@@ -156,6 +227,13 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
   const [filenameFilter, setFilenameFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
   const [showUnsupported, setShowUnsupported] = useState(false);
+  const [showInsights, setShowInsights] = useState(false);
+
+  // "Re-use last archive" state. The full object lives in a module-scoped
+  // cache (with binary data) for instant, processable restore; this component
+  // state mirrors it for reactive UI.
+  const [cachedArchive, setCachedArchive] = useState<ArchiveDiscoveryResult | null>(null);
+  const [cachedArchiveMeta, setCachedArchiveMeta] = useState<ArchiveCacheMeta | null>(null);
 
   // Debounce the applied filter ~200ms so fast typing does not thrash the list.
   useEffect(() => {
@@ -163,10 +241,47 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     return () => clearTimeout(handle);
   }, [filenameFilter]);
 
+  // On mount, react to whatever survived in memory. A stale localStorage
+  // summary from a previous page session (no binary in memory) is pruned so we
+  // never offer a re-use that cannot actually be processed.
+  useEffect(() => {
+    if (inMemoryArchiveCache) {
+      setCachedArchive(inMemoryArchiveCache);
+      setCachedArchiveMeta(
+        readArchiveMeta() ?? buildArchiveMeta(inMemoryArchiveCache)
+      );
+    } else {
+      removeArchiveMeta();
+    }
+  }, []);
+
   const resetDiscoveryViews = () => {
     setFilenameFilter('');
     setDebouncedFilter('');
     setShowUnsupported(false);
+    setShowInsights(false);
+  };
+
+  const rememberArchive = (result: ArchiveDiscoveryResult) => {
+    inMemoryArchiveCache = result;
+    const meta = buildArchiveMeta(result);
+    writeArchiveMeta(meta);
+    setCachedArchive(result);
+    setCachedArchiveMeta(meta);
+  };
+
+  const handleReuseArchive = () => {
+    if (!inMemoryArchiveCache) {
+      removeArchiveMeta();
+      setCachedArchive(null);
+      setCachedArchiveMeta(null);
+      setUnpackError(
+        'The previous archive is no longer available in this browser session. Please upload it again.'
+      );
+      return;
+    }
+    resetDiscoveryViews();
+    setArchiveResult(inMemoryArchiveCache);
   };
 
   const totalPdfCount = archiveResult?.pdfFiles.length ?? 0;
@@ -187,6 +302,34 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
 
   const activeProfile = profiles.find((p) => p.id === selectedProfileId) || profiles[0];
 
+  // Aggregate metrics + processing estimate for the Insights panel, computed
+  // entirely client-side from archiveResult (no network). Based on ALL PDFs in
+  // the archive, not the visually-filtered subset, since every PDF is processed.
+  const archiveStats = useMemo(() => {
+    const pdfs = archiveResult?.pdfFiles ?? [];
+    const count = pdfs.length;
+    let total = 0;
+    let min = Number.POSITIVE_INFINITY;
+    let max = 0;
+    pdfs.forEach((file) => {
+      const size = file.sizeBytes || 0;
+      total += size;
+      if (size < min) min = size;
+      if (size > max) max = size;
+    });
+    const fieldCount = activeProfile?.fields.length ?? 0;
+    return {
+      count,
+      total,
+      avg: count ? Math.round(total / count) : 0,
+      min: count ? min : 0,
+      max,
+      fieldCount,
+      minSeconds: count * fieldCount * ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MIN,
+      maxSeconds: count * fieldCount * ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MAX,
+    };
+  }, [archiveResult, activeProfile]);
+
   // Handle uploaded files (ZIP or loose PDFs)
   const handleFiles = async (files: FileList | File[]) => {
     if (!files || files.length === 0) return;
@@ -197,15 +340,16 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
       const firstFile = files[0];
       const isZip = firstFile.name.toLowerCase().endsWith('.zip');
 
+      let result: ArchiveDiscoveryResult;
       if (isZip) {
-        const result = await unpackZipArchive(firstFile, firstFile.name);
-        setArchiveResult(result);
+        result = await unpackZipArchive(firstFile, firstFile.name);
       } else {
         // Multiple loose PDF files
         const fileArray = Array.from(files);
-        const result = await collectLoosePdfFiles(fileArray);
-        setArchiveResult(result);
+        result = await collectLoosePdfFiles(fileArray);
       }
+      setArchiveResult(result);
+      rememberArchive(result);
       resetDiscoveryViews();
     } catch (err: unknown) {
       setUnpackError(err instanceof Error ? err.message : 'Failed to read uploaded archive');
@@ -223,6 +367,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
       const demoBlob = await createDemoZipArchive();
       const result = await unpackZipArchive(demoBlob, 'batch_2026_q1_civil_forms.zip');
       setArchiveResult(result);
+      rememberArchive(result);
       resetDiscoveryViews();
     } catch (err: unknown) {
       setUnpackError(err instanceof Error ? err.message : 'Failed to generate demo archive');
@@ -264,16 +409,34 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             </h3>
           </div>
 
-          {/* Quick Demo Button */}
-          <button
-            type="button"
-            onClick={handleLoadDemoArchive}
-            disabled={isUnpacking || isProcessing}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-neutral-800 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors border border-neutral-200"
-          >
-            <Sparkles className="w-3.5 h-3.5 text-neutral-700" />
-            <span>Load Realistic Demo Archive (8 PDFs)</span>
-          </button>
+          {/* Quick Demo Button + Re-use last archive */}
+          <div className="flex items-center gap-2">
+            {cachedArchive && (
+              <button
+                type="button"
+                onClick={handleReuseArchive}
+                disabled={isUnpacking || isProcessing}
+                title={
+                  cachedArchiveMeta
+                    ? `${cachedArchiveMeta.zipName} · ${cachedArchiveMeta.pdfCount} PDFs`
+                    : 'Re-use the last discovered archive'
+                }
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-neutral-800 bg-white hover:bg-neutral-100 rounded-md transition-colors border border-neutral-300"
+              >
+                <History className="w-3.5 h-3.5 text-neutral-600" />
+                <span>Re-use last archive</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleLoadDemoArchive}
+              disabled={isUnpacking || isProcessing}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-neutral-800 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors border border-neutral-200"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-neutral-700" />
+              <span>Load Realistic Demo Archive (8 PDFs)</span>
+            </button>
+          </div>
         </div>
 
         {/* Drag and Drop Dropzone */}
@@ -406,78 +569,158 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             )}
           </div>
 
-          {/* Unsupported (non-PDF) files: collapsible, grouped panel */}
-          {archiveResult.unsupportedFiles.length > 0 && (
-            <div className="border border-neutral-200 rounded-lg overflow-hidden">
-              <button
-                type="button"
-                onClick={() => setShowUnsupported((prev) => !prev)}
-                className="w-full flex items-center justify-between p-3 bg-amber-50/60 hover:bg-amber-50 transition-colors"
-                aria-expanded={showUnsupported}
-              >
-                <span className="flex items-center gap-2 text-xs font-semibold text-amber-800">
-                  {showUnsupported ? (
-                    <ChevronDown className="w-4 h-4" />
-                  ) : (
-                    <ChevronRight className="w-4 h-4" />
-                  )}
-                  <FileWarning className="w-4 h-4 text-amber-600" />
-                  <span>Review Unsupported Files</span>
-                  <span className="text-[11px] font-normal text-amber-700 bg-amber-100 border border-amber-200 rounded px-1.5 py-0.5">
-                    {archiveResult.unsupportedFiles.length} ignored
-                  </span>
-                </span>
-              </button>
+          {/* Processing Insights: collapsible stats + estimate + unsupported */}
+          <div className="border border-neutral-200 rounded-lg overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowInsights((prev) => !prev)}
+              className="w-full flex items-center justify-between p-3 bg-neutral-50 hover:bg-neutral-100 transition-colors"
+              aria-expanded={showInsights}
+            >
+              <span className="flex items-center gap-2 text-xs font-semibold text-neutral-800">
+                {showInsights ? (
+                  <ChevronDown className="w-4 h-4" />
+                ) : (
+                  <ChevronRight className="w-4 h-4" />
+                )}
+                <Gauge className="w-4 h-4 text-neutral-600" />
+                <span>Processing Insights</span>
+              </span>
+              <span className="flex items-center gap-2 text-[11px] text-neutral-500">
+                <span className="tabular-nums">{archiveStats.count} PDFs</span>
+                <span aria-hidden>&middot;</span>
+                <span className="tabular-nums">{formatBytes(archiveStats.total)}</span>
+                {archiveResult.unsupportedFiles.length > 0 && (
+                  <>
+                    <span aria-hidden>&middot;</span>
+                    <span className="text-amber-700 tabular-nums">
+                      {archiveResult.unsupportedFiles.length} ignored
+                    </span>
+                  </>
+                )}
+              </span>
+            </button>
 
-              {showUnsupported && (
-                <div className="p-3 border-t border-neutral-200 bg-neutral-50 space-y-3 text-xs animate-in fade-in">
-                  <p className="text-neutral-600 leading-relaxed">
-                    These files were skipped because they are not PDFs.
-                    DocuExtractor only processes PDF documents &mdash; other
-                    formats cannot be parsed for form-field extraction, so they
-                    are ignored and not added to this job.
-                  </p>
-
-                  {unsupportedGroups.map((group) => (
-                    <div key={`${group.label}:${group.extensions.join(',')}`} className="space-y-1">
-                      <div className="font-semibold text-neutral-800">
-                        {group.extensions.length > 0
-                          ? `${group.label} (${group.extensions.map((ext) => `.${ext}`).join(', ')})`
-                          : group.label}
-                        {`: ${group.items.length}`}
-                      </div>
-                      <div className="rounded border border-neutral-200 bg-white divide-y divide-neutral-100">
-                        {group.items.map((item) => {
-                          const ext = getExtension(item.filename);
-                          return (
-                            <div key={item.id} className="p-2 px-3 flex items-center justify-between gap-3">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <FileArchive className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                                <span className="font-medium text-neutral-900 truncate">
-                                  {item.filename}
-                                </span>
-                                <span className="text-neutral-400 font-mono text-[11px] truncate">
-                                  ({item.relativePath})
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-3 shrink-0">
-                                <span className="text-[10px] font-mono text-neutral-600 bg-neutral-100 border border-neutral-200 rounded px-1.5 py-0.5">
-                                  {ext ? `.${ext}` : 'no ext'}
-                                </span>
-                                <span className="text-neutral-400 font-mono text-[11px] tabular-nums">
-                                  {formatBytes(item.sizeBytes)}
-                                </span>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+            {showInsights && (
+              <div className="p-3 border-t border-neutral-200 bg-white space-y-4 text-xs animate-in fade-in">
+                {/* Aggregate stats */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Total PDFs</div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{archiveStats.count}</div>
+                  </div>
+                  <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Total Size</div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{formatBytes(archiveStats.total)}</div>
+                  </div>
+                  <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Avg File Size</div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{formatBytes(archiveStats.avg)}</div>
+                  </div>
+                  <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Size Range</div>
+                    <div className="text-[11px] font-semibold text-neutral-900 tabular-nums">
+                      {archiveStats.count > 0
+                        ? `${formatBytes(archiveStats.min)} \u2013 ${formatBytes(archiveStats.max)}`
+                        : 'N/A'}
                     </div>
-                  ))}
+                  </div>
                 </div>
-              )}
-            </div>
-          )}
+
+                {/* Estimated processing time */}
+                <div className="flex items-start gap-2 p-2.5 rounded border border-neutral-200 bg-neutral-50">
+                  <Clock className="w-4 h-4 text-neutral-500 shrink-0 mt-0.5" />
+                  <div className="text-neutral-700">
+                    {archiveStats.count === 0 ? (
+                      <span>No PDFs to process.</span>
+                    ) : (
+                      <>
+                        <span className="font-semibold text-neutral-900">
+                          Estimated processing: ~{formatDuration(archiveStats.minSeconds)}&ndash;{formatDuration(archiveStats.maxSeconds)}
+                        </span>{' '}
+                        for {archiveStats.count} {archiveStats.count === 1 ? 'PDF' : 'PDFs'} with{' '}
+                        {archiveStats.fieldCount} {archiveStats.fieldCount === 1 ? 'field' : 'fields'}
+                        {archiveStats.count > 50 ? ' (rough estimate)' : ''}.
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Unsupported (non-PDF) files breakdown */}
+                {archiveResult.unsupportedFiles.length > 0 && (
+                  <div className="border border-amber-200 rounded-lg overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setShowUnsupported((prev) => !prev)}
+                      className="w-full flex items-center justify-between p-2.5 bg-amber-50/60 hover:bg-amber-50 transition-colors"
+                      aria-expanded={showUnsupported}
+                    >
+                      <span className="flex items-center gap-2 text-xs font-semibold text-amber-800">
+                        {showUnsupported ? (
+                          <ChevronDown className="w-4 h-4" />
+                        ) : (
+                          <ChevronRight className="w-4 h-4" />
+                        )}
+                        <FileWarning className="w-4 h-4 text-amber-600" />
+                        <span>Review Unsupported Files</span>
+                        <span className="text-[11px] font-normal text-amber-700 bg-amber-100 border border-amber-200 rounded px-1.5 py-0.5">
+                          {archiveResult.unsupportedFiles.length} ignored
+                        </span>
+                      </span>
+                    </button>
+
+                    {showUnsupported && (
+                      <div className="p-3 border-t border-amber-200 bg-neutral-50 space-y-3 animate-in fade-in">
+                        <p className="text-neutral-600 leading-relaxed">
+                          These files were skipped because they are not PDFs.
+                          DocuExtractor only processes PDF documents &mdash; other
+                          formats cannot be parsed for form-field extraction, so
+                          they are ignored and not added to this job.
+                        </p>
+
+                        {unsupportedGroups.map((group) => (
+                          <div key={`${group.label}:${group.extensions.join(',')}`} className="space-y-1">
+                            <div className="font-semibold text-neutral-800">
+                              {group.extensions.length > 0
+                                ? `${group.label} (${group.extensions.map((ext) => `.${ext}`).join(', ')})`
+                                : group.label}
+                              {`: ${group.items.length}`}
+                            </div>
+                            <div className="rounded border border-neutral-200 bg-white divide-y divide-neutral-100">
+                              {group.items.map((item) => {
+                                const ext = getExtension(item.filename);
+                                return (
+                                  <div key={item.id} className="p-2 px-3 flex items-center justify-between gap-3">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <FileArchive className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                                      <span className="font-medium text-neutral-900 truncate">
+                                        {item.filename}
+                                      </span>
+                                      <span className="text-neutral-400 font-mono text-[11px] truncate">
+                                        ({item.relativePath})
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-3 shrink-0">
+                                      <span className="text-[10px] font-mono text-neutral-600 bg-neutral-100 border border-neutral-200 rounded px-1.5 py-0.5">
+                                        {ext ? `.${ext}` : 'no ext'}
+                                      </span>
+                                      <span className="text-neutral-400 font-mono text-[11px] tabular-nums">
+                                        {formatBytes(item.sizeBytes)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
