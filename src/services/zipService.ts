@@ -78,12 +78,17 @@ export async function unpackZipArchive(
     const isPdf = filename.toLowerCase().endsWith('.pdf');
 
     if (!isPdf) {
+      // Read the uncompressed size straight from the ZIP central-directory
+      // header so we can surface it in the UI without decompressing the entry.
+      const uncompressedSize =
+        (zipEntry as unknown as { _data?: { uncompressedSize?: number } })._data
+          ?.uncompressedSize ?? 0;
       unsupportedFiles.push({
         id: `unsupported-${cleanPath}`,
         filename,
         relativePath: cleanPath,
         directory,
-        sizeBytes: 0,
+        sizeBytes: uncompressedSize,
         isPdf: false,
         isUnsupported: true,
         isEncryptedOrCorrupted: false,
