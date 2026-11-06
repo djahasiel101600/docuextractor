@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -87,12 +88,36 @@ if not STORAGE_DIR.is_absolute():
     STORAGE_DIR = PROJECT_DIR / STORAGE_DIR
 MEDIA_ROOT = STORAGE_DIR
 
+# Database backend switch. Set DB_ENGINE in .env to "sqlite" or "postgres"
+# (default: sqlite, which matches the pre-existing behavior when neither
+# DB_ENGINE nor DATABASE_URL is set). DATABASE_URL, when set, is an explicit
+# full-URL override and always wins over the switch, so existing deployments
+# keep working unchanged.
+DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").strip().lower()
+if DB_ENGINE not in ("sqlite", "postgres"):
+    raise ImproperlyConfigured(
+        'DB_ENGINE must be "sqlite" or "postgres" '
+        f'(got {DB_ENGINE!r}). Use a full DATABASE_URL for anything custom.'
+    )
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
+if not DATABASE_URL and DB_ENGINE == "sqlite":
+    # Single source of truth for the SQLite file so the relative
+    # DOCUEXTRACT_STORAGE_DIR default stays stable across environments
+    # (host: ./storage, backend container: /app/storage volume).
+    DATABASE_URL = f"sqlite:///{(STORAGE_DIR / 'docuextract.sqlite3').as_posix()}"
+elif not DATABASE_URL and DB_ENGINE == "postgres":
     if not DEBUG:
         raise ImproperlyConfigured(
-            "DATABASE_URL must be configured when DEBUG is false.")
-    DATABASE_URL = f"sqlite:///{(STORAGE_DIR / 'docuextract.sqlite3').as_posix()}"
+            'DB_ENGINE=postgres requires POSTGRES_PASSWORD (or a full '
+            'DATABASE_URL) when DEBUG is false.')
+    DATABASE_URL = "postgres://{}:{}@{}:{}/{}".format(
+        quote(os.getenv("POSTGRES_USER", "docuextract"), safe=""),
+        quote(os.getenv("POSTGRES_PASSWORD", ""), safe=""),
+        os.getenv("POSTGRES_HOST", "localhost"),
+        os.getenv("POSTGRES_PORT", "5432"),
+        quote(os.getenv("POSTGRES_DB", "docuextract"), safe=""),
+    )
 
 DATABASE_CONFIG = dj_database_url.parse(
     DATABASE_URL,
