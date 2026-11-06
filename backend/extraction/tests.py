@@ -460,6 +460,128 @@ class ExtractionApiTests(APITestCase):
         self.assertEqual(progress.data["remainingCount"], 1)
         self.assertIsNone(progress.data["averageSecondsPerDocument"])
 
+    def test_batch_upload_aggregates_archives_into_single_job(self):
+        self.create_profile()
+        zip_one = create_zip([("a1.pdf", create_pdf()), ("a2.pdf", create_pdf())])
+        zip_two = create_zip([("b1.pdf", create_pdf())])
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            created = self.client.post(
+                "/api/jobs/batch/",
+                {"profileId": "test-profile"},
+                format="json",
+            )
+            self.assertEqual(created.status_code, 202, created.data)
+            job_id = created.data["id"]
+            self.assertEqual(created.data["status"], "idle")
+            self.assertEqual(created.data["totalDiscovered"], 0)
+
+            appended_one = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {
+                    "file": SimpleUploadedFile(
+                        "zip1.zip", zip_one, "application/zip")
+                },
+                format="multipart",
+            )
+            self.assertEqual(appended_one.status_code, 200, appended_one.data)
+            self.assertEqual(appended_one.data["added"], 2)
+
+            appended_two = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {
+                    "file": SimpleUploadedFile(
+                        "zip2.zip", zip_two, "application/zip")
+                },
+                format="multipart",
+            )
+            self.assertEqual(appended_two.status_code, 200, appended_two.data)
+            self.assertEqual(appended_two.data["added"], 1)
+            self.assertEqual(appended_two.data["totalDiscovered"], 3)
+
+            started = self.client.post(
+                f"/api/jobs/{job_id}/start/", {}, format="json"
+            )
+            self.assertEqual(started.status_code, 202, started.data)
+            self.assertEqual(started.data["status"], "running")
+
+        detail = self.client.get(f"/api/jobs/{job_id}/").data
+        self.assertEqual(detail["totalDiscovered"], 3)
+        self.assertEqual(detail["status"], "completed")
+        self.assertEqual(
+            sorted(document["filename"] for document in detail["documents"]),
+            ["a1.pdf", "a2.pdf", "b1.pdf"],
+        )
+        for document in detail["documents"]:
+            self.assertEqual(document["finalValues"]["full_name"], "Jane Doe")
+
+    def test_batch_upload_ignores_rejected_archive_and_keeps_others(self):
+        self.create_profile()
+        good_zip = create_zip([("g1.pdf", create_pdf())])
+        bad_bytes = b"this-is-not-a-zip-archive"
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            created = self.client.post(
+                "/api/jobs/batch/",
+                {"profileId": "test-profile"},
+                format="json",
+            )
+            job_id = created.data["id"]
+
+            ok = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {
+                    "file": SimpleUploadedFile(
+                        "good.zip", good_zip, "application/zip")
+                },
+                format="multipart",
+            )
+            self.assertEqual(ok.status_code, 200, ok.data)
+
+            rejected = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {
+                    "file": SimpleUploadedFile(
+                        "bad.zip", bad_bytes, "application/zip")
+                },
+                format="multipart",
+            )
+            self.assertEqual(rejected.status_code, 400, rejected.data)
+            self.assertIn("not a valid ZIP", rejected.data["detail"])
+
+            # The rejected archive must not have damaged the accepted one.
+            partial = self.client.get(f"/api/jobs/{job_id}/").data
+            self.assertEqual(partial["totalDiscovered"], 1)
+            self.assertEqual(partial["status"], "idle")
+
+            started = self.client.post(
+                f"/api/jobs/{job_id}/start/", {}, format="json"
+            )
+            self.assertEqual(started.status_code, 202, started.data)
+
+        detail = self.client.get(f"/api/jobs/{job_id}/").data
+        self.assertEqual(detail["status"], "completed")
+        self.assertEqual(len(detail["documents"]), 1)
+
+    def test_batch_start_with_no_valid_archives_deletes_orphan_job(self):
+        self.create_profile()
+        created = self.client.post(
+            "/api/jobs/batch/",
+            {"profileId": "test-profile"},
+            format="json",
+        )
+        job_id = created.data["id"]
+        self.assertTrue(ProcessingJob.objects.filter(pk=job_id).exists())
+        started = self.client.post(
+            f"/api/jobs/{job_id}/start/", {}, format="json"
+        )
+        self.assertEqual(started.status_code, 400, started.data)
+        self.assertIn("No archives", started.data["detail"])
+        # The empty job is removed instead of lingering as an orphan.
+        self.assertFalse(ProcessingJob.objects.filter(pk=job_id).exists())
+
     def test_documents_are_processed_with_configured_bounded_concurrency(self):
         self.create_profile()
         upload = create_zip(

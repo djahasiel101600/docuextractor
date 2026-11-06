@@ -23,10 +23,16 @@ from .document_extraction import process_pdf
 logger = logging.getLogger(__name__)
 
 
-def _extract_document(job_id, document, entry, extraction_profile):
+def _extract_document(job_id, document, extraction_profile, content=None):
     close_old_connections()
     try:
-        return process_pdf(entry.content, entry.filename, extraction_profile), None
+        # Batch jobs stream each PDF straight off storage so the whole archive
+        # never has to be resident in memory; single-upload jobs still pass the
+        # already-decompressed bytes in `content`.
+        if content is None:
+            with document.file.open("rb") as handle:
+                content = handle.read()
+        return process_pdf(content, document.filename, extraction_profile), None
     except Exception as exc:
         handled_errors = (
             DRFValidationError,
@@ -99,7 +105,8 @@ def _save_document_result(
                         document=document,
                         field_id=field["id"],
                         field_name=field.get("name", field["id"]),
-                        final_value=extracted["finalValues"].get(field["id"], ""),
+                        final_value=extracted["finalValues"].get(
+                            field["id"], ""),
                     )
                     for field in profile_fields
                 ]
@@ -150,25 +157,29 @@ def _finalize_job(job, processed_count, failed_count):
     job.failed_count = failed_count
     job.status = "completed" if processed_count else "error"
     job.review_required_count = sum(
-        any(item.details.get("reviewRequired") for item in doc.field_diagnostics.all())
+        any(item.details.get("reviewRequired")
+            for item in doc.field_diagnostics.all())
         for doc in documents
     )
     job.conflict_count = sum(
-        any(item.details.get("isConflict") for item in doc.field_diagnostics.all())
+        any(item.details.get("isConflict")
+            for item in doc.field_diagnostics.all())
         for doc in documents
     )
     job.missing_count = sum(
-        any(item.details.get("status") == "NOT_FOUND" for item in doc.field_diagnostics.all())
+        any(item.details.get("status") ==
+            "NOT_FOUND" for item in doc.field_diagnostics.all())
         for doc in documents
     )
     job.invalid_count = sum(
-        any(item.details.get("status") == "INVALID" for item in doc.field_diagnostics.all())
+        any(item.details.get("status") ==
+            "INVALID" for item in doc.field_diagnostics.all())
         for doc in documents
     )
     job.save()
 
 
-def process_job(job_id, entries):
+def process_job(job_id, entries=None):
     close_old_connections()
     processed_count = 0
     failed_count = 0
@@ -184,24 +195,39 @@ def process_job(job_id, entries):
             "ocrSettings": job.profile.configuration.get("ocrSettings", {}),
         }
 
-        documents = []
-        with transaction.atomic():
-            for entry in entries:
-                document = PDFDocument(
-                    id=f"doc-{uuid.uuid4()}",
-                    job=job,
-                    filename=entry.filename,
-                    relative_path=entry.relative_path,
-                    file_size_bytes=len(entry.content),
-                    file_hash=hashlib.sha256(entry.content).hexdigest(),
-                    processing_status="pending",
-                    raw_filename_text=entry.filename,
-                )
-                document.file.save(
-                    f"{document.id}.pdf", ContentFile(entry.content), save=False
-                )
-                documents.append(document)
-            PDFDocument.objects.bulk_create(documents, batch_size=100)
+        if entries is not None:
+            # Single-upload path: the PDF bytes are already decompressed in
+            # memory as `entries`, so create the rows and keep the bytes for
+            # this job only.
+            documents = []
+            contents = []
+            with transaction.atomic():
+                for entry in entries:
+                    document = PDFDocument(
+                        id=f"doc-{uuid.uuid4()}",
+                        job=job,
+                        filename=entry.filename,
+                        relative_path=entry.relative_path,
+                        file_size_bytes=len(entry.content),
+                        file_hash=hashlib.sha256(entry.content).hexdigest(),
+                        processing_status="pending",
+                        raw_filename_text=entry.filename,
+                    )
+                    document.file.save(
+                        f"{document.id}.pdf", ContentFile(entry.content), save=False
+                    )
+                    documents.append(document)
+                    contents.append(entry.content)
+                PDFDocument.objects.bulk_create(documents, batch_size=100)
+        else:
+            # Batch path: the per-archive append endpoint already persisted each
+            # PDFDocument row (bytes on storage, status pending), so we process
+            # whatever is still queued. Bytes are streamed off disk per document
+            # instead of holding every archive in memory.
+            documents = list(
+                job.documents.filter(processing_status="pending").order_by("id")
+            )
+            contents = None
 
         next_document = 0
         active = {}
@@ -213,16 +239,18 @@ def process_job(job_id, entries):
             while next_document < len(documents) or active:
                 while next_document < len(documents) and len(active) < worker_count:
                     document = documents[next_document]
-                    entry = entries[next_document]
                     document.processing_status = "processing"
                     document.save(update_fields=["processing_status"])
                     started = time.perf_counter()
+                    content = (
+                        contents[next_document] if contents is not None else None
+                    )
                     future = executor.submit(
                         _extract_document,
                         job_id,
                         document,
-                        entry,
                         extraction_profile,
+                        content,
                     )
                     active[future] = (document, started)
                     next_document += 1
@@ -231,7 +259,8 @@ def process_job(job_id, entries):
                 for future in completed:
                     document, started = active.pop(future)
                     extracted, error = future.result()
-                    next_processed = processed_count + int(extracted is not None)
+                    next_processed = processed_count + \
+                        int(extracted is not None)
                     next_failed = failed_count + int(extracted is None)
                     _save_document_result(
                         job_id,
@@ -258,7 +287,7 @@ def process_job(job_id, entries):
         close_old_connections()
 
 
-def launch_job_processing(job_id, entries):
+def launch_job_processing(job_id, entries=None):
     worker = threading.Thread(
         target=process_job,
         args=(job_id, entries),

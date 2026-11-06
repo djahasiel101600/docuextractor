@@ -105,6 +105,54 @@ export async function getJobProgress(jobId: string): Promise<ProcessingJobProgre
   return response.data;
 }
 
+/**
+ * Batch-upload flow: creates an idle job with no archive attached. Archives
+ * are appended one request at a time via uploadJobArchive, then the job is
+ * launched with startJob so processing never waits on a single huge body.
+ */
+export async function createBatchJob(profileId: string): Promise<ProcessingJob> {
+  const response = await api.post<ProcessingJob>('/jobs/batch/', { profileId });
+  return response.data;
+}
+
+/**
+ * Uploads one archive into an existing idle job. Each archive is its own
+ * small multipart request (timeout disabled) so large batch sets don't hit
+ * proxy body-size caps or upload stalls. Throws if the archive is rejected;
+ * previously accepted archives are kept server-side.
+ */
+export async function uploadJobArchive(
+  jobId: string,
+  archive: Blob,
+  filename: string,
+  onUploadProgress?: (percent: number) => void
+): Promise<{ jobId: string; archive: string; added: number; totalDiscovered: number }> {
+  const formData = new FormData();
+  formData.append('file', archive, filename);
+  const response = await api.post<{
+    jobId: string;
+    archive: string;
+    added: number;
+    totalDiscovered: number;
+  }>(`/jobs/${encodeURIComponent(jobId)}/archives/`, formData, {
+    timeout: 0,
+    onUploadProgress: (progress) => {
+      if (progress.total) {
+        onUploadProgress?.(Math.round((progress.loaded / progress.total) * 100));
+      }
+    },
+  });
+  return response.data;
+}
+
+/** Launches processing for an idle batch job assembled via createBatchJob. */
+export async function startJob(jobId: string): Promise<ProcessingJob> {
+  const response = await api.post<ProcessingJob>(
+    `/jobs/${encodeURIComponent(jobId)}/start/`
+  );
+  return response.data;
+}
+
 export async function getJob(jobId: string): Promise<ProcessingJob> {
   const response = await api.get<ProcessingJob>(
     `/jobs/${encodeURIComponent(jobId)}/`

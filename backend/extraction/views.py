@@ -1,10 +1,12 @@
 import csv
 from datetime import datetime
+import hashlib
 import uuid
 
 from django.db import IntegrityError, transaction
 from django.db.models import Avg
 from django.db.utils import DatabaseError
+from django.core.files.base import ContentFile
 from django.http import FileResponse, Http404, StreamingHttpResponse
 from django.utils import timezone
 from django.conf import settings
@@ -296,6 +298,179 @@ class JobListCreateView(APIView):
             total_discovered=len(entries),
         )
         launch_job_processing(job.pk, entries)
+        return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
+
+
+class JobBatchCreateView(APIView):
+    """Create an empty job that archives are appended into before it starts.
+
+    Batch uploads let a user split a large archive into several smaller ZIPs so
+    each HTTP body stays under the reverse-proxy limit, while everything still
+    aggregates into ONE processing job. The job is created in the 'idle'
+    (assembling) state and is NOT launched until the start endpoint is called.
+    """
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    @extend_schema(
+        operation_id="jobs_batch_create",
+        request=inline_serializer(
+            name="JobBatchCreateRequest",
+            fields={"profileId": serializers.CharField()},
+        ),
+        responses={202: ProcessingJobResponseSerializer},
+    )
+    def post(self, request):
+        profile_id = request.data.get("profileId")
+        if not profile_id:
+            return Response({"profileId": ["This field is required."]}, status=400)
+        try:
+            profile = ExtractionProfile.objects.get(pk=profile_id)
+        except ExtractionProfile.DoesNotExist:
+            return Response({"profileId": ["Choose a valid profile."]}, status=400)
+        job = ProcessingJob.objects.create(
+            id=f"job-{uuid.uuid4()}",
+            name="Batch upload",
+            zip_filename="batch",
+            profile=profile,
+            status="idle",
+            total_discovered=0,
+        )
+        return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
+
+
+class JobArchiveAppendView(APIView):
+    """Add one ZIP archive to an assembling job, aggregating its PDFs.
+
+    All discovery safeguards (compressed/uncompressed size caps, per-file size,
+    compression-ratio zip-bomb guard, path-traversal, PDF magic-byte checks) run
+    here for THIS archive only. A rejected archive returns 400 and leaves the job
+    and previously appended archives untouched, so one bad file never aborts the
+    batch or corrupts the job.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    @extend_schema(
+        operation_id="jobs_append_archive",
+        request=JobUploadRequestSerializer,
+        responses={
+            200: inline_serializer(
+                name="JobArchiveAppendResponse",
+                fields={
+                    "jobId": serializers.CharField(),
+                    "archive": serializers.CharField(),
+                    "added": serializers.IntegerField(),
+                    "totalDiscovered": serializers.IntegerField(),
+                },
+            ),
+            400: OpenApiResponse(description="This archive was rejected."),
+            409: OpenApiResponse(description="The job is no longer accepting archives."),
+        },
+    )
+    def post(self, request, job_id):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"file": ["This field is required."]}, status=400)
+        try:
+            job = ProcessingJob.objects.get(pk=job_id)
+        except ProcessingJob.DoesNotExist as exc:
+            raise Http404("Processing job not found.") from exc
+        if job.status != "idle":
+            return Response(
+                {"detail": "This job is no longer accepting archives."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            entries = discover_pdf_files(upload)
+        except ValidationError as exc:
+            detail = exc.detail
+            message = "; ".join(str(item) for item in detail) if isinstance(
+                detail, list
+            ) else str(detail)
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            documents = []
+            for entry in entries:
+                document = PDFDocument(
+                    id=f"doc-{uuid.uuid4()}",
+                    job=job,
+                    filename=entry.filename,
+                    relative_path=entry.relative_path,
+                    file_size_bytes=len(entry.content),
+                    file_hash=hashlib.sha256(entry.content).hexdigest(),
+                    processing_status="pending",
+                    raw_filename_text=entry.filename,
+                )
+                document.file.save(
+                    f"{document.id}.pdf", ContentFile(entry.content), save=False
+                )
+                documents.append(document)
+            PDFDocument.objects.bulk_create(documents, batch_size=100)
+            job.total_discovered += len(documents)
+            job.zip_size_bytes += upload.size
+            if upload.name and upload.name not in job.zip_filename:
+                parts = [
+                    part
+                    for part in job.zip_filename.split(", ")
+                    if part and part != "batch"
+                ]
+                parts.append(upload.name)
+                job.zip_filename = ", ".join(parts)
+                job.name = job.zip_filename
+            job.save(
+                update_fields=[
+                    "total_discovered",
+                    "zip_size_bytes",
+                    "zip_filename",
+                    "name",
+                ]
+            )
+        return Response(
+            {
+                "jobId": job.pk,
+                "archive": upload.name,
+                "added": len(documents),
+                "totalDiscovered": job.total_discovered,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class JobStartView(APIView):
+    """Launch processing for an assembled batch job.
+
+    A job that aggregated no valid PDFs is deleted rather than left behind as an
+    empty orphan, so a fully failed batch never lingers in the history.
+    """
+
+    parser_classes = [JSONParser, FormParser]
+
+    @extend_schema(
+        operation_id="jobs_start",
+        request=OpenApiTypes.OBJECT,
+        responses={202: ProcessingJobResponseSerializer},
+    )
+    def post(self, request, job_id):
+        try:
+            job = ProcessingJob.objects.get(pk=job_id)
+        except ProcessingJob.DoesNotExist as exc:
+            raise Http404("Processing job not found.") from exc
+        if job.status != "idle":
+            return Response(
+                {"detail": "This job has already been started."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if not job.documents.filter(processing_status="pending").exists():
+            job.delete()
+            return Response(
+                {"detail": "No archives containing valid PDFs were uploaded."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        job.status = "running"
+        job.save(update_fields=["status"])
+        launch_job_processing(job.pk)
         return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
 
 

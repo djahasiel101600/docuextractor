@@ -15,6 +15,9 @@ export interface DiscoveredFileItem {
   isUnsupported: boolean;
   isEncryptedOrCorrupted: boolean;
   fileData?: ArrayBuffer;
+  /** Populated only when the item came from a multi-archive batch upload, so
+   *  the Discovered Documents list can show which ZIP each file originated from. */
+  archiveName?: string;
 }
 
 export interface ArchiveDiscoveryResult {
@@ -25,6 +28,10 @@ export interface ArchiveDiscoveryResult {
   corruptedFiles: DiscoveredFileItem[];
   zipSizeBytes: number;
   sourceFile: Blob;
+  /** The individual archives that make up this (possibly batched) discovery.
+   *  Present with length > 1 only for multi-ZIP batch uploads; each entry is
+   *  uploaded as its own request so no single HTTP body exceeds the proxy cap. */
+  sourceArchives?: { filename: string; blob: Blob }[];
 }
 
 /**
@@ -131,6 +138,56 @@ export async function unpackZipArchive(
     corruptedFiles,
     zipSizeBytes: arrayBuffer.byteLength,
     sourceFile: file,
+  };
+}
+
+/**
+ * Unpacks several ZIP archives and merges their discoveries into a single
+ * result so the UI can show one unified list while each archive is still
+ * uploaded as its own small HTTP request (batch-upload flow).
+ */
+export async function unpackMultipleZipArchives(
+  files: File[]
+): Promise<ArchiveDiscoveryResult> {
+  const sourceArchives = files.map((file) => ({ filename: file.name, blob: file as Blob }));
+  const perArchive = await Promise.all(
+    files.map((file) => unpackZipArchive(file, file.name))
+  );
+
+  const pdfFiles: DiscoveredFileItem[] = [];
+  const unsupportedFiles: DiscoveredFileItem[] = [];
+  const corruptedFiles: DiscoveredFileItem[] = [];
+  let zipSizeBytes = 0;
+
+  perArchive.forEach((result, index) => {
+    const archiveName = files[index].name;
+    zipSizeBytes += result.zipSizeBytes;
+    // Prefix ids with the archive index so the same path inside two different
+    // archives still yields unique keys for React lists.
+    const rekey = (item: DiscoveredFileItem, prefix: string): DiscoveredFileItem => ({
+      ...item,
+      id: `${prefix}-${archiveName}-${item.id}`,
+      archiveName,
+    });
+    pdfFiles.push(...result.pdfFiles.map((item) => rekey(item, 'doc')));
+    unsupportedFiles.push(...result.unsupportedFiles.map((item) => rekey(item, 'unsupported')));
+    corruptedFiles.push(...result.corruptedFiles.map((item) => rekey(item, 'corrupted')));
+  });
+
+  const zipName =
+    files.length === 1
+      ? files[0].name
+      : `batch (${files.length} archives)`;
+
+  return {
+    zipName,
+    totalFiles: pdfFiles.length + unsupportedFiles.length + corruptedFiles.length,
+    pdfFiles,
+    unsupportedFiles,
+    corruptedFiles,
+    zipSizeBytes,
+    sourceFile: sourceArchives[0]?.blob ?? new Blob(),
+    sourceArchives,
   };
 }
 

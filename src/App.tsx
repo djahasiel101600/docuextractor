@@ -21,6 +21,7 @@ import {
 } from './types/extraction';
 import { ArchiveDiscoveryResult } from './services/zipService';
 import {
+  createBatchJob,
   createJob,
   createProfile,
   deleteJob as deleteServerJob,
@@ -31,9 +32,11 @@ import {
   getDocumentFile,
   listJobs,
   listProfiles,
+  startJob,
   updateDocumentField,
   updateDocumentReview,
   updateProfile,
+  uploadJobArchive,
 } from './services/apiClient';
 import { createDemoZipArchive } from './services/sampleArchiveGenerator';
 
@@ -305,6 +308,11 @@ export default function App() {
     });
 
     try {
+      const batchArchives = archiveResult.sourceArchives ?? [];
+      if (batchArchives.length > 1) {
+        await handleStartBatchProcessing(archiveResult, profile, batchArchives);
+        return;
+      }
       const job = await createJob(
         archiveResult.sourceFile,
         archiveResult.zipName,
@@ -336,6 +344,113 @@ export default function App() {
       setWorkspaceError(`Could not process the archive: ${getApiErrorMessage(error)}`);
       setIsProcessing(false);
       setProcessingProgress(null);
+    }
+  };
+
+  // Batch-upload flow: one idle job is created up front, then every archive is
+  // uploaded as its own small multipart request (so no single HTTP body hits
+  // the proxy/tunnel size caps that stall large single-zip uploads). Failed
+  // archives are collected as non-fatal warnings; the remaining ones still
+  // process. If nothing could be uploaded we delete the job so no orphan is
+  // left behind (the backend also refuses to start - and cleans up - a job
+  // with zero documents).
+  const handleStartBatchProcessing = async (
+    archiveResult: ArchiveDiscoveryResult,
+    profile: ExtractionProfile,
+    batchArchives: { filename: string; blob: Blob }[]
+  ) => {
+    const total = batchArchives.length;
+    const setPhase = (currentFile: string, uploadPercent: number) =>
+      setProcessingProgress((current) =>
+        current?.phase === 'uploading'
+          ? { ...current, currentFile, uploadPercent }
+          : current
+      );
+
+    setPhase(`Creating batch job...`, 0);
+    const job = await createBatchJob(profile.id);
+
+    const failedArchives: string[] = [];
+    for (let index = 0; index < total; index += 1) {
+      const archive = batchArchives[index];
+      setPhase(
+        `Uploading archive ${index + 1} of ${total}: ${archive.filename}`,
+        Math.round(((index + 0.01) / total) * 100)
+      );
+      try {
+        await uploadJobArchive(
+          job.id,
+          archive.blob,
+          archive.filename,
+          (percent) =>
+            setPhase(
+              `Uploading archive ${index + 1} of ${total}: ${archive.filename}`,
+              Math.round(((index + percent / 100) / total) * 100)
+            )
+        );
+      } catch (error) {
+        // Non-fatal: keep the archives already accepted and try the rest.
+        failedArchives.push(`${archive.filename} (${getApiErrorMessage(error)})`);
+      }
+    }
+
+    if (failedArchives.length === total) {
+      // Nothing was accepted; the idle job has no documents - delete it so it
+      // never lingers as an orphan, then surface the combined error.
+      try {
+        await deleteServerJob(job.id);
+      } catch {
+        // Best-effort cleanup only.
+      }
+      throw new Error(
+        `None of the ${total} archives could be uploaded: ${failedArchives.join('; ')}`
+      );
+    }
+
+    setPhase(
+      failedArchives.length
+        ? `Starting processing (${failedArchives.length} archive(s) skipped)...`
+        : 'Starting processing...',
+      100
+    );
+    try {
+      const started = await startJob(job.id);
+      setJobs((current) => [
+        started,
+        ...current.filter((existing) => existing.id !== started.id),
+      ]);
+      setActiveJobId(started.id);
+      setActiveTab('results');
+      if (failedArchives.length) {
+        setWorkspaceError(
+          `Processing started, but ${failedArchives.length} archive(s) failed to upload and were skipped: ${failedArchives.join('; ')}`
+        );
+      }
+      if (started.status !== 'running') {
+        // All documents finished before the watcher polled; load final detail.
+        const detail = await getJob(started.id);
+        setJobs((current) =>
+          current.map((existing) => (existing.id === detail.id ? detail : existing))
+        );
+        setIsProcessing(false);
+        setProcessingProgress(null);
+        if (detail.status === 'error') {
+          setWorkspaceError('The archive processing job failed. Review the job details for documents that could not be processed.');
+        }
+      }
+      // Otherwise the central watcher takes over polling via runningJobId.
+    } catch (error) {
+      // Cleanup depends on the job state: if start itself failed and the job
+      // still exists it is 'idle' with zero or rejected documents, so delete
+      // it. A 404 here means the backend already cleaned the job up.
+      try {
+        await deleteServerJob(job.id);
+      } catch {
+        // Ignore: already deleted or not reachable.
+      }
+      throw new Error(
+        `Could not start the batch job: ${getApiErrorMessage(error)}`
+      );
     }
   };
 

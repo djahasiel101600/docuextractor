@@ -32,6 +32,7 @@ import {
 } from '../../types/extraction';
 import {
   unpackZipArchive,
+  unpackMultipleZipArchives,
   collectLoosePdfFiles,
   ArchiveDiscoveryResult,
   DiscoveredFileItem,
@@ -337,15 +338,20 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     setUnpackError(null);
 
     try {
-      const firstFile = files[0];
-      const isZip = firstFile.name.toLowerCase().endsWith('.zip');
+      const fileArray = Array.from(files);
+      const zipFiles = fileArray.filter((file) =>
+        file.name.toLowerCase().endsWith('.zip')
+      );
 
       let result: ArchiveDiscoveryResult;
-      if (isZip) {
-        result = await unpackZipArchive(firstFile, firstFile.name);
+      if (zipFiles.length > 1) {
+        // Batch selection: aggregate every archive into one discovery result
+        // while each ZIP is still uploaded as its own small request later.
+        result = await unpackMultipleZipArchives(zipFiles);
+      } else if (zipFiles.length === 1) {
+        result = await unpackZipArchive(zipFiles[0], zipFiles[0].name);
       } else {
         // Multiple loose PDF files
-        const fileArray = Array.from(files);
         result = await collectLoosePdfFiles(fileArray);
       }
       setArchiveResult(result);
@@ -481,7 +487,8 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                 {isUnpacking ? 'Reading & unpacking archive contents...' : 'Click to browse or drop ZIP archive here'}
               </p>
               <p className="text-xs text-neutral-500 mt-1">
-                Supports nested directories, folder structures, or multiple loose .pdf files.
+                Supports nested directories, folder structures, multiple loose .pdf files,
+                or several ZIP archives at once (batch upload).
               </p>
             </div>
           </div>
@@ -508,7 +515,11 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                   Discovered Documents ({archiveResult.pdfFiles.length} PDFs)
                 </h3>
                 <p className="text-xs text-neutral-500 font-mono">
-                  Archive: {archiveResult.zipName} · {Math.round(archiveResult.zipSizeBytes / 1024)} KB total
+                  {archiveResult.sourceArchives && archiveResult.sourceArchives.length > 1 ? (
+                    `Batch: ${archiveResult.sourceArchives.length} archives · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`
+                  ) : (
+                    `Archive: ${archiveResult.zipName} · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`
+                  )}
                 </p>
               </div>
             </div>
@@ -560,6 +571,14 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                     <span className="text-neutral-400 font-mono text-[11px] truncate">
                       ({file.relativePath})
                     </span>
+                    {file.archiveName && (
+                      <span
+                        className="text-[10px] font-semibold text-neutral-600 bg-neutral-100 border border-neutral-200 rounded px-1.5 py-0.5 truncate max-w-40 shrink-0"
+                        title={`From archive: ${file.archiveName}`}
+                      >
+                        {file.archiveName}
+                      </span>
+                    )}
                   </div>
                   <span className="text-neutral-400 font-mono text-[11px] shrink-0 tabular-nums">
                     {Math.round(file.sizeBytes / 1024)} KB
