@@ -230,8 +230,29 @@ export interface DocumentAssignment {
   profileId: string | null;
   profileName: string | null;
   assignmentStatus: 'legacy' | 'assigned' | 'manual' | 'ambiguous' | 'unassigned' | 'excluded';
+  /** How the current assignment was produced: "", "manual" or "bulk". */
+  assignmentMethod: string;
   assignmentConfidence: number;
   assignmentReason: string;
+  /** Pipeline state; bulk assignment only touches "pending" documents. */
+  processingStatus: string;
+}
+
+export type BulkAssignmentFilterType = 'filename_pattern' | 'exact_match';
+
+export interface BulkAssignmentRequest {
+  /** null clears the assignment for every matched document. */
+  profileId: string | null;
+  filter: {
+    type: BulkAssignmentFilterType;
+    value: string;
+  };
+}
+
+export interface BulkAssignmentResult {
+  matched: number;
+  updated: number;
+  skipped_already_assigned: number;
 }
 
 export interface ProcessingJob {

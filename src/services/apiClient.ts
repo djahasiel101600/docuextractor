@@ -1,6 +1,9 @@
 import axios, { AxiosError } from 'axios';
 import {
   BlankFormAnalysis,
+  BulkAssignmentRequest,
+  BulkAssignmentResult,
+  DocumentAssignment,
   ExtractionProfile,
   PDFDocumentRecord,
   ProcessingJob,
@@ -204,9 +207,25 @@ export async function assignJobProfiles(jobId: string): Promise<{ detail: string
   return response.data;
 }
 
-export async function getJobAssignments(jobId: string): Promise<any[]> {
-  const response = await api.get<any[]>(
+export async function getJobAssignments(jobId: string): Promise<DocumentAssignment[]> {
+  const response = await api.get<DocumentAssignment[]>(
     `/jobs/${encodeURIComponent(jobId)}/assignments/`
+  );
+  return response.data;
+}
+
+/**
+ * Assigns (or clears, with `profileId: null`) one profile across the job's
+ * pending documents matched by a filename filter. Manual overrides are
+ * preserved server-side and reported via `skipped_already_assigned`.
+ */
+export async function bulkAssignJobDocuments(
+  jobId: string,
+  payload: BulkAssignmentRequest
+): Promise<BulkAssignmentResult> {
+  const response = await api.post<BulkAssignmentResult>(
+    `/jobs/${encodeURIComponent(jobId)}/bulk-assign/`,
+    payload
   );
   return response.data;
 }

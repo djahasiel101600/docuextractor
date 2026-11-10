@@ -772,6 +772,212 @@ class ExtractionApiTests(APITestCase):
         self.assertIn("Test Profile", rows["one.pdf"])
         self.assertIn("Secondary Profile", rows["two.pdf"])
 
+    def test_bulk_assign_by_filename_pattern(self):
+        self.create_profile()
+        created = self.client.post(
+            "/api/jobs/batch/", {"profileId": "test-profile"}, format="json")
+        job_id = created.data["id"]
+        upload = create_zip([
+            ("W8-form-1.pdf", create_pdf()),
+            ("W8-form-2.pdf", create_pdf()),
+            ("W8-form-3.pdf", create_pdf()),
+            ("other-1.pdf", create_pdf()),
+            ("other-2.pdf", create_pdf()),
+        ])
+        appended = self.client.post(
+            f"/api/jobs/{job_id}/archives/",
+            {"file": SimpleUploadedFile(
+                "batch.zip", upload, "application/zip")},
+            format="multipart",
+        )
+        self.assertEqual(appended.status_code, 200, appended.data)
+        self.assertEqual(
+            PDFDocument.objects.filter(job_id=job_id).count(), 5)
+
+        response = self.client.post(
+            f"/api/jobs/{job_id}/bulk-assign/",
+            {
+                "profileId": "test-profile",
+                "filter": {"type": "filename_pattern", "value": "W8*"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            response.data,
+            {"matched": 3, "updated": 3, "skipped_already_assigned": 0},
+        )
+
+        bulk_documents = PDFDocument.objects.filter(
+            job_id=job_id, assignment_method="bulk")
+        self.assertEqual(bulk_documents.count(), 3)
+        for document in bulk_documents:
+            self.assertTrue(document.filename.startswith("W8"))
+            self.assertEqual(document.profile_id, "test-profile")
+            self.assertEqual(document.assignment_status, "assigned")
+            self.assertEqual(document.assignment_rule, "filename_pattern")
+            self.assertAlmostEqual(document.assignment_confidence, 1.0)
+            self.assertEqual(
+                document.assignment_reason,
+                "bulk-assigned via filename_pattern: W8*",
+            )
+        untouched = PDFDocument.objects.filter(job_id=job_id).exclude(
+            assignment_method="bulk")
+        self.assertEqual(untouched.count(), 2)
+        self.assertTrue(all(
+            document.filename.startswith("other")
+            for document in untouched
+        ))
+
+        assignments = {
+            item["filename"]: item
+            for item in self.client.get(
+                f"/api/jobs/{job_id}/assignments/").data
+        }
+        self.assertEqual(
+            assignments["W8-form-1.pdf"]["assignmentMethod"], "bulk")
+        self.assertEqual(
+            assignments["W8-form-1.pdf"]["processingStatus"], "pending")
+
+    def test_bulk_assign_preserves_manual_overrides_and_can_clear_profiles(
+            self):
+        self.create_profile()
+        secondary = copy.deepcopy(PROFILE)
+        secondary["id"] = "secondary-profile"
+        secondary["name"] = "Secondary Profile"
+        created_profile = self.client.post(
+            "/api/profiles/", secondary, format="json")
+        self.assertEqual(created_profile.status_code,
+                         201, created_profile.data)
+
+        created = self.client.post(
+            "/api/jobs/batch/", {"profileId": "test-profile"}, format="json")
+        job_id = created.data["id"]
+        upload = create_zip(
+            [("manual.pdf", create_pdf()), ("auto.pdf", create_pdf())])
+        appended = self.client.post(
+            f"/api/jobs/{job_id}/archives/",
+            {"file": SimpleUploadedFile(
+                "batch.zip", upload, "application/zip")},
+            format="multipart",
+        )
+        self.assertEqual(appended.status_code, 200, appended.data)
+        assignments = {
+            item["filename"]: item
+            for item in self.client.get(
+                f"/api/jobs/{job_id}/assignments/").data
+        }
+        excluded = self.client.patch(
+            f"/api/documents/{assignments['manual.pdf']['id']}/",
+            {"assignmentStatus": "excluded"},
+            format="json",
+        )
+        self.assertEqual(excluded.status_code, 200, excluded.data)
+
+        # A wildcard sweep must never overwrite the manual exclusion.
+        swept = self.client.post(
+            f"/api/jobs/{job_id}/bulk-assign/",
+            {
+                "profileId": "secondary-profile",
+                "filter": {"type": "filename_pattern", "value": "*"},
+            },
+            format="json",
+        )
+        self.assertEqual(swept.status_code, 200, swept.data)
+        self.assertEqual(
+            swept.data,
+            {"matched": 2, "updated": 1, "skipped_already_assigned": 1},
+        )
+        manual_document = PDFDocument.objects.get(
+            pk=assignments["manual.pdf"]["id"])
+        self.assertEqual(manual_document.assignment_method, "manual")
+        self.assertEqual(manual_document.assignment_status, "excluded")
+        self.assertIsNone(manual_document.profile_id)
+        auto_document = PDFDocument.objects.get(
+            pk=assignments["auto.pdf"]["id"])
+        self.assertEqual(auto_document.profile_id, "secondary-profile")
+
+        # A null profileId clears the assignment for the matched documents.
+        cleared = self.client.post(
+            f"/api/jobs/{job_id}/bulk-assign/",
+            {
+                "profileId": None,
+                "filter": {"type": "exact_match", "value": "auto.pdf"},
+            },
+            format="json",
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.data)
+        self.assertEqual(
+            cleared.data,
+            {"matched": 1, "updated": 1, "skipped_already_assigned": 0},
+        )
+        auto_document.refresh_from_db()
+        self.assertIsNone(auto_document.profile_id)
+        self.assertEqual(auto_document.assignment_status, "unassigned")
+        self.assertEqual(auto_document.assignment_method, "bulk")
+        self.assertEqual(
+            auto_document.assignment_reason,
+            "bulk-cleared via exact_match: auto.pdf",
+        )
+
+    def test_bulk_assign_rejects_started_jobs(self):
+        self.create_profile()
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            created = self.client.post(
+                "/api/jobs/batch/",
+                {"profileId": "test-profile"},
+                format="json",
+            )
+            job_id = created.data["id"]
+            upload = create_zip([("W8-form.pdf", create_pdf())])
+            appended = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {"file": SimpleUploadedFile(
+                    "batch.zip", upload, "application/zip")},
+                format="multipart",
+            )
+            self.assertEqual(appended.status_code, 200, appended.data)
+
+            no_match = self.client.post(
+                f"/api/jobs/{job_id}/bulk-assign/",
+                {
+                    "profileId": "test-profile",
+                    "filter": {
+                        "type": "filename_pattern",
+                        "value": "NOPE*",
+                    },
+                },
+                format="json",
+            )
+            self.assertEqual(no_match.status_code, 200, no_match.data)
+            self.assertEqual(
+                no_match.data,
+                {
+                    "matched": 0,
+                    "updated": 0,
+                    "skipped_already_assigned": 0,
+                },
+            )
+
+            started = self.client.post(
+                f"/api/jobs/{job_id}/start/", {}, format="json")
+            self.assertEqual(started.status_code, 202, started.data)
+
+        rejected = self.client.post(
+            f"/api/jobs/{job_id}/bulk-assign/",
+            {
+                "profileId": "test-profile",
+                "filter": {"type": "filename_pattern", "value": "*"},
+            },
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        self.assertFalse(
+            PDFDocument.objects.filter(
+                job_id=job_id, assignment_method="bulk").exists())
+
     def test_documents_are_processed_with_configured_bounded_concurrency(self):
         self.create_profile()
         upload = create_zip(

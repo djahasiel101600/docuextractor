@@ -47,8 +47,34 @@ class DocumentAssignmentSerializer(serializers.Serializer):
     profileId = serializers.CharField(allow_null=True)
     profileName = serializers.CharField(allow_null=True)
     assignmentStatus = serializers.CharField()
+    assignmentMethod = serializers.CharField(allow_blank=True)
     assignmentConfidence = serializers.FloatField()
     assignmentReason = serializers.CharField()
+    processingStatus = serializers.CharField()
+
+
+class BulkAssignmentFilterSerializer(serializers.Serializer):
+    """Which pending documents a bulk assignment applies to.
+
+    - `filename_pattern`: `*` matches any sequence of characters (case
+      insensitive), e.g. `W8*`.
+    - `exact_match`: the filename must match exactly (case insensitive).
+    """
+
+    type = serializers.ChoiceField(
+        choices=["filename_pattern", "exact_match"])
+    value = serializers.CharField(max_length=255, allow_blank=False)
+
+
+class BulkAssignmentRequestSerializer(serializers.Serializer):
+    """Body for POST /api/jobs/{id}/bulk-assign/.
+
+    `profileId: null` clears the assignment for every matched document instead
+    of pointing them at a profile.
+    """
+
+    profileId = serializers.CharField(required=True, allow_null=True)
+    filter = BulkAssignmentFilterSerializer()
 
 
 class DocumentAssignmentUpdateSerializer(serializers.Serializer):

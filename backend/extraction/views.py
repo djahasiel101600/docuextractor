@@ -1,6 +1,7 @@
 import csv
 from datetime import datetime
 import hashlib
+import re
 import uuid
 
 from django.db import IntegrityError, transaction
@@ -21,6 +22,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
 from .api_serializers import (
+    BulkAssignmentRequestSerializer,
     DocumentPatchRequestSerializer,
     DocumentResponseSerializer,
     DocumentAssignmentSerializer,
@@ -534,10 +536,144 @@ class JobAssignmentDetailView(APIView):
                 "profileId": doc.profile_id,
                 "profileName": doc.profile.name if doc.profile else None,
                 "assignmentStatus": doc.assignment_status,
+                "assignmentMethod": doc.assignment_method,
                 "assignmentConfidence": doc.assignment_confidence,
                 "assignmentReason": doc.assignment_reason,
+                "processingStatus": doc.processing_status,
             })
         return Response(results, status=status.HTTP_200_OK)
+
+
+def _matches_bulk_filter(filename, filter_type, filter_value):
+    """Case-insensitive filename match for bulk assignment filters."""
+    name = (filename or "").lower()
+    value = (filter_value or "").strip().lower()
+    if filter_type == "exact_match":
+        return name == value
+    # `filename_pattern` treats `*` as the only wildcard; every other regex
+    # character in the user's pattern is literal.
+    pattern = re.escape(value).replace(r"\*", ".*")
+    return re.fullmatch(pattern, name) is not None
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class JobBulkAssignmentView(APIView):
+    """Assign (or clear) one profile across many pending documents at once.
+
+    Bulk actions only apply to documents that are still `pending` and that the
+    user has not manually decided on, so a bulk sweep can never overwrite a
+    hand-picked profile or exclusion.
+    """
+
+    parser_classes = [JSONParser]
+
+    @extend_schema(
+        operation_id="jobs_bulk_assign_profiles",
+        request=BulkAssignmentRequestSerializer,
+        responses={
+            200: inline_serializer(
+                name="JobBulkAssignResponse",
+                fields={
+                    "matched": serializers.IntegerField(),
+                    "updated": serializers.IntegerField(),
+                    "skipped_already_assigned": serializers.IntegerField(),
+                },
+            ),
+            400: OpenApiResponse(description="Unknown profile or filter."),
+            409: OpenApiResponse(
+                description="The job has already started processing."
+            ),
+        },
+    )
+    def post(self, request, job_id):
+        try:
+            job = ProcessingJob.objects.get(pk=job_id)
+        except ProcessingJob.DoesNotExist as exc:
+            raise Http404("Processing job not found.") from exc
+        # Assignments only make sense before the pipeline runs; changing them
+        # mid-flight would make the produced results untraceable.
+        if job.status != "idle":
+            return Response(
+                {
+                    "detail": (
+                        "This job has already started; assignments can no "
+                        "longer change."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        serializer = BulkAssignmentRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile_id = serializer.validated_data["profileId"]
+        filter_type = serializer.validated_data["filter"]["type"]
+        filter_value = serializer.validated_data["filter"]["value"].strip()
+
+        target_profile = None
+        if profile_id is not None:
+            try:
+                target_profile = ExtractionProfile.objects.get(pk=profile_id)
+            except ExtractionProfile.DoesNotExist:
+                return Response(
+                    {"profileId": ["Choose a valid profile."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        pending_documents = list(
+            job.documents.filter(processing_status="pending").order_by("id")
+        )
+        matched = [
+            document
+            for document in pending_documents
+            if _matches_bulk_filter(
+                document.filename, filter_type, filter_value
+            )
+        ]
+
+        updated = 0
+        preserved_manual = 0
+        with transaction.atomic():
+            for document in matched:
+                # A manual decision always wins over a bulk action.
+                if document.assignment_method == "manual":
+                    preserved_manual += 1
+                    continue
+                if target_profile is None:
+                    document.profile = None
+                    document.assignment_status = "unassigned"
+                    document.assignment_confidence = 0.0
+                    document.assignment_reason = (
+                        f"bulk-cleared via {filter_type}: {filter_value}"
+                    )
+                else:
+                    document.profile = target_profile
+                    document.assignment_status = "assigned"
+                    document.assignment_confidence = 1.0
+                    document.assignment_reason = (
+                        f"bulk-assigned via {filter_type}: {filter_value}"
+                    )
+                document.assignment_method = "bulk"
+                document.assignment_rule = filter_type
+                document.save(
+                    update_fields=[
+                        "profile",
+                        "assignment_status",
+                        "assignment_method",
+                        "assignment_rule",
+                        "assignment_confidence",
+                        "assignment_reason",
+                    ]
+                )
+                updated += 1
+
+        return Response(
+            {
+                "matched": len(matched),
+                "updated": updated,
+                "skipped_already_assigned": preserved_manual,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class JobStartView(APIView):
@@ -763,6 +899,21 @@ class DocumentDetailView(APIView):
                 document.assignment_status = validated["assignmentStatus"]
                 if "assignment_status" not in update_fields:
                     update_fields.append("assignment_status")
+                # A standalone status change is still a manual decision and
+                # must survive later bulk sweeps.
+                if "profileId" not in validated:
+                    document.assignment_method = "manual"
+                    document.assignment_rule = "manual_status"
+                    document.assignment_confidence = 0.0
+                    document.assignment_reason = (
+                        f"Manually set to {document.assignment_status} by user."
+                    )
+                    update_fields.extend([
+                        "assignment_method",
+                        "assignment_rule",
+                        "assignment_confidence",
+                        "assignment_reason",
+                    ])
 
             if update_fields:
                 document.save(update_fields=update_fields)

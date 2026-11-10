@@ -23,8 +23,14 @@ import {
   Gauge,
   Clock,
   LayoutTemplate,
+  ListChecks,
 } from "lucide-react";
-import { ExtractionProfile, DocumentAssignment } from "../../types/extraction";
+import {
+  ExtractionProfile,
+  DocumentAssignment,
+  BulkAssignmentRequest,
+} from "../../types/extraction";
+import { BulkAssignModal } from "./BulkAssignModal";
 import {
   unpackZipArchive,
   unpackMultipleZipArchives,
@@ -35,6 +41,7 @@ import {
 import { createDemoZipArchive } from "../../services/sampleArchiveGenerator";
 import {
   assignJobProfiles,
+  bulkAssignJobDocuments,
   createBatchJob,
   getJobAssignments,
   uploadJobArchive,
@@ -322,6 +329,12 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
   const [isAssigning, setIsAssigning] = useState(false);
   const [hasAnalyzed, setHasAnalyzed] = useState(false);
   const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  // Bulk-assignment modal plus its non-blocking result toast.
+  const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
+  const [bulkNotice, setBulkNotice] = useState<{
+    tone: "success" | "info";
+    text: string;
+  } | null>(null);
   // Profile the analysed batch job was created with. Frozen once analysed so a
   // later change to the global profile selection cannot misrepresent (or
   // silently replace) the job default the assignments were computed against.
@@ -388,6 +401,8 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     setAssignments([]);
     setAssignmentError(null);
     setJobProfileId(null);
+    setIsBulkModalOpen(false);
+    setBulkNotice(null);
   }, [archiveResult]);
 
   const resetDiscoveryViews = () => {
@@ -649,6 +664,61 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     }
   };
 
+  // Bulk assignment rewrites the profile of every matched document, so it is
+  // only offered while nothing has moved past "pending".
+  const pendingAssignments = useMemo(
+    () => assignments.filter((asgn) => asgn.processingStatus === "pending"),
+    [assignments],
+  );
+  const canBulkAssign =
+    hasAnalyzed &&
+    assignments.length > 0 &&
+    !isAssigning &&
+    !isProcessing &&
+    assignments.every((asgn) => asgn.processingStatus === "pending");
+
+  useEffect(() => {
+    if (!bulkNotice) return;
+    const handle = setTimeout(() => setBulkNotice(null), 6000);
+    return () => clearTimeout(handle);
+  }, [bulkNotice]);
+
+  const handleBulkAssign = async (payload: BulkAssignmentRequest) => {
+    const jobId = jobIdRef.current;
+    if (!jobId) {
+      throw new Error(
+        "No job has been created yet. Please analyze documents first.",
+      );
+    }
+    const result = await bulkAssignJobDocuments(jobId, payload);
+    const results = await getJobAssignments(jobId);
+    setAssignments(results);
+    setAssignmentError(null);
+    setIsBulkModalOpen(false);
+
+    if (result.matched === 0) {
+      setBulkNotice({
+        tone: "info",
+        text: `No pending documents matched "${payload.filter.value}".`,
+      });
+      return;
+    }
+    const targetName = payload.profileId
+      ? profiles.find((profile) => profile.id === payload.profileId)?.name ??
+      "the selected profile"
+      : null;
+    const preserved =
+      result.skipped_already_assigned > 0
+        ? ` ${result.skipped_already_assigned} manual assignment(s) preserved.`
+        : "";
+    setBulkNotice({
+      tone: "success",
+      text: targetName
+        ? `Bulk assigned ${result.updated} of ${result.matched} matched document(s) to ${targetName}.${preserved}`
+        : `Cleared the profile on ${result.updated} of ${result.matched} matched document(s).${preserved}`,
+    });
+  };
+
   return (
     <div className="max-w-6xl mx-auto space-y-8">
       {/* View Title */}
@@ -717,8 +787,8 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
           }}
           onClick={() => fileInputRef.current?.click()}
           className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors ${isDragging
-              ? "border-neutral-900 bg-neutral-50"
-              : "border-neutral-300 hover:border-neutral-400 bg-neutral-50/50"
+            ? "border-neutral-900 bg-neutral-50"
+            : "border-neutral-300 hover:border-neutral-400 bg-neutral-50/50"
             }`}
         >
           <input
@@ -1065,6 +1135,23 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                 </span>
               </button>
             )}
+
+            {hasAnalyzed && (
+              <button
+                type="button"
+                onClick={() => setIsBulkModalOpen(true)}
+                disabled={!canBulkAssign}
+                title={
+                  canBulkAssign
+                    ? "Assign one profile to every pending document matching a filename filter"
+                    : "Bulk assignment is only available while every document is pending."
+                }
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-neutral-800 bg-white hover:bg-neutral-100 border border-neutral-300 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ListChecks className="w-3.5 h-3.5 text-neutral-600" />
+                <span>Bulk assign</span>
+              </button>
+            )}
           </div>
 
           {/* Job default extraction profile. The batch job is created with it,
@@ -1165,18 +1252,31 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                             </select>
                           </td>
                           <td className="px-4 py-2">
-                            <span
-                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${asgn.assignmentStatus === "assigned"
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${asgn.assignmentStatus === "assigned"
                                   ? "bg-emerald-100 text-emerald-800"
                                   : asgn.assignmentStatus === "ambiguous"
                                     ? "bg-amber-100 text-amber-800"
                                     : asgn.assignmentStatus === "excluded"
                                       ? "bg-neutral-100 text-neutral-800"
                                       : "bg-rose-100 text-rose-800"
-                                }`}
-                            >
-                              {asgn.assignmentStatus}
-                            </span>
+                                  }`}
+                              >
+                                {asgn.assignmentStatus}
+                              </span>
+                              {(asgn.assignmentMethod === "manual" ||
+                                asgn.assignmentMethod === "bulk") && (
+                                  <span
+                                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${asgn.assignmentMethod === "bulk"
+                                      ? "bg-indigo-100 text-indigo-800"
+                                      : "bg-sky-100 text-sky-800"
+                                      }`}
+                                  >
+                                    {asgn.assignmentMethod}
+                                  </span>
+                                )}
+                            </div>
                           </td>
                           <td className="px-4 py-2 text-neutral-500">
                             <div className="flex items-center gap-2">
@@ -1227,6 +1327,37 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
               <span>Start Extraction Pipeline</span>
             </button>
           </div>
+        </div>
+      )}
+
+      {isBulkModalOpen && (
+        <BulkAssignModal
+          profiles={profiles}
+          documents={pendingAssignments}
+          defaultProfileId={jobProfile?.id}
+          onClose={() => setIsBulkModalOpen(false)}
+          onConfirm={handleBulkAssign}
+        />
+      )}
+
+      {bulkNotice && (
+        <div
+          role="status"
+          className={`fixed bottom-6 right-6 z-50 flex items-start gap-3 max-w-sm px-4 py-3 rounded-lg border shadow-lg text-xs ${bulkNotice.tone === "success"
+            ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+            : "bg-sky-50 border-sky-200 text-sky-900"
+            }`}
+        >
+          <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="leading-relaxed">{bulkNotice.text}</span>
+          <button
+            type="button"
+            onClick={() => setBulkNotice(null)}
+            aria-label="Dismiss notification"
+            className="ml-auto opacity-60 hover:opacity-100 transition-opacity"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
     </div>
