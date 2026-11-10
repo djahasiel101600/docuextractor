@@ -1,0 +1,284 @@
+{
+  "jobId": "job-29e2e0c0-857f-46cd-a07e-df56000d9fb1",
+  "profile": "W8 Profile",
+  "documents": 104,
+  "processed": 104,
+  "missingFiles": [],
+  "failures": [],
+  "ocrAi": "disabled (deterministic offline run)",
+  "timing": {
+    "totalSeconds": 205.6,
+    "averageSeconds": 1.98,
+    "p95Seconds": 9.43
+  },
+  "invalidCounts": {
+    "before": {
+      "ssn_tin": 15
+    },
+    "after": {}
+  },
+  "semanticViolations": {
+    "before": {
+      "country_mailing": 38,
+      "ssn_tin": 15,
+      "country": 14,
+      "country_of_citizenship": 1
+    },
+    "after": {}
+  },
+  "addressFragmentValues": {
+    "old": 0,
+    "new": 0
+  },
+  "statusTransitions": {
+    "country: AMBIGUOUS -> NOT_FOUND": 1,
+    "country: MATCHED -> MATCHED": 29,
+    "country: MATCHED -> NOT_FOUND": 10,
+    "country: MISMATCH -> NOT_FOUND": 1,
+    "country: MISSING -> NOT_FOUND": 57,
+    "country: NOT_FOUND -> NOT_FOUND": 3,
+    "country: OCR_EXTRACTED -> NOT_FOUND": 3,
+    "country_mailing: AMBIGUOUS -> NOT_FOUND": 1,
+    "country_mailing: MATCHED -> MATCHED": 5,
+    "country_mailing: MATCHED -> NOT_FOUND": 30,
+    "country_mailing: MISMATCH -> NOT_FOUND": 1,
+    "country_mailing: MISSING -> NOT_FOUND": 57,
+    "country_mailing: NOT_FOUND -> NOT_FOUND": 3,
+    "country_mailing: OCR_EXTRACTED -> NOT_FOUND": 7,
+    "country_of_citizenship: MATCHED -> MATCHED": 32,
+    "country_of_citizenship: MATCHED -> NOT_FOUND": 1,
+    "country_of_citizenship: MISSING -> NOT_FOUND": 57,
+    "country_of_citizenship: NOT_FOUND -> NOT_FOUND": 14,
+    "ssn_tin: INVALID -> NOT_FOUND": 15,
+    "ssn_tin: MISMATCH -> MATCHED": 1,
+    "ssn_tin: MISSING -> NOT_FOUND": 57,
+    "ssn_tin: NOT_FOUND -> NOT_FOUND": 31
+  },
+  "changedExamples": [
+    {
+      "document": "ALI, HELALY_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Alexandria, 21523",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "ALI, HELALY_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "30212170201452",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aidar Osmonaliev_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Bishkek",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aidar Osmonaliev_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "21210200250156",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Albina Askatova_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Bishkek",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Albina Askatova_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "11703200200242",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Anjalee Dinushika, Kariyawasam Manage_W8.pdf",
+      "field": "country",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Gampaha, Western Province, 11564",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Anjalee Dinushika, Kariyawasam Manage_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Gampaha, Western Province, 11564",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Arnel Prado_W8.pdf",
+      "field": "country",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Angeles City, Pampanga",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Arnel Prado_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Angeles City, Pampanga",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aubaid Baba_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Srinagar Jammu and Kashmir 190020",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aubaid Baba_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "FLLPB0278N",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aurimas Juskevicius_W8.pdf",
+      "field": "country",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "ciurlionio 12",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Aurimas Juskevicius_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "OCR_EXTRACTED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "siauliai",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Chesslyn Beneke_W8.pdf",
+      "field": "country",
+      "oldStatus": "OCR_EXTRACTED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "O72 /1) 7247",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Chesslyn Beneke_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "OCR_EXTRACTED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "O72 /1) 7247",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "DESMOND AKPAN_W8.pdf",
+      "field": "country",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "GBAGADA, LAGOS, 100234",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "DESMOND AKPAN_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "GBAGADA, LAGOS, 100234",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "DESMOND AKPAN_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "N-16641021",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Dominykas Slizauskas_W8.pdf",
+      "field": "ssn_tin",
+      "oldStatus": "INVALID",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "50506170758",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Edgaras Zemaitatis_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "OCR_EXTRACTED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Klaipeda",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Fazlyn_Lagardien_W8.pdf",
+      "field": "country_of_citizenship",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "29-10-1977",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Fazlyn_Lagardien_W8.pdf",
+      "field": "country",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "29-10-1977",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Fazlyn_Lagardien_W8.pdf",
+      "field": "country_mailing",
+      "oldStatus": "MATCHED",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "29-10-1977",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    },
+    {
+      "document": "Filippos Argyropoulos loannou_W8.pdf",
+      "field": "country",
+      "oldStatus": "MISMATCH",
+      "newStatus": "NOT_FOUND",
+      "oldValue": "Anavyssos Athens Greece \u06f1\u06f9\u06f0\u06f1\u06f3",
+      "newValue": "",
+      "newValidationError": "No value was extracted."
+    }
+  ]
+}

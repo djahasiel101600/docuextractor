@@ -21,6 +21,7 @@ import {
 } from './types/extraction';
 import { ArchiveDiscoveryResult } from './services/zipService';
 import {
+  cancelJob,
   createBatchJob,
   createJob,
   createProfile,
@@ -32,6 +33,7 @@ import {
   getDocumentFile,
   listJobs,
   listProfiles,
+  retryJob,
   startJob,
   updateDocumentField,
   updateDocumentReview,
@@ -48,6 +50,11 @@ const DocumentInspectorModal = React.lazy(() =>
 
 const PROFILE_STORAGE_KEY = 'docuextract_profiles_v1';
 const ACTIVE_JOB_STORAGE_KEY = 'docuextract_active_job_id_v1';
+// The full job payload carries every document with its extracted fields,
+// diagnostics and raw PDF text. Progress is cheap and stays at 2 s; the heavy
+// payload is refreshed on the first tick, every 8th tick (~16 s), and once
+// more when the run finishes, instead of on every progress poll.
+const DETAIL_REFRESH_TICKS = 8;
 const TAB_PATHS: Record<ActiveTab, string> = {
   dashboard: '/',
   'new-job': '/jobs/new',
@@ -230,19 +237,45 @@ export default function App() {
       return;
     }
     let cancelled = false;
+    let tickCount = 0;
+    // A full-payload refresh on a large batch can outlast the 2 s interval;
+    // never let ticks stack up behind it.
+    let inFlight = false;
     setIsProcessing(true);
     const tick = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
       try {
-        const [progress, detail] = await Promise.all([
-          getJobProgress(runningJobId),
-          getJob(runningJobId),
-        ]);
+        const progress = await getJobProgress(runningJobId);
         if (cancelled) {
           return;
         }
-        setJobs((current) =>
-          current.map((job) => (job.id === detail.id ? detail : job))
-        );
+        const refreshDetail =
+          tickCount === 0 ||
+          tickCount % DETAIL_REFRESH_TICKS === 0 ||
+          progress.status !== 'running';
+        tickCount += 1;
+        const detail = refreshDetail ? await getJob(runningJobId) : null;
+        if (cancelled) {
+          return;
+        }
+        if (detail) {
+          setJobs((current) =>
+            current.map((job) => (job.id === detail.id ? detail : job))
+          );
+        } else {
+          // Keep the job status authoritative even when the document payload
+          // is not refreshed this tick.
+          setJobs((current) =>
+            current.map((job) =>
+              job.id === runningJobId
+                ? { ...job, status: progress.status }
+                : job
+            )
+          );
+        }
         setProcessingProgress({
           phase: 'processing',
           total: progress.totalDiscovered,
@@ -644,6 +677,47 @@ export default function App() {
     setExportJobOverride(targetJob);
     setIsExportModalOpen(true);
   };
+
+  const handleCancelJob = () => {
+    if (!activeJob) {
+      return;
+    }
+    setWorkspaceError(null);
+    void cancelJob(activeJob.id)
+      .then(() => {
+        // The worker flips the status once the in-flight documents finish.
+        setJobs((current) =>
+          current.map((job) =>
+            job.id === activeJob.id ? { ...job, cancelRequested: true } : job
+          )
+        );
+      })
+      .catch((error: unknown) => {
+        setWorkspaceError(`Could not cancel the job: ${getApiErrorMessage(error)}`);
+      });
+  };
+
+  const handleRetryJob = () => {
+    if (!activeJob) {
+      return;
+    }
+    setWorkspaceError(null);
+    void retryJob(activeJob.id)
+      .then(() => {
+        // Pick the job back up immediately; the watcher takes over from here.
+        setJobs((current) =>
+          current.map((job) =>
+            job.id === activeJob.id
+              ? { ...job, status: 'running' as const, cancelRequested: false }
+              : job
+          )
+        );
+      })
+      .catch((error: unknown) => {
+        setWorkspaceError(`Could not retry the job: ${getApiErrorMessage(error)}`);
+      });
+  };
+
   const handleOpenExportDefault = () => {
     setExportJobOverride(null);
     setIsExportModalOpen(true);
@@ -802,6 +876,8 @@ export default function App() {
                 onToggleReviewed={handleToggleReviewed}
                 onUpdateFieldValue={handleUpdateFieldValue}
                 onOpenExport={handleOpenExportDefault}
+                onCancelJob={handleCancelJob}
+                onRetryJob={handleRetryJob}
               />
             ) : (
               <div className="mx-auto max-w-2xl space-y-4 rounded-xl border border-neutral-200 bg-white p-12 text-center shadow-xs">

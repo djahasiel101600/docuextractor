@@ -52,6 +52,13 @@ class ProcessingJob(models.Model):
     missing_count = models.PositiveIntegerField(default=0)
     invalid_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Durable-execution controls. The heartbeat is refreshed by the worker
+    # while it owns the job, so a restarted process can tell an orphaned
+    # "running" job (stale/absent heartbeat) from one a live worker is still
+    # processing. cancel_requested is polled between documents instead of
+    # killing threads mid-extraction.
+    heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    cancel_requested = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["-created_at"]

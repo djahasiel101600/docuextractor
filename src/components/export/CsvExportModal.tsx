@@ -42,6 +42,7 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
   const [includeBom, setIncludeBom] = useState<boolean>(true);
   const [useCorrectedValues, setUseCorrectedValues] = useState<boolean>(true);
   const [onlyReviewed, setOnlyReviewed] = useState<boolean>(false);
+  const [includeInvalid, setIncludeInvalid] = useState<boolean>(false);
   // Columns are the union of every profile used in this batch, matching what
   // the backend export produces.
   const availableFields = useMemo(
@@ -66,10 +67,11 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
       delimiter,
       includeBom,
       useCorrectedValues,
+      includeInvalid,
       selectedFieldIds,
       profiles,
     });
-  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, selectedFieldIds, profiles]);
+  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, includeInvalid, selectedFieldIds, profiles]);
 
   const diagnosticsCsvContent = useMemo(() => {
     return generateDiagnosticsCsv(targetDocs, profile, {
@@ -95,6 +97,7 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
         includeBom,
         useCorrectedValues,
         onlyReviewed,
+        includeInvalid,
         selectedFieldIds,
       });
       const url = URL.createObjectURL(blob);
@@ -178,8 +181,8 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                   type="button"
                   onClick={() => setDelimiter(',')}
                   className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === ','
-                      ? 'bg-neutral-900 text-white border-neutral-900'
-                      : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
+                    ? 'bg-neutral-900 text-white border-neutral-900'
+                    : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
                     }`}
                 >
                   Comma ( , )
@@ -188,8 +191,8 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                   type="button"
                   onClick={() => setDelimiter(';')}
                   className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === ';'
-                      ? 'bg-neutral-900 text-white border-neutral-900'
-                      : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
+                    ? 'bg-neutral-900 text-white border-neutral-900'
+                    : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
                     }`}
                 >
                   Semicolon ( ; )
@@ -198,8 +201,8 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                   type="button"
                   onClick={() => setDelimiter('\t')}
                   className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === '\t'
-                      ? 'bg-neutral-900 text-white border-neutral-900'
-                      : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
+                    ? 'bg-neutral-900 text-white border-neutral-900'
+                    : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
                     }`}
                 >
                   Tab ( \t )
@@ -240,6 +243,18 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                 />
                 <span className="text-neutral-700">
                   Export only reviewed documents ({job.documents.filter((d) => d.isReviewed).length})
+                </span>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={includeInvalid}
+                  onChange={(e) => setIncludeInvalid(e.target.checked)}
+                  className="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900"
+                />
+                <span className="text-neutral-700">
+                  Include values that failed validation (flagged in CSV)
                 </span>
               </label>
             </div>
@@ -316,8 +331,8 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                   type="button"
                   onClick={() => setActiveTab('primary')}
                   className={`px-3 py-1.5 rounded-md transition-colors ${activeTab === 'primary'
-                      ? 'bg-neutral-900 text-white font-semibold'
-                      : 'text-neutral-600 hover:text-neutral-900'
+                    ? 'bg-neutral-900 text-white font-semibold'
+                    : 'text-neutral-600 hover:text-neutral-900'
                     }`}
                 >
                   Primary Reconciled Dataset ({targetDocs.length} rows)
@@ -326,8 +341,8 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({
                   type="button"
                   onClick={() => setActiveTab('diagnostics')}
                   className={`px-3 py-1.5 rounded-md transition-colors ${activeTab === 'diagnostics'
-                      ? 'bg-neutral-900 text-white font-semibold'
-                      : 'text-neutral-600 hover:text-neutral-900'
+                    ? 'bg-neutral-900 text-white font-semibold'
+                    : 'text-neutral-600 hover:text-neutral-900'
                     }`}
                 >
                   Diagnostics Trace Report ({targetDocs.length * selectedFieldIds.length} events)

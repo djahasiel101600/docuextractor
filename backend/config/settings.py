@@ -219,7 +219,11 @@ MAX_UPLOAD_SIZE_BYTES = int(
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(
     os.getenv("MAX_ARCHIVE_UNCOMPRESSED_SIZE_MB", "500")
 ) * 1024 * 1024
-MAX_ARCHIVE_FILES = int(os.getenv("MAX_ARCHIVE_FILES", "500"))
+MAX_ARCHIVE_FILES = int(os.getenv("MAX_ARCHIVE_FILES", "1500"))
+# Hard ceiling on the PDFs a single job may aggregate across appended archives.
+# Backs the per-job ThreadPoolExecutor and the job JSON payload with a limit
+# that a multi-archive batch cannot silently exceed.
+MAX_JOB_DOCUMENTS = int(os.getenv("MAX_JOB_DOCUMENTS", "2000"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
 PDF_PROCESSING_WORKERS = max(
     1,
@@ -229,6 +233,16 @@ PDF_PROCESSING_WORKERS = max(
         os.cpu_count() or 1,
     ),
 )
+# Durable execution. A running job whose heartbeat is older than the stale
+# window is treated as orphaned after a crash/restart and resumed; the
+# heartbeat refresh interval must stay well below the window.
+JOB_HEARTBEAT_INTERVAL_SECONDS = int(
+    os.getenv("JOB_HEARTBEAT_INTERVAL_SECONDS", "10"))
+JOB_STALE_SECONDS = int(os.getenv("JOB_STALE_SECONDS", "120"))
+# How often each server process scans for orphaned jobs. Must stay below the
+# stale window so a dead worker is noticed promptly.
+JOB_RECOVERY_INTERVAL_SECONDS = int(
+    os.getenv("JOB_RECOVERY_INTERVAL_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true"
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 if TESSERACT_CMD:

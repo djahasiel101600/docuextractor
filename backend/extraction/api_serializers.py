@@ -126,6 +126,7 @@ class ProcessingJobResponseSerializer(serializers.Serializer):
     currentProcessingFile = serializers.CharField(allow_blank=True)
     currentProcessingFiles = serializers.ListField(
         child=serializers.CharField())
+    cancelRequested = serializers.BooleanField()
     documents = DocumentResponseSerializer(many=True)
 
 
@@ -144,6 +145,7 @@ class ProcessingJobProgressSerializer(serializers.Serializer):
     averageSecondsPerDocument = serializers.FloatField(allow_null=True)
     estimatedRemainingSeconds = serializers.FloatField(allow_null=True)
     workerCount = serializers.IntegerField()
+    cancelRequested = serializers.BooleanField()
 
 
 class JobUploadRequestSerializer(serializers.Serializer):
@@ -238,5 +240,6 @@ def job_data(job):
         "status": job.status,
         "currentProcessingFile": current_processing_file,
         "currentProcessingFiles": current_processing_files,
+        "cancelRequested": job.cancel_requested,
         "documents": documents,
     }

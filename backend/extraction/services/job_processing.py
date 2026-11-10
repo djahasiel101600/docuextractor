@@ -1,4 +1,5 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import timedelta
 import hashlib
 import logging
 import threading
@@ -8,6 +9,8 @@ import uuid
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db import close_old_connections, transaction
+from django.db.models import Count, Q
+from django.utils import timezone
 import fitz
 import pytesseract
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -21,6 +24,51 @@ from ..models import (
 from .document_extraction import process_pdf
 
 logger = logging.getLogger(__name__)
+
+
+def _document_totals(job_id):
+    """Per-status document counts for a job, in one query.
+
+    Counters used to be incremented from zero for the current run, which made
+    a resumed or retried job report only its latest slice of work.
+    """
+    rows = (
+        PDFDocument.objects.filter(job_id=job_id)
+        .values("processing_status")
+        .annotate(total=Count("id"))
+    )
+    return {row["processing_status"]: row["total"] for row in rows}
+
+
+def _job_should_stop(job_id):
+    """True when the worker no longer owns the job or a cancel was requested.
+
+    Read from the database on every scheduling pass, so a cancel request made
+    in any process reaches the worker that is actually running the batch.
+    """
+    state = (
+        ProcessingJob.objects.filter(pk=job_id)
+        .values("cancel_requested", "status")
+        .first()
+    )
+    if state is None:
+        return True
+    return bool(state["cancel_requested"]) or state["status"] != "running"
+
+
+def _heartbeat_loop(job_id, stop_event):
+    """Refresh the job heartbeat until the worker is done."""
+    interval = max(int(settings.JOB_HEARTBEAT_INTERVAL_SECONDS), 1)
+    while not stop_event.wait(interval):
+        try:
+            ProcessingJob.objects.filter(pk=job_id).update(
+                heartbeat_at=timezone.now()
+            )
+        except Exception:  # noqa: BLE001 - heartbeat must never kill the job
+            logger.exception(
+                "Could not refresh the heartbeat for job %s.", job_id)
+        finally:
+            close_old_connections()
 
 
 def _extract_document(job_id, document, extraction_profile, content=None):
@@ -151,14 +199,17 @@ def _save_document_result(
     )
 
 
-def _finalize_job(job, processed_count, failed_count, skipped_count):
+def _finalize_job(job, cancelled=False):
     documents = list(job.documents.prefetch_related("field_diagnostics"))
-    job.processed_count = processed_count
-    job.failed_count = failed_count
-    job.skipped_count = skipped_count
-    # A batch where every document was deliberately excluded is a success, not
-    # an error: nothing needed to run.
-    job.status = "completed" if (processed_count or skipped_count) else "error"
+    # Recompute the totals from document state instead of trusting the current
+    # run's counters, so a resumed or retried job reports the whole batch and
+    # cannot lose earlier results.
+    job.processed_count = sum(
+        1 for doc in documents if doc.processing_status == "completed")
+    job.failed_count = sum(
+        1 for doc in documents if doc.processing_status == "failed")
+    job.skipped_count = sum(
+        1 for doc in documents if doc.processing_status == "excluded")
     job.review_required_count = sum(
         any(item.details.get("reviewRequired")
             for item in doc.field_diagnostics.all())
@@ -179,7 +230,24 @@ def _finalize_job(job, processed_count, failed_count, skipped_count):
             "INVALID" for item in doc.field_diagnostics.all())
         for doc in documents
     )
-    job.save()
+    if cancelled:
+        # A cooperative stop is a user decision, not a failure: documents that
+        # were never reached stay pending so a retry can resume exactly them.
+        job.status = "cancelled"
+    elif job.processed_count or job.skipped_count:
+        job.status = "completed"
+    else:
+        job.status = "error"
+    job.save(update_fields=[
+        "processed_count",
+        "failed_count",
+        "skipped_count",
+        "review_required_count",
+        "conflict_count",
+        "missing_count",
+        "invalid_count",
+        "status",
+    ])
 
 
 def process_job(job_id, entries=None):
@@ -187,8 +255,37 @@ def process_job(job_id, entries=None):
     processed_count = 0
     failed_count = 0
     skipped_count = 0
+    cancelled = False
+    heartbeat_stop = threading.Event()
     try:
         job = ProcessingJob.objects.select_related("profile").get(pk=job_id)
+        # A duplicate launch (or a job cancelled before the worker got here)
+        # must not process anything: the compare-and-swap claim already moved
+        # ownership elsewhere.
+        if job.status != "running":
+            return
+        if job.cancel_requested:
+            _finalize_job(job, cancelled=True)
+            return
+        # Resume from what is already on disk so progress and the final report
+        # cover the whole job, not just this run.
+        totals = _document_totals(job_id)
+        processed_count = totals.get("completed", 0)
+        failed_count = totals.get("failed", 0)
+        skipped_count = totals.get("excluded", 0)
+        ProcessingJob.objects.filter(pk=job_id).update(
+            heartbeat_at=timezone.now(),
+            processed_count=processed_count,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+        )
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            args=(job_id, heartbeat_stop),
+            name=f"docuextract-heartbeat-{job_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         if entries is not None:
             # Single-upload path: the PDF bytes are already decompressed in
@@ -251,6 +348,12 @@ def process_job(job_id, entries=None):
             thread_name_prefix="docuextract-pdf",
         ) as executor:
             while next_document < len(documents) or active:
+                # Cooperative cancel: checked between documents from any
+                # process. Already-running extractions finish and are saved;
+                # the rest of the queue is left pending for a retry.
+                if _job_should_stop(job_id):
+                    cancelled = True
+                    next_document = len(documents)
                 while next_document < len(documents) and len(active) < worker_count:
                     document = documents[next_document]
 
@@ -353,17 +456,58 @@ def process_job(job_id, entries=None):
                     processed_count = next_processed
                     failed_count = next_failed
 
-        _finalize_job(job, processed_count, failed_count, skipped_count)
+        if not cancelled and _job_should_stop(job_id):
+            cancelled = True
+        _finalize_job(job, cancelled=cancelled)
     except Exception:
         logger.exception("Background processing failed for job %s.", job_id)
+        try:
+            totals = _document_totals(job_id)
+        except Exception:  # noqa: BLE001 - keep the original error reportable
+            totals = {}
         ProcessingJob.objects.filter(pk=job_id).update(
             status="error",
-            processed_count=processed_count,
-            failed_count=failed_count,
-            skipped_count=skipped_count,
+            processed_count=totals.get("completed", processed_count),
+            failed_count=totals.get("failed", failed_count),
+            skipped_count=totals.get("excluded", skipped_count),
         )
     finally:
+        heartbeat_stop.set()
         close_old_connections()
+
+
+def recover_stale_jobs():
+    """Resume jobs orphaned by a crash or restart.
+
+    A "running" job whose heartbeat is missing or older than
+    settings.JOB_STALE_SECONDS has no live worker. Claim it with a conditional
+    update (several processes may scan at once; only one update can win), reset
+    documents interrupted mid-extraction, and relaunch. Returns the resumed
+    job ids.
+    """
+    cutoff = timezone.now() - timedelta(seconds=settings.JOB_STALE_SECONDS)
+    stale_filter = Q(heartbeat_at__isnull=True) | Q(heartbeat_at__lt=cutoff)
+    stale_ids = list(
+        ProcessingJob.objects.filter(status="running")
+        .filter(stale_filter)
+        .values_list("pk", flat=True)
+    )
+    resumed = []
+    for job_id in stale_ids:
+        claimed = (
+            ProcessingJob.objects.filter(pk=job_id, status="running")
+            .filter(stale_filter)
+            .update(heartbeat_at=timezone.now())
+        )
+        if not claimed:
+            continue
+        PDFDocument.objects.filter(
+            job_id=job_id, processing_status="processing"
+        ).update(processing_status="pending")
+        logger.warning("Resuming orphaned job %s after restart.", job_id)
+        launch_job_processing(job_id)
+        resumed.append(job_id)
+    return resumed
 
 
 def launch_job_processing(job_id, entries=None):

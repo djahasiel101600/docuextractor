@@ -296,6 +296,16 @@ class JobListCreateView(APIView):
             return Response({"profileId": ["Choose a valid profile."]}, status=400)
 
         entries = discover_pdf_files(upload)
+        if len(entries) > settings.MAX_JOB_DOCUMENTS:
+            return Response(
+                {
+                    "detail": (
+                        "This job would exceed the configured limit of "
+                        f"{settings.MAX_JOB_DOCUMENTS} documents."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         job_id = f"job-{uuid.uuid4()}"
         job = ProcessingJob.objects.create(
             id=job_id,
@@ -400,7 +410,35 @@ class JobArchiveAppendView(APIView):
             ) else str(detail)
             return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Lock the job row for the whole append so two archives uploaded in
+        # parallel cannot both count the same existing total (and lose one
+        # archive's PDFs) or race past MAX_JOB_DOCUMENTS. The status is
+        # re-checked inside the lock because a start request may have won the
+        # race while discovery was parsing this archive.
         with transaction.atomic():
+            job = (
+                ProcessingJob.objects.select_for_update()
+                .filter(pk=job_id)
+                .first()
+            )
+            if job is None:
+                raise Http404("Processing job not found.")
+            if job.status != "idle":
+                return Response(
+                    {"detail": "This job is no longer accepting archives."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            existing_count = job.documents.count()
+            if existing_count + len(entries) > settings.MAX_JOB_DOCUMENTS:
+                return Response(
+                    {
+                        "detail": (
+                            "This job would exceed the configured limit of "
+                            f"{settings.MAX_JOB_DOCUMENTS} documents."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             documents = []
             for entry in entries:
                 document = PDFDocument(
@@ -691,25 +729,117 @@ class JobStartView(APIView):
         responses={202: ProcessingJobResponseSerializer},
     )
     def post(self, request, job_id):
-        try:
-            job = ProcessingJob.objects.get(pk=job_id)
-        except ProcessingJob.DoesNotExist as exc:
-            raise Http404("Processing job not found.") from exc
-        if job.status != "idle":
-            return Response(
-                {"detail": "This job has already been started."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        if not job.documents.filter(processing_status="pending").exists():
-            job.delete()
-            return Response(
-                {"detail": "No archives containing valid PDFs were uploaded."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        job.status = "running"
-        job.save(update_fields=["status"])
+        with transaction.atomic():
+            try:
+                job = ProcessingJob.objects.select_for_update().get(pk=job_id)
+            except ProcessingJob.DoesNotExist as exc:
+                raise Http404("Processing job not found.") from exc
+            if job.status != "idle":
+                return Response(
+                    {"detail": "This job has already been started."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if not job.documents.filter(processing_status="pending").exists():
+                job.delete()
+                return Response(
+                    {"detail": "No archives containing valid PDFs were uploaded."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Compare-and-swap: authoritative on every backend (row locks are a
+            # no-op on SQLite), so two concurrent start requests can never both
+            # launch the same job.
+            claimed = ProcessingJob.objects.filter(
+                pk=job_id, status="idle"
+            ).update(status="running")
+            if not claimed:
+                return Response(
+                    {"detail": "This job has already been started."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            job.status = "running"
+        # Launch only after the transaction commits so the worker threads can
+        # read the running status and the appended documents.
         launch_job_processing(job.pk)
         return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
+
+
+class JobCancelView(APIView):
+    @extend_schema(
+        operation_id="jobs_cancel",
+        request=None,
+        responses={202: OpenApiTypes.OBJECT},
+    )
+    def post(self, request, job_id):
+        if not ProcessingJob.objects.filter(pk=job_id).exists():
+            raise Http404("Processing job not found.")
+        # Cooperative stop: the worker polls this flag between documents, so
+        # an extraction that is already running finishes and is saved first.
+        requested = ProcessingJob.objects.filter(
+            pk=job_id, status="running"
+        ).update(cancel_requested=True)
+        if not requested:
+            return Response(
+                {"detail": "Only a running job can be cancelled."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {"id": job_id, "status": "running", "cancelRequested": True},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class JobRetryView(APIView):
+    RETRYABLE_STATUSES = ("completed", "error", "cancelled")
+
+    @extend_schema(
+        operation_id="jobs_retry",
+        request=None,
+        responses={202: OpenApiTypes.OBJECT},
+    )
+    def post(self, request, job_id):
+        with transaction.atomic():
+            try:
+                job = ProcessingJob.objects.select_for_update().get(pk=job_id)
+            except ProcessingJob.DoesNotExist as exc:
+                raise Http404("Processing job not found.") from exc
+            if job.status not in self.RETRYABLE_STATUSES:
+                return Response(
+                    {"detail": "Only a finished, failed or cancelled job can "
+                               "be retried."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            # Retry re-queues exactly the documents that did not produce a
+            # result: failures, and anything a cancel left pending. Documents
+            # the user excluded stay excluded.
+            retryable = job.documents.filter(
+                processing_status__in=["failed", "pending"]
+            ).exclude(assignment_status="excluded")
+            if not retryable.exists():
+                return Response(
+                    {"detail": "There are no failed or pending documents to "
+                               "retry."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            retryable.update(processing_status="pending", error_details="")
+            claimed = ProcessingJob.objects.filter(
+                pk=job_id, status__in=self.RETRYABLE_STATUSES
+            ).update(
+                status="running",
+                cancel_requested=False,
+                heartbeat_at=timezone.now(),
+            )
+            if not claimed:
+                return Response(
+                    {"detail": "This job is already running."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            job.status = "running"
+        # Launch after commit so the worker sees the re-queued documents.
+        launch_job_processing(job.pk)
+        return Response(
+            {"id": job.id, "status": "running"},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class JobDetailView(APIView):
@@ -793,6 +923,7 @@ class JobProgressView(APIView):
                     else None
                 ),
                 "workerCount": settings.PDF_PROCESSING_WORKERS,
+                "cancelRequested": job.cancel_requested,
             }
         )
 
@@ -1031,6 +1162,15 @@ class JobExportView(APIView):
                 location=OpenApiParameter.QUERY,
             ),
             OpenApiParameter(
+                name="includeInvalid",
+                type=bool,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Include values that failed validation. Off by default so a "
+                    "primary CSV never ships INVALID values as if they were data."
+                ),
+            ),
+            OpenApiParameter(
                 name="fields",
                 type=str,
                 location=OpenApiParameter.QUERY,
@@ -1053,6 +1193,8 @@ class JobExportView(APIView):
         selected_ids = set(selected_ids.split(",")) if selected_ids else None
         only_reviewed = request.query_params.get(
             "onlyReviewed", "false").lower() == "true"
+        include_invalid = request.query_params.get(
+            "includeInvalid", "false").lower() == "true"
         include_bom = request.query_params.get(
             "includeBom", "true").lower() == "true"
         use_corrected = request.query_params.get(
@@ -1129,6 +1271,7 @@ class JobExportView(APIView):
                 "Processing Status",
                 "Extraction Method Used",
                 "Review Status",
+                "Flagged Values",
                 *[field.get("name", field["id"]) for field in profile_fields],
             ])]
             for document in job_documents.prefetch_related(
@@ -1142,6 +1285,24 @@ class JobExportView(APIView):
                     item.field_id: item.details
                     for item in document.field_diagnostics.all()
                 }
+                # INVALID values are diagnostic, not data: a primary export must
+                # not present "address." as a citizenship or an address line as
+                # an SSN. They are blanked by default and summarized in the
+                # Flagged Values column; includeInvalid=true opts back in.
+                invalid_ids = {
+                    field_id
+                    for field_id, details in diagnostics.items()
+                    if details.get("status") == "INVALID"
+                }
+                flagged = [
+                    "{name}: {reason}".format(
+                        name=field.get("name", field["id"]),
+                        reason=diagnostics[field["id"]].get(
+                            "validationError") or "INVALID",
+                    )
+                    for field in profile_fields
+                    if field["id"] in invalid_ids
+                ]
                 rows.append(writer.writerow([
                     document.filename,
                     document.relative_path,
@@ -1149,16 +1310,22 @@ class JobExportView(APIView):
                     document.processing_status,
                     document.extraction_method_used,
                     "Reviewed" if document.is_reviewed else "Pending Review",
+                    " | ".join(flagged),
                     *[
-                        (
-                            diagnostics.get(field["id"], {}).get("pdfValue")
-                            or diagnostics.get(field["id"], {}).get("filenameValue")
-                            or diagnostics.get(field["id"], {}).get("ocrValue")
-                            or ""
+                        ""
+                        if not include_invalid and field["id"] in invalid_ids
+                        else (
+                            (
+                                diagnostics.get(
+                                    field["id"], {}).get("pdfValue")
+                                or diagnostics.get(field["id"], {}).get("filenameValue")
+                                or diagnostics.get(field["id"], {}).get("ocrValue")
+                                or ""
+                            )
+                            if not use_corrected
+                            and diagnostics.get(field["id"], {}).get("isManuallyCorrected")
+                            else values.get(field["id"], "")
                         )
-                        if not use_corrected
-                        and diagnostics.get(field["id"], {}).get("isManuallyCorrected")
-                        else values.get(field["id"], "")
                         for field in profile_fields
                     ],
                 ]))

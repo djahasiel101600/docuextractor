@@ -200,6 +200,29 @@ export async function getJob(jobId: string): Promise<ProcessingJob> {
   return response.data;
 }
 
+/**
+ * Requests a cooperative stop. Documents already being extracted finish and
+ * are saved; the rest of the queue stays pending for a later retry.
+ */
+export async function cancelJob(
+  jobId: string
+): Promise<{ id: string; status: string; cancelRequested: boolean }> {
+  const response = await api.post<{ id: string; status: string; cancelRequested: boolean }>(
+    `/jobs/${encodeURIComponent(jobId)}/cancel/`
+  );
+  return response.data;
+}
+
+/** Re-queues failed documents and anything a cancel left pending. */
+export async function retryJob(
+  jobId: string
+): Promise<{ id: string; status: string }> {
+  const response = await api.post<{ id: string; status: string }>(
+    `/jobs/${encodeURIComponent(jobId)}/retry/`
+  );
+  return response.data;
+}
+
 export async function assignJobProfiles(jobId: string): Promise<{ detail: string }> {
   const response = await api.post<{ detail: string }>(
     `/jobs/${encodeURIComponent(jobId)}/assign/`
@@ -284,6 +307,7 @@ export async function downloadJobExport(
     includeBom: boolean;
     useCorrectedValues: boolean;
     onlyReviewed: boolean;
+    includeInvalid?: boolean;
     selectedFieldIds: string[];
   }
 ): Promise<Blob> {
@@ -296,6 +320,7 @@ export async function downloadJobExport(
         includeBom: options.includeBom,
         useCorrectedValues: options.useCorrectedValues,
         onlyReviewed: options.onlyReviewed,
+        includeInvalid: options.includeInvalid ?? false,
         fields: options.selectedFieldIds.join(','),
       },
       responseType: 'blob',

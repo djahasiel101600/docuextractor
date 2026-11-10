@@ -276,6 +276,7 @@ export interface ProcessingJob {
 
   status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
   currentProcessingFile?: string;
+  cancelRequested?: boolean;
 
   documents: PDFDocumentRecord[];
 }
@@ -294,4 +295,5 @@ export interface ProcessingJobProgress {
   averageSecondsPerDocument: number | null;
   estimatedRemainingSeconds: number | null;
   workerCount: number;
+  cancelRequested: boolean;
 }

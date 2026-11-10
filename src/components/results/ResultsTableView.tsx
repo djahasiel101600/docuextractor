@@ -18,7 +18,9 @@ import {
   Sparkles,
   ChevronRight,
   FileText,
+  RefreshCw,
   SlidersHorizontal,
+  XCircle,
 } from 'lucide-react';
 import {
   ProcessingJob,
@@ -35,11 +37,26 @@ interface ResultsTableViewProps {
   onToggleReviewed: (docId: string) => void;
   onUpdateFieldValue: (docId: string, fieldId: string, newValue: string) => void;
   onOpenExport: () => void;
+  onCancelJob: () => void;
+  onRetryJob: () => void;
 }
 
 type FilterCategory = 'all' | 'review' | 'conflicts' | 'missing' | 'invalid' | 'reviewed';
 
 type ProfileFilter = 'all' | string;
+
+interface FieldQualityMetric {
+  fieldId: string;
+  name: string;
+  documents: number;
+  extracted: number;
+  valid: number;
+  invalid: number;
+  missing: number;
+  conflicts: number;
+  corrected: number;
+  validityRate: number | null;
+}
 
 export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   job,
@@ -48,12 +65,15 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   onToggleReviewed,
   onUpdateFieldValue,
   onOpenExport,
+  onCancelJob,
+  onRetryJob,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterCategory>('all');
   const [sortField, setSortField] = useState<string>('filename');
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [profileFilter, setProfileFilter] = useState<ProfileFilter>('all');
+  const [showFieldQuality, setShowFieldQuality] = useState(false);
 
   // Inline quick-editing state: { docId, fieldId }
   const [editingCell, setEditingCell] = useState<{ docId: string; fieldId: string } | null>(null);
@@ -175,6 +195,69 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       aiUsed,
     };
   }, [job.documents, profiles]);
+
+  // Documents a retry would re-queue server-side: failures plus anything a
+  // cooperative cancel left pending (user-excluded docs stay excluded).
+  const retryableCount = useMemo(
+    () =>
+      job.documents.filter(
+        (doc) =>
+          doc.processingStatus === 'failed' ||
+          (doc.processingStatus === 'pending' &&
+            doc.assignmentStatus !== 'excluded')
+      ).length,
+    [job.documents]
+  );
+  const canRetry =
+    job.status !== 'running' && job.status !== 'idle' && retryableCount > 0;
+
+  // Per-field quality across the processed documents of this batch. "Valid"
+  // means the value passed the field's own validators; it is a validation pass
+  // rate, not a ground-truth precision measurement.
+  const fieldQualityMetrics = useMemo<FieldQualityMetric[]>(() => {
+    const metrics = new Map<string, FieldQualityMetric>();
+    for (const field of activeFields) {
+      metrics.set(field.id, {
+        fieldId: field.id,
+        name: field.name,
+        documents: 0,
+        extracted: 0,
+        valid: 0,
+        invalid: 0,
+        missing: 0,
+        conflicts: 0,
+        corrected: 0,
+        validityRate: null,
+      });
+    }
+    for (const doc of job.documents) {
+      if (doc.processingStatus !== 'completed') continue;
+      for (const field of getDocFields(doc)) {
+        const metric = metrics.get(field.id);
+        const diag = doc.diagnostics[field.id];
+        if (!metric || !diag) continue;
+        metric.documents += 1;
+        const value = doc.finalValues[field.id] ?? diag.finalValue ?? '';
+        if (String(value).trim()) {
+          metric.extracted += 1;
+          const fullyValid =
+            diag.validationPassed &&
+            !['INVALID', 'MISMATCH', 'AMBIGUOUS', 'REVIEW_REQUIRED'].includes(diag.status);
+          if (fullyValid) metric.valid += 1;
+        }
+        if (diag.status === 'INVALID') metric.invalid += 1;
+        if (diag.status === 'NOT_FOUND') metric.missing += 1;
+        if (diag.isConflict) metric.conflicts += 1;
+        if (diag.isManuallyCorrected) metric.corrected += 1;
+      }
+    }
+    return activeFields.map((field) => {
+      const metric = metrics.get(field.id)!;
+      metric.validityRate =
+        metric.extracted > 0 ? metric.valid / metric.extracted : null;
+      return metric;
+    });
+  }, [job.documents, activeFields, profiles]);
 
   // Filter documents
   const filteredDocuments = useMemo(() => {
@@ -347,6 +430,31 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {job.status === 'running' && (
+              <button
+                onClick={onCancelJob}
+                disabled={job.cancelRequested}
+                title={
+                  job.cancelRequested
+                    ? 'Waiting for the documents currently being extracted to finish'
+                    : 'Stop after the documents currently being extracted finish; the rest stay pending'
+                }
+                className="px-3 py-1.5 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 disabled:opacity-60 disabled:cursor-not-allowed rounded-md transition-colors flex items-center gap-1.5"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                <span>{job.cancelRequested ? 'Cancelling…' : 'Cancel Job'}</span>
+              </button>
+            )}
+            {canRetry && (
+              <button
+                onClick={onRetryJob}
+                title="Re-queue failed documents and anything a cancel left pending"
+                className="px-3 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-md transition-colors flex items-center gap-1.5"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Retry ({retryableCount})</span>
+              </button>
+            )}
             <button
               onClick={handleBatchMarkReviewed}
               className="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors flex items-center gap-1.5"
@@ -431,6 +539,84 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
         </div>
       </div>
 
+      {/* 1b. Per-Field Quality Panel */}
+      <div className="bg-white rounded-xl border border-neutral-200 shadow-xs overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowFieldQuality((current) => !current)}
+          className="w-full px-5 py-3 flex items-center justify-between text-left hover:bg-neutral-50/70 transition-colors"
+        >
+          <div className="flex items-baseline gap-2 flex-wrap">
+            <span className="text-sm font-bold text-neutral-900">Per-Field Quality</span>
+            <span className="text-[11px] text-neutral-500">
+              Validation pass rate across processed documents
+            </span>
+          </div>
+          <ChevronRight
+            className={`w-4 h-4 text-neutral-500 transition-transform ${showFieldQuality ? 'rotate-90' : ''}`}
+          />
+        </button>
+        {showFieldQuality && (
+          <div className="px-5 pb-4 overflow-x-auto border-t border-neutral-100 pt-3">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="text-[10px] uppercase tracking-wider text-neutral-400">
+                  <th className="py-1.5 pr-3 font-medium">Field</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Docs</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Extracted</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Valid</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Invalid</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Missing</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Conflicts</th>
+                  <th className="py-1.5 px-2 font-medium text-right">Corrected</th>
+                  <th className="py-1.5 pl-2 font-medium text-right">Validity</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-100">
+                {fieldQualityMetrics.map((metric) => (
+                  <tr key={metric.fieldId}>
+                    <td className="py-1.5 pr-3 font-medium text-neutral-800 whitespace-nowrap">
+                      {metric.name}
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-neutral-600">{metric.documents}</td>
+                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-neutral-600">{metric.extracted}</td>
+                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-emerald-700">{metric.valid}</td>
+                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.invalid ? 'text-rose-700 font-semibold' : 'text-neutral-400'}`}>
+                      {metric.invalid}
+                    </td>
+                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.missing ? 'text-amber-700' : 'text-neutral-400'}`}>
+                      {metric.missing}
+                    </td>
+                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.conflicts ? 'text-amber-700' : 'text-neutral-400'}`}>
+                      {metric.conflicts}
+                    </td>
+                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.corrected ? 'text-blue-700' : 'text-neutral-400'}`}>
+                      {metric.corrected}
+                    </td>
+                    <td
+                      className={`py-1.5 pl-2 text-right font-mono tabular-nums font-semibold ${metric.validityRate === null
+                          ? 'text-neutral-300'
+                          : metric.validityRate >= 0.95
+                            ? 'text-emerald-700'
+                            : metric.validityRate >= 0.8
+                              ? 'text-amber-700'
+                              : 'text-rose-700'
+                        }`}
+                    >
+                      {metric.validityRate === null ? '—' : `${Math.round(metric.validityRate * 100)}%`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="text-[11px] text-neutral-400 mt-2">
+              Validity = values passing field validation ÷ extracted values. It is a rule-based pass
+              rate, not ground-truth precision; manual review remains the source of truth.
+            </p>
+          </div>
+        )}
+      </div>
+
       {/* 2. Controls & Filter Bar */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
         {/* Category Tabs */}
@@ -470,6 +656,15 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
               }`}
           >
             Missing Required ({summaryMetrics.missingFields})
+          </button>
+          <button
+            onClick={() => setActiveFilter('invalid')}
+            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'invalid'
+              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
+              : 'text-neutral-600 hover:text-neutral-900'
+              }`}
+          >
+            Invalid Values ({summaryMetrics.invalidFields})
           </button>
           <button
             onClick={() => setActiveFilter('reviewed')}
@@ -553,6 +748,13 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                 sortedDocuments.map((doc) => {
                   const docProfile = getDocProfile(doc);
                   const hasConflict = Object.values(doc.diagnostics).some((d) => d.isConflict);
+                  const invalidDiagnostics = Object.values(doc.diagnostics).filter(
+                    (d) => d.status === 'INVALID'
+                  );
+                  const hasInvalid = invalidDiagnostics.length > 0;
+                  const invalidTooltip = invalidDiagnostics
+                    .map((d) => `${d.fieldName || d.fieldId}: ${d.validationError || 'Validation failed'}`)
+                    .join('\n');
                   const isPending =
                     doc.processingStatus === 'pending' ||
                     doc.processingStatus === 'processing';
@@ -604,6 +806,13 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                             className="inline-flex items-center justify-center"
                           >
                             <AlertTriangle className="w-4 h-4 text-amber-600 inline" />
+                          </span>
+                        ) : hasInvalid ? (
+                          <span
+                            title={`Invalid values hidden from export:\n${invalidTooltip}`}
+                            className="inline-flex items-center justify-center"
+                          >
+                            <AlertCircle className="w-4 h-4 text-rose-600 inline" />
                           </span>
                         ) : doc.isReviewed ? (
                           <span title="Reviewed and Verified" className="inline-flex items-center justify-center">
@@ -754,7 +963,11 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                                           ? 'text-blue-800 font-medium'
                                           : 'text-neutral-800'
                                     }`}
-                                  title={diag?.explanation || val}
+                                  title={
+                                    isInvalidCell
+                                      ? diag?.validationError || 'Value failed validation; hidden from export'
+                                      : diag?.explanation || val
+                                  }
                                 >
                                   {val}
                                 </span>
@@ -779,6 +992,14 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                                   className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0"
                                   title="Conflict between sources"
                                 />
+                              )}
+                              {isInvalidCell && (
+                                <span
+                                  title={diag?.validationError || 'Value failed validation; hidden from export'}
+                                  className="inline-flex shrink-0"
+                                >
+                                  <AlertCircle className="w-3 h-3 text-rose-600" />
+                                </span>
                               )}
                               {isFormCell && (
                                 <span

@@ -13,6 +13,9 @@ export interface CsvExportOptions {
   useCorrectedValues: boolean; // if false, use initial extracted value
   selectedFieldIds?: string[];
   onlyReviewed?: boolean;
+  // Off by default: a primary export must not ship values that failed
+  // validation as if they were extracted data.
+  includeInvalid?: boolean;
   // Every profile in the workspace. A batch can mix profiles, so each document
   // resolves the profile it was actually extracted with from this list.
   profiles?: ExtractionProfile[];
@@ -108,7 +111,14 @@ export function generatePrimaryCsv(
   profile: ExtractionProfile,
   options: CsvExportOptions = { delimiter: ',', includeBom: true, useCorrectedValues: true }
 ): string {
-  const { delimiter, includeBom, useCorrectedValues, selectedFieldIds, profiles = [] } = options;
+  const {
+    delimiter,
+    includeBom,
+    useCorrectedValues,
+    selectedFieldIds,
+    includeInvalid = false,
+    profiles = [],
+  } = options;
 
   // Columns cover every profile used by the exported documents, so a mixed
   // batch never silently drops fields that only another profile defines.
@@ -122,12 +132,23 @@ export function generatePrimaryCsv(
     'Processing Status',
     'Extraction Method Used',
     'Review Status',
+    'Flagged Values',
     ...activeFields.map((f) => f.name),
   ];
 
   const rows: string[] = [headers.map((h) => escapeCsvCell(h, delimiter)).join(delimiter)];
 
   for (const doc of documents) {
+    // INVALID values are diagnostic, not data: blank them unless the caller
+    // explicitly opts in, and always summarize them in Flagged Values.
+    const flagged = activeFields
+      .filter((field) => doc.diagnostics[field.id]?.status === 'INVALID')
+      .map((field) => {
+        const diag = doc.diagnostics[field.id];
+        return `${field.name}: ${diag.validationError || 'INVALID'}`;
+      })
+      .join(' | ');
+
     const rowValues: string[] = [
       escapeCsvCell(doc.filename, delimiter),
       escapeCsvCell(doc.relativePath, delimiter),
@@ -135,10 +156,15 @@ export function generatePrimaryCsv(
       escapeCsvCell(doc.processingStatus, delimiter),
       escapeCsvCell(doc.extractionMethodUsed, delimiter),
       escapeCsvCell(doc.isReviewed ? 'Reviewed' : 'Pending Review', delimiter),
+      escapeCsvCell(flagged, delimiter),
     ];
 
     for (const field of activeFields) {
       const diag = doc.diagnostics[field.id];
+      if (!includeInvalid && diag?.status === 'INVALID') {
+        rowValues.push('');
+        continue;
+      }
       let val = '';
       if (diag) {
         if (!useCorrectedValues && diag.isManuallyCorrected) {

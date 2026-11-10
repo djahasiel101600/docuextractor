@@ -1,5 +1,6 @@
 from io import BytesIO
 import copy
+from datetime import timedelta
 import json
 import tempfile
 from threading import Barrier, Lock
@@ -12,11 +13,18 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import override_settings
 from django.test import SimpleTestCase
+from django.utils import timezone
 from PIL import Image
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
-from .models import PDFDocument, ProcessingJob
+from .models import (
+    ExtractedField,
+    ExtractionProfile,
+    FieldDiagnostic,
+    PDFDocument,
+    ProcessingJob,
+)
 from .services.document_extraction import (
     _choose_content_candidate,
     _drop_duplicate_form_widgets,
@@ -26,7 +34,13 @@ from .services.document_extraction import (
     _ocr_pdf_ocrspace,
     process_pdf,
 )
-from .services.job_processing import process_job
+from .services.country_data import is_country_value
+from .services.job_processing import (
+    _finalize_job,
+    _job_should_stop,
+    process_job,
+    recover_stale_jobs,
+)
 from .services.form_layout import analyze_blank_form, validate_profile_config
 from .services.ollama import (
     _request_json,
@@ -771,6 +785,96 @@ class ExtractionApiTests(APITestCase):
         }
         self.assertIn("Test Profile", rows["one.pdf"])
         self.assertIn("Secondary Profile", rows["two.pdf"])
+
+    def test_primary_export_hides_invalid_values_unless_requested(self):
+        self.create_profile()
+        created = self.client.post(
+            "/api/jobs/batch/", {"profileId": "test-profile"}, format="json"
+        )
+        job_id = created.data["id"]
+        document = PDFDocument.objects.create(
+            id="doc-invalid-export",
+            job_id=job_id,
+            filename="bad.pdf",
+            relative_path="bad.pdf",
+            file_size_bytes=1,
+            processing_status="completed",
+        )
+        ExtractedField.objects.create(
+            document=document,
+            field_id="full_name",
+            field_name="Full Name",
+            final_value="address.",
+        )
+        FieldDiagnostic.objects.create(
+            document=document,
+            field_id="full_name",
+            field_name="Full Name",
+            details={
+                "status": "INVALID",
+                "finalValue": "address.",
+                "validationPassed": False,
+                "validationError": "Value is not a recognized country name.",
+            },
+        )
+
+        default_export = self.client.get(f"/api/jobs/{job_id}/export/")
+        self.assertEqual(default_export.status_code, 200)
+        default_text = b"".join(
+            default_export.streaming_content).decode("utf-8-sig")
+        self.assertIn("Flagged Values", default_text.splitlines()[0])
+        # The invalid value is suppressed but its reason is still reported.
+        self.assertNotIn("address.", default_text)
+        self.assertIn(
+            "Value is not a recognized country name.", default_text
+        )
+
+        with_invalid = self.client.get(
+            f"/api/jobs/{job_id}/export/", {"includeInvalid": "true"}
+        )
+        included_text = b"".join(
+            with_invalid.streaming_content).decode("utf-8-sig")
+        self.assertIn("address.", included_text)
+
+        diagnostics = self.client.get(
+            f"/api/jobs/{job_id}/export/", {"type": "diagnostics"}
+        )
+        diagnostics_text = b"".join(
+            diagnostics.streaming_content).decode("utf-8-sig")
+        self.assertIn("address.", diagnostics_text)
+
+    @override_settings(MAX_JOB_DOCUMENTS=2)
+    def test_batch_append_enforces_the_job_document_limit(self):
+        self.create_profile()
+        created = self.client.post(
+            "/api/jobs/batch/", {"profileId": "test-profile"}, format="json"
+        )
+        job_id = created.data["id"]
+        first_zip = create_zip(
+            [("one.pdf", create_pdf()), ("two.pdf", create_pdf())]
+        )
+        first = self.client.post(
+            f"/api/jobs/{job_id}/archives/",
+            {"file": SimpleUploadedFile(
+                "first.zip", first_zip, "application/zip")},
+            format="multipart",
+        )
+        self.assertEqual(first.status_code, 200, first.data)
+
+        over_limit_zip = create_zip([("three.pdf", create_pdf())])
+        over_limit = self.client.post(
+            f"/api/jobs/{job_id}/archives/",
+            {"file": SimpleUploadedFile(
+                "second.zip", over_limit_zip, "application/zip")},
+            format="multipart",
+        )
+        self.assertEqual(over_limit.status_code, 400, over_limit.data)
+        self.assertIn("limit", over_limit.data["detail"])
+
+        job = ProcessingJob.objects.get(pk=job_id)
+        self.assertEqual(job.documents.count(), 2)
+        self.assertEqual(job.total_discovered, 2)
+        self.assertEqual(job.status, "idle")
 
     def test_bulk_assign_by_filename_pattern(self):
         self.create_profile()
@@ -1636,6 +1740,99 @@ class ExtractionApiTests(APITestCase):
         )
         self.assertEqual(extracted["finalValues"]["citizenship"], "Egypt")
 
+    def test_citizenship_rejects_a_label_fragment_on_the_same_row(self):
+        # W-8BEN layout regression: the citizenship label is followed on its
+        # own text row by "address." from the residence-address instructions.
+        # That fragment became the citizenship value on 19 archived documents.
+        citizenship_label = "Country of citizenship"
+        address_label = "Permanent residence address"
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"] = [
+            create_labeled_field("citizenship", citizenship_label),
+            create_labeled_field("residence_address", address_label),
+        ]
+        pdf_bytes = create_layout_pdf(
+            [
+                (citizenship_label, 40, 100),
+                ("address.", 330, 100),
+                (address_label, 40, 140),
+                ("123 Main Street", 40, 165),
+            ]
+        )
+
+        extracted = process_pdf(pdf_bytes, "w8ben.pdf", profile)
+
+        self.assertEqual(extracted["finalValues"]["citizenship"], "")
+        self.assertEqual(
+            extracted["diagnostics"]["citizenship"]["status"], "NOT_FOUND"
+        )
+        self.assertFalse(extracted["diagnostics"]["citizenship"]["pdfValue"])
+        self.assertEqual(
+            extracted["finalValues"]["residence_address"], "123 Main Street"
+        )
+
+    def test_ssn_tin_keeps_only_the_value_shaped_substring(self):
+        # Archive regression: the SSN/TIN association often spans instruction
+        # text and an employee-type line; only the SSN-shaped run is the value.
+        ssn_label = "SSN / TIN"
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"] = [create_labeled_field("ssn_tin", ssn_label)]
+        pdf_bytes = create_layout_pdf(
+            [
+                (ssn_label, 40, 100),
+                ("Employee Type Full Time 1099 123-45-6789", 40, 125),
+            ]
+        )
+
+        extracted = process_pdf(pdf_bytes, "w9.pdf", profile)
+
+        self.assertEqual(extracted["finalValues"]["ssn_tin"], "123-45-6789")
+        self.assertEqual(extracted["diagnostics"]
+                         ["ssn_tin"]["status"], "MATCHED")
+        self.assertTrue(
+            extracted["diagnostics"]["ssn_tin"]["validationPassed"]
+        )
+
+    def test_ssn_tin_never_slices_a_nine_digit_window_from_a_longer_id(self):
+        # A 14-digit foreign tax ID contains a 9-digit run; exporting that run
+        # as a "valid" US SSN would be a false positive, not a validation fix.
+        ssn_label = "SSN / TIN"
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"] = [create_labeled_field("ssn_tin", ssn_label)]
+        pdf_bytes = create_layout_pdf(
+            [
+                (ssn_label, 40, 100),
+                ("30212170201452", 40, 125),
+            ]
+        )
+
+        extracted = process_pdf(pdf_bytes, "w9.pdf", profile)
+
+        self.assertEqual(extracted["finalValues"]["ssn_tin"], "")
+        self.assertEqual(
+            extracted["diagnostics"]["ssn_tin"]["status"], "NOT_FOUND"
+        )
+
+    def test_ssn_tin_rejects_an_address_line_without_an_ssn_shape(self):
+        # 49 archived documents exported an address line as an INVALID SSN.
+        ssn_label = "SSN / TIN"
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"] = [create_labeled_field("ssn_tin", ssn_label)]
+        pdf_bytes = create_layout_pdf(
+            [
+                (ssn_label, 40, 100),
+                ("1099 Gateshead Dr", 40, 125),
+            ]
+        )
+
+        extracted = process_pdf(pdf_bytes, "w9.pdf", profile)
+
+        self.assertEqual(extracted["finalValues"]["ssn_tin"], "")
+        self.assertEqual(
+            extracted["diagnostics"]["ssn_tin"]["status"], "NOT_FOUND"
+        )
+        self.assertFalse(extracted["diagnostics"]["ssn_tin"]["pdfValue"])
+
     def test_short_address_alias_skips_wrapped_label_instructions_before_value(self):
         address_label = "Permanent residence address"
         city_label = "City or town, state or province"
@@ -2303,6 +2500,210 @@ class ExtractionApiTests(APITestCase):
         self.assertEqual(diag["source"], "filename")
 
 
+class DurableJobExecutionTests(APITestCase):
+    """Heartbeat recovery, cooperative cancel and retry of failed documents."""
+
+    def setUp(self):
+        self.media_dir = tempfile.TemporaryDirectory()
+        self.settings_override = override_settings(
+            MEDIA_ROOT=self.media_dir.name)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(self.media_dir.cleanup)
+        self.profile = ExtractionProfile.objects.create(
+            id="durable-profile",
+            name="Durable Profile",
+            configuration={"fields": PROFILE["fields"]},
+        )
+
+    def create_job(self, job_id="job-durable", status="running", **kwargs):
+        return ProcessingJob.objects.create(
+            id=job_id,
+            name="Durable job",
+            zip_filename="batch.zip",
+            profile=self.profile,
+            status=status,
+            **kwargs,
+        )
+
+    def create_document(
+        self, job, doc_id, status="pending", assignment_status="legacy"
+    ):
+        return PDFDocument.objects.create(
+            id=doc_id,
+            job=job,
+            filename=f"{doc_id}.pdf",
+            relative_path=f"{doc_id}.pdf",
+            file_size_bytes=1,
+            file=SimpleUploadedFile(
+                f"{doc_id}.pdf", create_pdf(), "application/pdf"),
+            processing_status=status,
+            assignment_status=assignment_status,
+        )
+
+    def test_cancel_requires_a_running_job_and_exposes_the_flag(self):
+        completed = self.create_job(job_id="job-completed", status="completed")
+        rejected = self.client.post(f"/api/jobs/{completed.id}/cancel/")
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+
+        missing = self.client.post("/api/jobs/job-missing/cancel/")
+        self.assertEqual(missing.status_code, 404)
+
+        running = self.create_job(job_id="job-running")
+        accepted = self.client.post(f"/api/jobs/{running.id}/cancel/")
+        self.assertEqual(accepted.status_code, 202, accepted.data)
+        self.assertTrue(accepted.data["cancelRequested"])
+        running.refresh_from_db()
+        self.assertTrue(running.cancel_requested)
+
+        progress = self.client.get(f"/api/jobs/{running.id}/progress/")
+        self.assertEqual(progress.status_code, 200, progress.data)
+        self.assertTrue(progress.data["cancelRequested"])
+
+    def test_should_stop_reads_the_cancel_flag_and_the_job_status(self):
+        job = self.create_job()
+        self.assertFalse(_job_should_stop(job.id))
+        ProcessingJob.objects.filter(pk=job.id).update(cancel_requested=True)
+        self.assertTrue(_job_should_stop(job.id))
+        ProcessingJob.objects.filter(pk=job.id).update(
+            status="completed", cancel_requested=False
+        )
+        self.assertTrue(_job_should_stop(job.id))
+        self.assertTrue(_job_should_stop("job-missing"))
+
+    def test_process_job_finalizes_a_pre_cancelled_job_without_extracting(self):
+        job = self.create_job(cancel_requested=True)
+        document = self.create_document(job, "doc-waiting")
+        with patch(
+            "extraction.services.job_processing.process_pdf"
+        ) as extract:
+            process_job(job.id)
+
+        extract.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, "cancelled")
+        self.assertEqual(job.processed_count, 0)
+        document.refresh_from_db()
+        self.assertEqual(document.processing_status, "pending")
+
+    @override_settings(OCR_ENABLED=False, PDF_PROCESSING_WORKERS=1)
+    def test_worker_stops_scheduling_after_a_cancel_signal(self):
+        job = self.create_job()
+        first = self.create_document(job, "doc-first")
+        second = self.create_document(job, "doc-second")
+        checks = {"count": 0}
+
+        def stop_after_first_save(_job_id):
+            checks["count"] += 1
+            return checks["count"] > 1
+
+        with patch(
+            "extraction.services.job_processing._job_should_stop",
+            side_effect=stop_after_first_save,
+        ), patch(
+            "extraction.services.job_processing._extract_document",
+            return_value=(None, "stopped by test"),
+        ):
+            process_job(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, "cancelled")
+        self.assertEqual(job.failed_count, 1)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.processing_status, "failed")
+        # The cancelled document was never scheduled, so a retry can resume it.
+        self.assertEqual(second.processing_status, "pending")
+
+    def test_finalize_recomputes_totals_from_the_whole_job(self):
+        job = self.create_job()
+        self.create_document(job, "doc-done", status="completed")
+        self.create_document(job, "doc-done-2", status="completed")
+        self.create_document(job, "doc-failed", status="failed")
+        self.create_document(
+            job, "doc-excluded", status="excluded", assignment_status="excluded"
+        )
+
+        _finalize_job(job)
+
+        job.refresh_from_db()
+        self.assertEqual(job.processed_count, 2)
+        self.assertEqual(job.failed_count, 1)
+        self.assertEqual(job.skipped_count, 1)
+        self.assertEqual(job.status, "completed")
+
+    def test_retry_requeues_failed_documents_and_keeps_finished_ones(self):
+        job = self.create_job(job_id="job-retry", status="completed")
+        failed = self.create_document(job, "doc-failed", status="failed")
+        done = self.create_document(job, "doc-done", status="completed")
+        excluded = self.create_document(
+            job, "doc-excluded", status="excluded", assignment_status="excluded"
+        )
+
+        with patch("extraction.views.launch_job_processing") as launch:
+            response = self.client.post(f"/api/jobs/{job.id}/retry/")
+
+        self.assertEqual(response.status_code, 202, response.data)
+        launch.assert_called_once_with(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.status, "running")
+        self.assertFalse(job.cancel_requested)
+        self.assertIsNotNone(job.heartbeat_at)
+        failed.refresh_from_db()
+        done.refresh_from_db()
+        excluded.refresh_from_db()
+        self.assertEqual(failed.processing_status, "pending")
+        self.assertEqual(done.processing_status, "completed")
+        self.assertEqual(excluded.processing_status, "excluded")
+
+    def test_retry_rejects_jobs_with_nothing_to_requeue_or_already_running(self):
+        nothing = self.create_job(job_id="job-nothing", status="completed")
+        self.create_document(nothing, "doc-done", status="completed")
+        rejected = self.client.post(f"/api/jobs/{nothing.id}/retry/")
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+
+        running = self.create_job(job_id="job-already-running")
+        self.create_document(running, "doc-failed", status="failed")
+        conflicted = self.client.post(f"/api/jobs/{running.id}/retry/")
+        self.assertEqual(conflicted.status_code, 409, conflicted.data)
+
+    @override_settings(JOB_STALE_SECONDS=120)
+    def test_recovery_resumes_only_stale_running_jobs(self):
+        stale = self.create_job(job_id="job-stale")
+        stale_doc = self.create_document(
+            stale, "doc-stale", status="processing")
+        ProcessingJob.objects.filter(pk=stale.id).update(
+            heartbeat_at=timezone.now() - timedelta(minutes=10)
+        )
+
+        fresh = self.create_job(job_id="job-fresh")
+        fresh_doc = self.create_document(
+            fresh, "doc-fresh", status="processing")
+        ProcessingJob.objects.filter(pk=fresh.id).update(
+            heartbeat_at=timezone.now()
+        )
+
+        # A crash between the status claim and the first heartbeat leaves no
+        # heartbeat at all; that job is orphaned too.
+        never_beating = self.create_job(job_id="job-no-heartbeat")
+        never_doc = self.create_document(
+            never_beating, "doc-no-heartbeat", status="processing")
+
+        with patch(
+            "extraction.services.job_processing.launch_job_processing"
+        ) as launch:
+            resumed = recover_stale_jobs()
+
+        self.assertEqual(sorted(resumed), ["job-no-heartbeat", "job-stale"])
+        self.assertEqual(launch.call_count, 2)
+        stale_doc.refresh_from_db()
+        fresh_doc.refresh_from_db()
+        never_doc.refresh_from_db()
+        self.assertEqual(stale_doc.processing_status, "pending")
+        self.assertEqual(never_doc.processing_status, "pending")
+        self.assertEqual(fresh_doc.processing_status, "processing")
+
+
 def create_blank_form_pdf():
     """Template-style form: widgets exist but carry no values."""
     return create_acroform_pdf(
@@ -2747,3 +3148,58 @@ class BlankFormAuthoringTests(APITestCase):
         saved = response.data["fields"][0]
         self.assertIn("Name:", saved["contentRules"]["labels"])
         self.assertIn("applicant_name", saved["contentRules"]["labels"])
+
+
+class CountryValueTests(SimpleTestCase):
+    def test_recognizes_iso_names_codes_and_common_aliases(self):
+        for value in (
+            "Canada",
+            "philippines",
+            "UNITED STATES",
+            "United States of America",
+            "U.S.",
+            "USA",
+            "gb",
+            "England",
+            "  Germany  ",
+        ):
+            self.assertTrue(is_country_value(value), value)
+
+    def test_rejects_label_fragments_and_address_lines(self):
+        for value in (
+            "",
+            "address.",
+            "Gateshead Dr",
+            "123 Main Street",
+            "resident",
+            "citizenship",
+            "Narnia",
+        ):
+            self.assertFalse(is_country_value(value), value)
+
+    def test_accepts_a_single_typo_in_a_country_name(self):
+        # Real archives contain hand-typed names ("Phiippines", "Lithuani");
+        # one typo must not turn a country into a validation failure.
+        for value in (
+            "Phiippines",
+            "Lithuani",
+            "Untied States",
+            "Singapre",
+            "Mexcio",
+            "Indonisia",
+        ):
+            self.assertTrue(is_country_value(value), value)
+
+    def test_typo_tolerance_does_not_accept_cities_or_short_words(self):
+        # The fuzzy layer must not reopen the original false positives: cities
+        # and short words stay far enough from every country name.
+        for value in (
+            "Bishkek",
+            "Alexandria",
+            "Angeles City",
+            "Springfield",
+            "Male",
+            "Narnia",
+            "Philippines2",
+        ):
+            self.assertFalse(is_country_value(value), value)

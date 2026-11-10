@@ -18,6 +18,7 @@ from PIL import Image
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
+from .country_data import is_country_value
 from .ollama import extract_with_ollama
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,129 @@ _SPATIAL_CITY_COUNTRY_TOKENS = {
 }
 _SPATIAL_DATE_TOKENS = {"date", "dob", "birth", "birthday"}
 
+# Fields whose values are semantically constrained beyond length/regex. The
+# inference keeps existing profiles accurate without forcing a config
+# migration: a field called "citizenship" or "ssn_tin" gets the matching guard
+# even when its stored validation block only has min/max length.
+_COUNTRY_FIELD_IDS = {
+    "country",
+    "citizenship",
+    "country_of_citizenship",
+    "nationality",
+    "country_of_residence",
+    "residence_country",
+    "country_mailing",
+    "mailing_country",
+}
+_SSN_FIELD_IDS = {
+    "ssn",
+    "ssn_tin",
+    "tin",
+    "itin",
+    "ein",
+    "social_security_number",
+    "taxpayer_id",
+}
+_US_SSN_VALUE_RE = re.compile(r"^\d{3}-\d{2}-\d{4}$|^\d{2}-\d{7}$|^\d{9}$")
+# The search form must not slice a 9-digit window out of a longer foreign tax
+# ID: "30212170201452" (14 digits) or "34-6229091-8" are not US SSNs, so the
+# run may not touch another digit or hyphen on either side.
+_US_SSN_SEARCH_RE = re.compile(
+    r"(?<![\d-])(?:\d{3}-\d{2}-\d{4}|\d{2}-\d{7}|\d{9})(?![\d-])"
+)
+
+
+def _infer_value_type(field):
+    """Return the semantic value type for a field, explicit config first."""
+    rules = field.get("validation")
+    if isinstance(rules, dict):
+        explicit = str(rules.get("valueType") or "").strip().casefold()
+        if explicit:
+            return explicit
+    field_id = str(field.get("id") or "").strip().casefold()
+    normalized_name = " ".join(str(field.get("name") or "").split()).casefold()
+    if field_id in _COUNTRY_FIELD_IDS or normalized_name in {
+        "country",
+        "citizenship",
+        "nationality",
+        "country of citizenship",
+    }:
+        return "country"
+    if field_id in _SSN_FIELD_IDS or normalized_name in {
+        "ssn",
+        "ssn / tin",
+        "tin",
+        "social security number",
+        "taxpayer id",
+    }:
+        return "us_ssn"
+    return ""
+
+
+def _normalize_field_config(field):
+    """Copy a field config and inject the inferred semantic value type.
+
+    Copying keeps the shared profile configuration immutable while threads
+    process different documents, and makes every downstream `_validate_value`
+    call (candidate selection, AI gating, reconciliation) apply the same rule.
+    """
+    if not isinstance(field, dict):
+        return field
+    normalized = dict(field)
+    validation = dict(field.get("validation") or {})
+    if not validation.get("valueType"):
+        inferred = _infer_value_type(field)
+        if inferred:
+            validation["valueType"] = inferred
+    normalized["validation"] = validation
+    return normalized
+
+
+def _is_us_ssn(value):
+    return bool(_US_SSN_VALUE_RE.fullmatch(str(value or "").strip()))
+
+
+def _is_label_fragment(text, labels, max_tokens=2):
+    """True when the text is just words lifted from another field's label.
+
+    On the W-8 layout the "Citizenship" label is followed on the same text row
+    by the word "address." from the residence-address instructions. Whole-label
+    similarity (0.82) cannot see that, so the fragment became the citizenship
+    value. A short, digit-free run whose every token already appears in some
+    configured label is a label fragment, never a field value.
+    """
+    value = str(text or "").strip()
+    if not value or any(character.isdigit() for character in value):
+        return False
+    tokens = re.findall(r"[a-z]+", value.casefold())
+    if not tokens or len(tokens) > max_tokens:
+        return False
+    label_tokens = set()
+    for label in labels:
+        if isinstance(label, str):
+            label_tokens.update(re.findall(r"[a-z]+", label.casefold()))
+    return bool(label_tokens) and all(
+        token in label_tokens for token in tokens
+    )
+
+
+def _ssn_value_from_text(field, text):
+    """Pull a value-shaped SSN/TIN out of a noisy label association.
+
+    The SSN format regex used to run only after a whole address line had been
+    selected, so "Gateshead Dr" and instruction prose became INVALID values.
+    Searching the associated text for a substring that satisfies the field's
+    own validation rejects those lines before they can win.
+    """
+    if _infer_value_type(field) != "us_ssn":
+        return text
+    validation = field.get("validation") or {}
+    for match in _US_SSN_SEARCH_RE.finditer(str(text or "")):
+        candidate = match.group(0)
+        if _validate_value(candidate, validation)[0]:
+            return candidate
+    return None
+
 
 def _spatial_form_value_is_plausible(field, widget):
     """Semantic guard for the label->widget spatial matcher only.
@@ -51,6 +175,11 @@ def _spatial_form_value_is_plausible(field, widget):
     spatial heuristic."""
     value = (widget.get("value") or "").strip()
     if not value:
+        return False
+    value_type = _infer_value_type(field)
+    if value_type == "country" and not is_country_value(value):
+        return False
+    if value_type == "us_ssn" and not _is_us_ssn(value):
         return False
     field_text = " ".join(
         str(field.get(key, ""))
@@ -192,6 +321,14 @@ def _validate_value(value, rules):
         return False, "Value is shorter than the configured minimum."
     if rules.get("maxLength") is not None and len(value) > rules["maxLength"]:
         return False, "Value exceeds the configured maximum."
+    # Semantic value types inferred from the field identity ("citizenship" is a
+    # country, "ssn_tin" is a government ID) so a syntactically short value such
+    # as "address." or "Gateshead Dr" can never validate as one.
+    value_type = str(rules.get("valueType") or "").strip().casefold()
+    if value_type == "country" and not is_country_value(value):
+        return False, "Value is not a recognized country name."
+    if value_type == "us_ssn" and not _is_us_ssn(value):
+        return False, "Value is not a valid SSN/TIN format."
     return True, None
 
 
@@ -924,7 +1061,9 @@ def _row_candidate_text(
     ):
         return None
     text = " ".join(word["text"] for word in selected_words).strip()
-    if not text or text.endswith(":"):
+    if not text or text.endswith(":") or _is_label_fragment(
+        text, excluded_labels
+    ):
         return None
     return {
         "text": text,
@@ -1075,6 +1214,7 @@ def _associate_label_value(
         and not _is_parenthetical_label_hint(same_row_text)
         and not _is_field_instruction(same_row_text)
         and not _looks_like_prose(same_row_text)
+        and not _is_label_fragment(same_row_text, excluded_labels)
     ):
         candidate_text = same_row_text
         if candidate_text and not candidate_text.endswith(":"):
@@ -1696,6 +1836,16 @@ def _extract_from_text(
             item for item in spatial_candidates
             if not _looks_like_prose(item["text"])
         ]
+    if spatial_candidates and _infer_value_type(field) == "us_ssn":
+        # A spatial pick often spans the whole address/instruction line. Keep
+        # only a substring that actually satisfies the field's own validation
+        # so "Gateshead Dr" and template prose never reach reconciliation.
+        trimmed_candidates = []
+        for item in spatial_candidates:
+            trimmed_value = _ssn_value_from_text(field, item["text"])
+            if trimmed_value:
+                trimmed_candidates.append({**item, "text": trimmed_value})
+        spatial_candidates = trimmed_candidates
     if spatial_candidates:
         # The value must also be semantically able to fill its field: a date is
         # never a person's name and a one-word city/country grab is never a
@@ -1973,7 +2123,10 @@ def process_pdf(pdf_bytes, filename, profile):
             (time.perf_counter() - native_started) * 1000, 3
         )
 
-        fields = profile.get("fields", [])
+        fields = [
+            _normalize_field_config(field)
+            for field in profile.get("fields", [])
+        ]
         extraction_settings = profile.get("extractionSettings", {})
         if not isinstance(extraction_settings, dict):
             extraction_settings = {}
