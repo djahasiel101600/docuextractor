@@ -3,24 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Search,
-  Filter,
   CheckCircle2,
   AlertTriangle,
   AlertCircle,
   Eye,
   Download,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
   Check,
-  RotateCcw,
   Sparkles,
   ChevronRight,
-  FileText,
   RefreshCw,
-  SlidersHorizontal,
   XCircle,
+  X,
+  Pencil,
+  Rows3,
+  Rows4,
+  Keyboard,
 } from 'lucide-react';
 import {
   ProcessingJob,
@@ -58,6 +61,124 @@ interface FieldQualityMetric {
   validityRate: number | null;
 }
 
+const FILTER_TABS: { id: FilterCategory; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'review', label: 'Needs review' },
+  { id: 'conflicts', label: 'Conflicts' },
+  { id: 'missing', label: 'Missing required' },
+  { id: 'invalid', label: 'Invalid' },
+  { id: 'reviewed', label: 'Reviewed' },
+];
+
+const SHORTCUTS: { keys: string[]; label: string }[] = [
+  { keys: ['/'], label: 'Search' },
+  { keys: ['J', 'K'], label: 'Next / previous row' },
+  { keys: ['Enter'], label: 'Inspect selected row' },
+  { keys: ['R'], label: 'Mark selected row reviewed' },
+  { keys: ['Enter', 'Tab'], label: 'While editing: save and move down / right' },
+  { keys: ['Esc'], label: 'Cancel edit or clear search' },
+];
+
+const isTypingTarget = (el: EventTarget | null) => {
+  const node = el as HTMLElement | null;
+  if (!node || !node.tagName) return false;
+  const tag = node.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
+};
+
+const Kbd: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <kbd className="inline-flex min-w-[1.25rem] items-center justify-center rounded border border-neutral-300 bg-white px-1 py-px font-mono text-[10px] font-semibold leading-none text-neutral-600">
+    {children}
+  </kbd>
+);
+
+/* -------------------------------------------------------------------------- */
+/*  KPI tile                                                                  */
+/* -------------------------------------------------------------------------- */
+
+type TileTone = 'neutral' | 'emerald' | 'amber' | 'rose' | 'purple' | 'sky' | 'blue';
+
+const TILE_TONES: Record<TileTone, { box: string; label: string; value: string; active: string }> = {
+  neutral: {
+    box: 'bg-neutral-50 border-neutral-200/70',
+    label: 'text-neutral-500',
+    value: 'text-neutral-900',
+    active: 'ring-neutral-900',
+  },
+  emerald: {
+    box: 'bg-emerald-50/60 border-emerald-200/60',
+    label: 'text-emerald-800',
+    value: 'text-emerald-900',
+    active: 'ring-emerald-700',
+  },
+  amber: {
+    box: 'bg-amber-50/60 border-amber-200/60',
+    label: 'text-amber-800',
+    value: 'text-amber-900',
+    active: 'ring-amber-700',
+  },
+  rose: {
+    box: 'bg-rose-50/60 border-rose-200/60',
+    label: 'text-rose-800',
+    value: 'text-rose-900',
+    active: 'ring-rose-700',
+  },
+  purple: {
+    box: 'bg-purple-50/60 border-purple-200/60',
+    label: 'text-purple-800',
+    value: 'text-purple-900',
+    active: 'ring-purple-700',
+  },
+  sky: {
+    box: 'bg-sky-50/60 border-sky-200/60',
+    label: 'text-sky-800',
+    value: 'text-sky-900',
+    active: 'ring-sky-700',
+  },
+  blue: {
+    box: 'bg-blue-50/60 border-blue-200/60',
+    label: 'text-blue-800',
+    value: 'text-blue-900',
+    active: 'ring-blue-700',
+  },
+};
+
+const KpiTile: React.FC<{
+  label: string;
+  value: number;
+  hint?: string;
+  tone?: TileTone;
+  active?: boolean;
+  onClick?: () => void;
+}> = ({ label, value, hint, tone = 'neutral', active, onClick }) => {
+  const t = TILE_TONES[tone];
+  const content = (
+    <>
+      <span className={`block text-[11px] font-medium ${t.label}`}>{label}</span>
+      <span className={`font-mono text-lg font-bold tabular-nums ${t.value}`}>{value}</span>
+      {hint && <span className={`ml-1 text-[10px] ${t.label} opacity-70`}>{hint}</span>}
+    </>
+  );
+  const base = `rounded-lg border p-2.5 text-left ${t.box}`;
+  if (!onClick) return <div className={base}>{content}</div>;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      title={active ? 'Click to clear this filter' : 'Click to filter the table'}
+      className={`${base} transition-shadow hover:shadow-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 ${active ? `ring-2 ${t.active}` : ''
+        }`}
+    >
+      {content}
+    </button>
+  );
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Main component                                                            */
+/* -------------------------------------------------------------------------- */
+
 export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   job,
   profiles,
@@ -78,6 +199,18 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   // Inline quick-editing state: { docId, fieldId }
   const [editingCell, setEditingCell] = useState<{ docId: string; fieldId: string } | null>(null);
   const [inlineValue, setInlineValue] = useState<string>('');
+
+  // Review-flow UX state
+  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
+  const [compact, setCompact] = useState<boolean>(false);
+  const [showShortcuts, setShowShortcuts] = useState<boolean>(false);
+  const [flash, setFlash] = useState<string | null>(null);
+
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
+  const editingCellRef = useRef(editingCell);
+  editingCellRef.current = editingCell;
 
   // Profile filter options: 'All Profiles' (union) plus each individual profile
   const profileOptions = useMemo(
@@ -196,6 +329,11 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     };
   }, [job.documents, profiles]);
 
+  const reviewedCount = useMemo(
+    () => job.documents.filter((d) => d.isReviewed).length,
+    [job.documents]
+  );
+
   // Documents a retry would re-queue server-side: failures plus anything a
   // cooperative cancel left pending (user-excluded docs stay excluded).
   const retryableCount = useMemo(
@@ -259,6 +397,61 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     });
   }, [job.documents, activeFields, profiles]);
 
+  // Category predicate shared by the table filter and the tab counts, so the
+  // number on a tab always equals the rows you get when you click it.
+  const matchesCategory = (doc: PDFDocumentRecord, category: FilterCategory): boolean => {
+    // Queued / in-flight docs only belong in the "All" view; they have no
+    // results yet, so exclude them from every quality-based filter tab.
+    if (
+      category !== 'all' &&
+      (doc.processingStatus === 'pending' ||
+        doc.processingStatus === 'processing' ||
+        doc.processingStatus === 'excluded')
+    ) {
+      return false;
+    }
+    if (category === 'review') {
+      const hasFieldNeedingReview = Object.values(doc.diagnostics).some(
+        (d) => d.reviewRequired || d.isConflict || d.status === 'INVALID'
+      );
+      return !doc.isReviewed || hasFieldNeedingReview;
+    }
+    if (category === 'conflicts') {
+      return Object.values(doc.diagnostics).some((d) => d.isConflict);
+    }
+    if (category === 'missing') {
+      return Object.values(doc.diagnostics).some(
+        (d) =>
+          d.status === 'NOT_FOUND' &&
+          getDocFields(doc).find((f) => f.id === d.fieldId)?.required
+      );
+    }
+    if (category === 'invalid') {
+      return Object.values(doc.diagnostics).some((d) => d.status === 'INVALID');
+    }
+    if (category === 'reviewed') {
+      return doc.isReviewed;
+    }
+    return true;
+  };
+
+  const filterCounts = useMemo(() => {
+    const counts: Record<FilterCategory, number> = {
+      all: 0,
+      review: 0,
+      conflicts: 0,
+      missing: 0,
+      invalid: 0,
+      reviewed: 0,
+    };
+    for (const doc of job.documents) {
+      for (const tab of FILTER_TABS) {
+        if (matchesCategory(doc, tab.id)) counts[tab.id] += 1;
+      }
+    }
+    return counts;
+  }, [job.documents, profiles]);
+
   // Filter documents
   const filteredDocuments = useMemo(() => {
     return job.documents.filter((doc) => {
@@ -276,40 +469,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       }
 
       // 2. Category Tab Filter
-      // Queued / in-flight docs only belong in the "All" view; they have no
-      // results yet, so exclude them from every quality-based filter tab.
-      if (
-        activeFilter !== 'all' &&
-        (doc.processingStatus === 'pending' ||
-          doc.processingStatus === 'processing' ||
-          doc.processingStatus === 'excluded')
-      ) {
-        return false;
-      }
-      if (activeFilter === 'review') {
-        const hasFieldNeedingReview = Object.values(doc.diagnostics).some(
-          (d) => d.reviewRequired || d.isConflict || d.status === 'INVALID'
-        );
-        return !doc.isReviewed || hasFieldNeedingReview;
-      }
-      if (activeFilter === 'conflicts') {
-        return Object.values(doc.diagnostics).some((d) => d.isConflict);
-      }
-      if (activeFilter === 'missing') {
-        return Object.values(doc.diagnostics).some(
-          (d) =>
-            d.status === 'NOT_FOUND' &&
-            getDocFields(doc).find((f) => f.id === d.fieldId)?.required
-        );
-      }
-      if (activeFilter === 'invalid') {
-        return Object.values(doc.diagnostics).some((d) => d.status === 'INVALID');
-      }
-      if (activeFilter === 'reviewed') {
-        return doc.isReviewed;
-      }
-
-      return true;
+      return matchesCategory(doc, activeFilter);
     });
   }, [job.documents, searchQuery, activeFilter, profiles]);
 
@@ -338,6 +498,26 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     });
   }, [filteredDocuments, sortField, sortAsc, profiles]);
 
+  const hasActiveFilters = activeFilter !== 'all' || searchQuery.trim() !== '';
+
+  const clearFilters = () => {
+    setActiveFilter('all');
+    setSearchQuery('');
+  };
+
+  const showFlash = (message: string) => {
+    setFlash(message);
+    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => setFlash(null), 2400);
+  };
+
+  useEffect(
+    () => () => {
+      if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    },
+    []
+  );
+
   const handleSort = (fieldId: string) => {
     if (sortField === fieldId) {
       setSortAsc(!sortAsc);
@@ -347,91 +527,339 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     }
   };
 
+  /* ---------------------------- Inline editing ---------------------------- */
+
+  const isEditableDoc = (doc: PDFDocumentRecord) =>
+    doc.processingStatus !== 'pending' &&
+    doc.processingStatus !== 'processing' &&
+    doc.processingStatus !== 'excluded';
+
+  const getCellValue = (doc: PDFDocumentRecord, fieldId: string) =>
+    doc.finalValues[fieldId] || doc.diagnostics[fieldId]?.finalValue || '';
+
   const startInlineEdit = (docId: string, fieldId: string, currentValue: string) => {
     setEditingCell({ docId, fieldId });
     setInlineValue(currentValue);
+    setSelectedDocId(docId);
   };
 
-  const commitInlineEdit = () => {
-    if (editingCell) {
-      onUpdateFieldValue(editingCell.docId, editingCell.fieldId, inlineValue);
-      setEditingCell(null);
+  /**
+   * Ends the active inline edit. `move` chains straight into the next cell so a
+   * reviewer can fix a whole column (Enter) or row (Tab) without the mouse.
+   */
+  const finishInlineEdit = (save: boolean, move?: 'down' | 'next' | 'prev') => {
+    if (!editingCell) return;
+    const { docId, fieldId } = editingCell;
+    const rowIdx = sortedDocuments.findIndex((d) => d.id === docId);
+    const doc = rowIdx >= 0 ? sortedDocuments[rowIdx] : undefined;
+
+    if (save && doc && inlineValue !== getCellValue(doc, fieldId)) {
+      onUpdateFieldValue(docId, fieldId, inlineValue);
     }
+
+    if (move && rowIdx >= 0) {
+      const colIdx = activeFields.findIndex((f) => f.id === fieldId);
+      let target: { doc: PDFDocumentRecord; fieldId: string } | null = null;
+
+      if (move === 'down') {
+        for (let i = rowIdx + 1; i < sortedDocuments.length; i++) {
+          if (isEditableDoc(sortedDocuments[i])) {
+            target = { doc: sortedDocuments[i], fieldId };
+            break;
+          }
+        }
+      } else {
+        const dir = move === 'next' ? 1 : -1;
+        let r = rowIdx;
+        let c = colIdx + dir;
+        while (r >= 0 && r < sortedDocuments.length) {
+          if (c >= activeFields.length) {
+            r += 1;
+            c = 0;
+          } else if (c < 0) {
+            r -= 1;
+            c = activeFields.length - 1;
+          }
+          if (r < 0 || r >= sortedDocuments.length) break;
+          if (isEditableDoc(sortedDocuments[r])) {
+            target = { doc: sortedDocuments[r], fieldId: activeFields[c].id };
+            break;
+          }
+          c += dir;
+        }
+      }
+
+      if (target) {
+        startInlineEdit(target.doc.id, target.fieldId, getCellValue(target.doc, target.fieldId));
+        return;
+      }
+    }
+    setEditingCell(null);
   };
+
+  const batchEligible = filteredDocuments.filter(
+    (doc) => !doc.isReviewed && doc.processingStatus !== 'excluded'
+  );
 
   const handleBatchMarkReviewed = () => {
+    if (batchEligible.length >= 5) {
+      const ok = window.confirm(
+        `Mark ${batchEligible.length} documents as reviewed? This applies to the documents currently shown.`
+      );
+      if (!ok) return;
+    }
+    const count = batchEligible.length;
     for (const doc of filteredDocuments) {
       if (!doc.isReviewed && doc.processingStatus !== 'excluded') {
         onToggleReviewed(doc.id);
       }
     }
+    if (count > 0) showFlash(`Marked ${count} document${count === 1 ? '' : 's'} as reviewed`);
   };
 
-  return (
-    <div className="space-y-6">
+  /* --------------------------- Keyboard shortcuts -------------------------- */
 
-      {/* 1. Processing Summary KPI Strip */}
-      <div className="bg-white rounded-xl border border-neutral-200 p-5 shadow-xs">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-neutral-100">
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-lg font-bold text-neutral-900">
-                Extraction &amp; Reconciliation Results
-              </h2>
-              <span className="text-xs font-mono text-neutral-500">
+  const moveSelection = (delta: 1 | -1) => {
+    if (sortedDocuments.length === 0) return;
+    const idx = sortedDocuments.findIndex((d) => d.id === selectedDocId);
+    const next =
+      idx === -1
+        ? delta === 1
+          ? 0
+          : sortedDocuments.length - 1
+        : Math.min(sortedDocuments.length - 1, Math.max(0, idx + delta));
+    setSelectedDocId(sortedDocuments[next].id);
+  };
+
+  // Latest-closure pattern: one stable listener always sees fresh state.
+  const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => undefined);
+  keyHandlerRef.current = (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // The document inspector has its own shortcuts; stay out of its way.
+    if (window.document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+    if (isTypingTarget(e.target)) return;
+
+    const key = e.key.toLowerCase();
+    const selected = sortedDocuments.find((d) => d.id === selectedDocId);
+
+    switch (key) {
+      case '/':
+        e.preventDefault();
+        searchRef.current?.focus();
+        break;
+      case 'j':
+      case 'arrowdown':
+        e.preventDefault();
+        moveSelection(1);
+        break;
+      case 'k':
+      case 'arrowup':
+        e.preventDefault();
+        moveSelection(-1);
+        break;
+      case 'enter':
+        if (selected) {
+          e.preventDefault();
+          onInspectDocument(selected);
+        }
+        break;
+      case 'r':
+        if (selected) {
+          e.preventDefault();
+          onToggleReviewed(selected.id);
+        }
+        break;
+      case 'escape':
+        setSelectedDocId(null);
+        setShowShortcuts(false);
+        break;
+      case '?':
+        setShowShortcuts((s) => !s);
+        break;
+      default:
+        break;
+    }
+  };
+
+  useEffect(() => {
+    const listener = (e: KeyboardEvent) => keyHandlerRef.current(e);
+    window.addEventListener('keydown', listener);
+    return () => window.removeEventListener('keydown', listener);
+  }, []);
+
+  // Keep the keyboard-selected row visible.
+  useEffect(() => {
+    if (!selectedDocId || !tableScrollRef.current) return;
+    const el = tableScrollRef.current.querySelector(
+      `[data-doc-id="${CSS.escape(selectedDocId)}"]`
+    ) as HTMLElement | null;
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [selectedDocId]);
+
+  /* ------------------------------ Row status ------------------------------ */
+
+  const renderStatus = (doc: PDFDocumentRecord) => {
+    const diagnostics = Object.values(doc.diagnostics);
+    const hasConflict = diagnostics.some((d) => d.isConflict);
+    const invalidDiagnostics = diagnostics.filter((d) => d.status === 'INVALID');
+    const hasInvalid = invalidDiagnostics.length > 0;
+    const invalidTooltip = invalidDiagnostics
+      .map((d) => `${d.fieldName || d.fieldId}: ${d.validationError || 'Validation failed'}`)
+      .join('\n');
+    const isPending = doc.processingStatus === 'pending' || doc.processingStatus === 'processing';
+    const isExcluded = doc.processingStatus === 'excluded';
+    const hasMissingRequired = diagnostics.some(
+      (d) =>
+        d.status === 'NOT_FOUND' &&
+        getDocFields(doc).find((f) => f.id === d.fieldId)?.required
+    );
+    const isAi = doc.extractionMethodUsed === 'AI_EXTRACTED';
+    const isOcrOrAi = doc.extractionMethodUsed === 'OCR_EXTRACTED' || isAi;
+
+    let title: string;
+    let icon: React.ReactNode;
+
+    if (isPending) {
+      title = doc.processingStatus === 'processing' ? 'Processing...' : 'Queued for processing';
+      icon = (
+        <span
+          className={`inline-block h-3.5 w-3.5 rounded-full border-2 ${doc.processingStatus === 'processing'
+              ? 'animate-spin border-neutral-300 border-t-neutral-700 motion-reduce:animate-none'
+              : 'border-neutral-200'
+            }`}
+        />
+      );
+    } else if (isExcluded) {
+      title = 'Excluded from processing by the user';
+      icon = <span className="inline-block h-3.5 w-3.5 rounded-full border-2 border-dashed border-neutral-400" />;
+    } else if (doc.errorDetails) {
+      title = `Processing warning: ${doc.errorDetails}`;
+      icon = <AlertTriangle className="h-4 w-4 text-amber-600" />;
+    } else if (hasInvalid) {
+      title = `Invalid values hidden from export:\n${invalidTooltip}`;
+      icon = <AlertCircle className="h-4 w-4 text-rose-600" />;
+    } else if (doc.isReviewed) {
+      title = 'Reviewed and verified';
+      icon = <CheckCircle2 className="h-4 w-4 text-emerald-600" />;
+    } else if (hasConflict) {
+      title = 'Conflict detected between filename and PDF';
+      icon = <AlertTriangle className="h-4 w-4 text-amber-500" />;
+    } else if (hasMissingRequired) {
+      title = 'Missing required fields';
+      icon = <AlertCircle className="h-4 w-4 text-rose-500" />;
+    } else if (isOcrOrAi) {
+      title = isAi ? 'Local AI-assisted extraction; verify values' : 'Extracted via OCR fallback';
+      icon = <Sparkles className={`h-4 w-4 ${isAi ? 'text-sky-700' : 'text-purple-600'}`} />;
+    } else {
+      title = 'Ready for review';
+      icon = <Check className="h-3.5 w-3.5 text-neutral-400" />;
+    }
+
+    return (
+      <span title={title} className="inline-flex items-center justify-center" role="img" aria-label={title.split('\n')[0]}>
+        {icon}
+      </span>
+    );
+  };
+
+  /* -------------------------------- Render -------------------------------- */
+
+  const cellPad = compact ? 'py-1 px-3' : 'py-2.5 px-3';
+
+  const SortHeader: React.FC<{
+    id: string;
+    label: string;
+    className?: string;
+    stickyClass?: string;
+  }> = ({ id, label, className = '', stickyClass = '' }) => {
+    const active = sortField === id;
+    return (
+      <th
+        scope="col"
+        aria-sort={active ? (sortAsc ? 'ascending' : 'descending') : 'none'}
+        className={`sticky top-0 z-20 border-b border-neutral-200 bg-neutral-50 px-0 ${stickyClass} ${className}`}
+      >
+        <button
+          type="button"
+          onClick={() => handleSort(id)}
+          className={`flex w-full items-center gap-1.5 whitespace-nowrap px-3 py-2.5 text-left font-semibold transition-colors hover:text-neutral-900 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-neutral-900 ${active ? 'text-neutral-900' : 'text-neutral-600'
+            }`}
+        >
+          <span>{label}</span>
+          {active ? (
+            sortAsc ? (
+              <ArrowUp className="h-3 w-3 text-neutral-900" />
+            ) : (
+              <ArrowDown className="h-3 w-3 text-neutral-900" />
+            )
+          ) : (
+            <ArrowUpDown className="h-3 w-3 text-neutral-300" />
+          )}
+        </button>
+      </th>
+    );
+  };
+
+  const reviewProgress =
+    summaryMetrics.completed > 0
+      ? Math.min(100, Math.round((reviewedCount / summaryMetrics.completed) * 100))
+      : 0;
+
+  return (
+    <div className="space-y-5">
+      {/* 1. Summary & actions */}
+      <div className="rounded-xl border border-neutral-200 bg-white p-5 shadow-xs">
+        <div className="flex flex-col justify-between gap-4 border-b border-neutral-100 pb-4 md:flex-row md:items-start">
+          <div className="min-w-0 space-y-2">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <h2 className="text-lg font-bold text-neutral-900">Extraction &amp; Reconciliation Results</h2>
+              <span className="truncate font-mono text-xs text-neutral-500" title={job.zipFilename}>
                 Batch: {job.zipFilename}
               </span>
             </div>
-            <p className="text-xs text-neutral-500 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
               <span>
-                Profile:{' '}
-                {activeProfile ? (
-                  <span className="font-medium text-neutral-800">{activeProfile.name}</span>
-                ) : (
-                  <span className="font-medium text-neutral-800">
-                    All Profiles ({profiles.length})
-                  </span>
-                )}
-              </span>
-              <span>
-                · {summaryMetrics.completed} of{' '}
-                {job.totalDiscovered || job.documents.length} processed
+                {summaryMetrics.completed} of {job.totalDiscovered || job.documents.length} processed
               </span>
               {summaryMetrics.excluded > 0 && (
-                <span className="text-neutral-500">
-                  · {summaryMetrics.excluded} excluded from processing
-                </span>
+                <span>· {summaryMetrics.excluded} excluded from processing</span>
+              )}
+              {summaryMetrics.errors > 0 && (
+                <span className="font-medium text-rose-700">· {summaryMetrics.errors} failed</span>
               )}
               {job.status === 'running' && (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
-                  <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-emerald-300 border-t-emerald-700 animate-spin" />
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                  <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-emerald-300 border-t-emerald-700 motion-reduce:animate-none" />
                   Live — {summaryMetrics.queued} still queued
                 </span>
               )}
             </p>
 
-            {/* Profile Column Filter Dropdown */}
-            <div className="mt-3 flex items-center gap-2">
-              <label className="text-[10px] uppercase tracking-wider text-neutral-400 font-medium">
-                Profile Columns
-              </label>
-              <select
-                value={profileFilter}
-                onChange={(e) => setProfileFilter(e.target.value as ProfileFilter)}
-                className="text-xs bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
+            {/* Review progress */}
+            <div className="flex items-center gap-3" title={`${reviewedCount} of ${summaryMetrics.completed} processed documents reviewed`}>
+              <div
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={reviewProgress}
+                aria-label="Review progress"
+                className="h-1.5 w-48 overflow-hidden rounded-full bg-neutral-100"
               >
-                {profileOptions.map((opt) => (
-                  <option key={opt.id} value={opt.id}>
-                    {opt.name}
-                  </option>
-                ))}
-              </select>
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-all"
+                  style={{ width: `${reviewProgress}%` }}
+                />
+              </div>
+              <span className="font-mono text-[11px] tabular-nums text-neutral-500">
+                {reviewedCount} / {summaryMetrics.completed} reviewed
+              </span>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {job.status === 'running' && (
               <button
+                type="button"
                 onClick={onCancelJob}
                 disabled={job.cancelRequested}
                 title={
@@ -439,422 +867,457 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                     ? 'Waiting for the documents currently being extracted to finish'
                     : 'Stop after the documents currently being extracted finish; the rest stay pending'
                 }
-                className="px-3 py-1.5 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 disabled:opacity-60 disabled:cursor-not-allowed rounded-md transition-colors flex items-center gap-1.5"
+                className="flex items-center gap-1.5 rounded-md border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-medium text-rose-700 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <XCircle className="w-3.5 h-3.5" />
-                <span>{job.cancelRequested ? 'Cancelling…' : 'Cancel Job'}</span>
+                <XCircle className="h-3.5 w-3.5" />
+                <span>{job.cancelRequested ? 'Cancelling…' : 'Cancel job'}</span>
               </button>
             )}
             {canRetry && (
               <button
+                type="button"
                 onClick={onRetryJob}
                 title="Re-queue failed documents and anything a cancel left pending"
-                className="px-3 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 hover:bg-amber-100 rounded-md transition-colors flex items-center gap-1.5"
+                className="flex items-center gap-1.5 rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 transition-colors hover:bg-amber-100"
               >
-                <RefreshCw className="w-3.5 h-3.5" />
+                <RefreshCw className="h-3.5 w-3.5" />
                 <span>Retry ({retryableCount})</span>
               </button>
             )}
             <button
+              type="button"
               onClick={handleBatchMarkReviewed}
-              className="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors flex items-center gap-1.5"
+              disabled={batchEligible.length === 0}
+              title={
+                batchEligible.length === 0
+                  ? 'Every document currently shown is already reviewed'
+                  : 'Mark every unreviewed document currently shown as reviewed'
+              }
+              className="flex items-center gap-1.5 rounded-md bg-neutral-100 px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>Mark Filtered as Reviewed</span>
+              <Check className="h-3.5 w-3.5" />
+              <span>Mark {batchEligible.length} shown as reviewed</span>
             </button>
             <button
+              type="button"
               onClick={onOpenExport}
-              className="px-3.5 py-1.5 text-xs font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-md transition-colors flex items-center gap-1.5"
+              className="flex items-center gap-1.5 rounded-md bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-neutral-800"
             >
-              <Download className="w-3.5 h-3.5" />
+              <Download className="h-3.5 w-3.5" />
               <span>Export CSV</span>
             </button>
           </div>
         </div>
 
-        {/* Metric Badges Grid */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-9 gap-3 pt-4">
-          <div className="p-2.5 rounded-lg bg-neutral-50 border border-neutral-200/70">
-            <span className="text-[11px] font-medium text-neutral-500 block">Total Documents</span>
-            <span className="text-lg font-bold text-neutral-900 font-mono tabular-nums">
-              {summaryMetrics.totalDocs}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-emerald-50/60 border border-emerald-200/60">
-            <span className="text-[11px] font-medium text-emerald-800 block">Processed Clean</span>
-            <span className="text-lg font-bold text-emerald-900 font-mono tabular-nums">
-              {summaryMetrics.completed}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-neutral-50 border border-neutral-200/70">
-            <span className="text-[11px] font-medium text-neutral-500 block">Queued</span>
-            <span className="text-lg font-bold text-neutral-600 font-mono tabular-nums">
-              {summaryMetrics.queued}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-amber-50/60 border border-amber-200/60">
-            <span className="text-[11px] font-medium text-amber-800 block">Conflicts Flagged</span>
-            <span className="text-lg font-bold text-amber-900 font-mono tabular-nums">
-              {summaryMetrics.conflicts}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-rose-50/60 border border-rose-200/60">
-            <span className="text-[11px] font-medium text-rose-800 block">Missing Fields</span>
-            <span className="text-lg font-bold text-rose-900 font-mono tabular-nums">
-              {summaryMetrics.missingFields}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-purple-50/60 border border-purple-200/60">
-            <span className="text-[11px] font-medium text-purple-800 block">OCR Fallbacks</span>
-            <span className="text-lg font-bold text-purple-900 font-mono tabular-nums">
-              {summaryMetrics.ocrUsed}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-sky-50/60 border border-sky-200/60">
-            <span className="text-[11px] font-medium text-sky-800 block">AI-assisted</span>
-            <span className="text-lg font-bold text-sky-900 font-mono tabular-nums">
-              {summaryMetrics.aiUsed}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-neutral-50 border border-neutral-200/70">
-            <span className="text-[11px] font-medium text-neutral-500 block">Needs Review</span>
-            <span className="text-lg font-bold text-neutral-900 font-mono tabular-nums">
-              {summaryMetrics.reviewRequired}
-            </span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-blue-50/60 border border-blue-200/60">
-            <span className="text-[11px] font-medium text-blue-800 block">Reviewed</span>
-            <span className="text-lg font-bold text-blue-900 font-mono tabular-nums">
-              {job.documents.filter((d) => d.isReviewed).length}
-            </span>
-          </div>
+        {/* KPI tiles: those with a filter are clickable shortcuts into the table */}
+        <div className="grid grid-cols-2 gap-3 pt-4 sm:grid-cols-3 lg:grid-cols-5">
+          <KpiTile label="Total documents" value={summaryMetrics.totalDocs} onClick={() => setActiveFilter('all')} active={activeFilter === 'all'} />
+          <KpiTile label="Processed" value={summaryMetrics.completed} tone="emerald" />
+          <KpiTile label="Queued" value={summaryMetrics.queued} />
+          <KpiTile
+            label="Needs review"
+            value={summaryMetrics.reviewRequired}
+            onClick={() => setActiveFilter(activeFilter === 'review' ? 'all' : 'review')}
+            active={activeFilter === 'review'}
+          />
+          <KpiTile
+            label="Reviewed"
+            value={reviewedCount}
+            tone="blue"
+            onClick={() => setActiveFilter(activeFilter === 'reviewed' ? 'all' : 'reviewed')}
+            active={activeFilter === 'reviewed'}
+          />
+          <KpiTile
+            label="Conflicts flagged"
+            value={summaryMetrics.conflicts}
+            hint="fields"
+            tone="amber"
+            onClick={() => setActiveFilter(activeFilter === 'conflicts' ? 'all' : 'conflicts')}
+            active={activeFilter === 'conflicts'}
+          />
+          <KpiTile
+            label="Missing fields"
+            value={summaryMetrics.missingFields}
+            hint="required"
+            tone="rose"
+            onClick={() => setActiveFilter(activeFilter === 'missing' ? 'all' : 'missing')}
+            active={activeFilter === 'missing'}
+          />
+          <KpiTile
+            label="Invalid values"
+            value={summaryMetrics.invalidFields}
+            hint="fields"
+            tone="rose"
+            onClick={() => setActiveFilter(activeFilter === 'invalid' ? 'all' : 'invalid')}
+            active={activeFilter === 'invalid'}
+          />
+          <KpiTile label="OCR fallbacks" value={summaryMetrics.ocrUsed} tone="purple" />
+          <KpiTile label="AI-assisted" value={summaryMetrics.aiUsed} tone="sky" />
         </div>
       </div>
 
-      {/* 1b. Per-Field Quality Panel */}
-      <div className="bg-white rounded-xl border border-neutral-200 shadow-xs overflow-hidden">
+      {/* 1b. Per-field quality */}
+      <div className="overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-xs">
         <button
           type="button"
           onClick={() => setShowFieldQuality((current) => !current)}
-          className="w-full px-5 py-3 flex items-center justify-between text-left hover:bg-neutral-50/70 transition-colors"
+          aria-expanded={showFieldQuality}
+          className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-neutral-50/70"
         >
-          <div className="flex items-baseline gap-2 flex-wrap">
-            <span className="text-sm font-bold text-neutral-900">Per-Field Quality</span>
-            <span className="text-[11px] text-neutral-500">
-              Validation pass rate across processed documents
-            </span>
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="text-sm font-bold text-neutral-900">Per-field quality</span>
+            <span className="text-[11px] text-neutral-500">Validation pass rate across processed documents</span>
           </div>
           <ChevronRight
-            className={`w-4 h-4 text-neutral-500 transition-transform ${showFieldQuality ? 'rotate-90' : ''}`}
+            className={`h-4 w-4 text-neutral-500 transition-transform ${showFieldQuality ? 'rotate-90' : ''}`}
           />
         </button>
         {showFieldQuality && (
-          <div className="px-5 pb-4 overflow-x-auto border-t border-neutral-100 pt-3">
-            <table className="w-full text-left text-xs border-collapse">
+          <div className="overflow-x-auto border-t border-neutral-100 px-5 pb-4 pt-3">
+            <table className="w-full border-collapse text-left text-xs">
               <thead>
-                <tr className="text-[10px] uppercase tracking-wider text-neutral-400">
+                <tr className="text-[11px] text-neutral-400">
                   <th className="py-1.5 pr-3 font-medium">Field</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Docs</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Extracted</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Valid</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Invalid</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Missing</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Conflicts</th>
-                  <th className="py-1.5 px-2 font-medium text-right">Corrected</th>
-                  <th className="py-1.5 pl-2 font-medium text-right">Validity</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Docs</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Extracted</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Valid</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Invalid</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Missing</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Conflicts</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Corrected</th>
+                  <th className="py-1.5 pl-2 text-right font-medium">Validity</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-100">
-                {fieldQualityMetrics.map((metric) => (
-                  <tr key={metric.fieldId}>
-                    <td className="py-1.5 pr-3 font-medium text-neutral-800 whitespace-nowrap">
-                      {metric.name}
-                    </td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-neutral-600">{metric.documents}</td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-neutral-600">{metric.extracted}</td>
-                    <td className="py-1.5 px-2 text-right font-mono tabular-nums text-emerald-700">{metric.valid}</td>
-                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.invalid ? 'text-rose-700 font-semibold' : 'text-neutral-400'}`}>
-                      {metric.invalid}
-                    </td>
-                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.missing ? 'text-amber-700' : 'text-neutral-400'}`}>
-                      {metric.missing}
-                    </td>
-                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.conflicts ? 'text-amber-700' : 'text-neutral-400'}`}>
-                      {metric.conflicts}
-                    </td>
-                    <td className={`py-1.5 px-2 text-right font-mono tabular-nums ${metric.corrected ? 'text-blue-700' : 'text-neutral-400'}`}>
-                      {metric.corrected}
-                    </td>
-                    <td
-                      className={`py-1.5 pl-2 text-right font-mono tabular-nums font-semibold ${metric.validityRate === null
-                          ? 'text-neutral-300'
-                          : metric.validityRate >= 0.95
-                            ? 'text-emerald-700'
-                            : metric.validityRate >= 0.8
-                              ? 'text-amber-700'
-                              : 'text-rose-700'
-                        }`}
-                    >
-                      {metric.validityRate === null ? '—' : `${Math.round(metric.validityRate * 100)}%`}
-                    </td>
-                  </tr>
-                ))}
+                {fieldQualityMetrics.map((metric) => {
+                  const rate = metric.validityRate;
+                  const tone =
+                    rate === null
+                      ? 'text-neutral-300'
+                      : rate >= 0.95
+                        ? 'text-emerald-700'
+                        : rate >= 0.8
+                          ? 'text-amber-700'
+                          : 'text-rose-700';
+                  const bar =
+                    rate === null
+                      ? 'bg-neutral-200'
+                      : rate >= 0.95
+                        ? 'bg-emerald-500'
+                        : rate >= 0.8
+                          ? 'bg-amber-500'
+                          : 'bg-rose-500';
+                  return (
+                    <tr key={metric.fieldId}>
+                      <td className="whitespace-nowrap py-1.5 pr-3 font-medium text-neutral-800">{metric.name}</td>
+                      <td className="px-2 py-1.5 text-right font-mono tabular-nums text-neutral-600">{metric.documents}</td>
+                      <td className="px-2 py-1.5 text-right font-mono tabular-nums text-neutral-600">{metric.extracted}</td>
+                      <td className="px-2 py-1.5 text-right font-mono tabular-nums text-emerald-700">{metric.valid}</td>
+                      <td className={`px-2 py-1.5 text-right font-mono tabular-nums ${metric.invalid ? 'font-semibold text-rose-700' : 'text-neutral-400'}`}>
+                        {metric.invalid}
+                      </td>
+                      <td className={`px-2 py-1.5 text-right font-mono tabular-nums ${metric.missing ? 'text-amber-700' : 'text-neutral-400'}`}>
+                        {metric.missing}
+                      </td>
+                      <td className={`px-2 py-1.5 text-right font-mono tabular-nums ${metric.conflicts ? 'text-amber-700' : 'text-neutral-400'}`}>
+                        {metric.conflicts}
+                      </td>
+                      <td className={`px-2 py-1.5 text-right font-mono tabular-nums ${metric.corrected ? 'text-blue-700' : 'text-neutral-400'}`}>
+                        {metric.corrected}
+                      </td>
+                      <td className="py-1.5 pl-2">
+                        <div className="flex items-center justify-end gap-2">
+                          <div className="h-1.5 w-16 overflow-hidden rounded-full bg-neutral-100" aria-hidden>
+                            <div className={`h-full ${bar}`} style={{ width: `${Math.round((rate ?? 0) * 100)}%` }} />
+                          </div>
+                          <span className={`w-9 text-right font-mono font-semibold tabular-nums ${tone}`}>
+                            {rate === null ? '—' : `${Math.round(rate * 100)}%`}
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
-            <p className="text-[11px] text-neutral-400 mt-2">
-              Validity = values passing field validation ÷ extracted values. It is a rule-based pass
-              rate, not ground-truth precision; manual review remains the source of truth.
+            <p className="mt-2 text-[11px] text-neutral-400">
+              Validity = values passing field validation ÷ extracted values. It is a rule-based pass rate, not
+              ground-truth precision; manual review remains the source of truth.
             </p>
           </div>
         )}
       </div>
 
-      {/* 2. Controls & Filter Bar */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-        {/* Category Tabs */}
-        <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-lg overflow-x-auto text-xs font-medium">
-          <button
-            onClick={() => setActiveFilter('all')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'all'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
+      {/* 2. Filters & search */}
+      <div className="space-y-2">
+        <div className="flex flex-col items-stretch justify-between gap-3 lg:flex-row lg:items-center">
+          <div
+            role="tablist"
+            aria-label="Filter documents"
+            className="flex items-center gap-1 overflow-x-auto rounded-lg bg-neutral-100 p-1 text-xs font-medium"
           >
-            All Documents ({job.documents.length})
-          </button>
-          <button
-            onClick={() => setActiveFilter('review')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'review'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-          >
-            Requires Review ({summaryMetrics.reviewRequired})
-          </button>
-          <button
-            onClick={() => setActiveFilter('conflicts')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'conflicts'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-          >
-            Conflicts ({summaryMetrics.conflicts})
-          </button>
-          <button
-            onClick={() => setActiveFilter('missing')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'missing'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-          >
-            Missing Required ({summaryMetrics.missingFields})
-          </button>
-          <button
-            onClick={() => setActiveFilter('invalid')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'invalid'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-          >
-            Invalid Values ({summaryMetrics.invalidFields})
-          </button>
-          <button
-            onClick={() => setActiveFilter('reviewed')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap ${activeFilter === 'reviewed'
-              ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-              : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-          >
-            Reviewed ({job.documents.filter((d) => d.isReviewed).length})
-          </button>
+            {FILTER_TABS.map((tab) => {
+              const isActive = activeFilter === tab.id;
+              return (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  key={tab.id}
+                  onClick={() => setActiveFilter(tab.id)}
+                  className={`flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 transition-colors ${isActive
+                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                      : 'text-neutral-600 hover:text-neutral-900'
+                    }`}
+                >
+                  {tab.label}
+                  <span
+                    className={`rounded-full px-1.5 py-px font-mono text-[10px] tabular-nums ${isActive ? 'bg-neutral-900 text-white' : 'bg-neutral-200/80 text-neutral-600'
+                      }`}
+                  >
+                    {filterCounts[tab.id]}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 text-xs text-neutral-600">
+              <span className="text-neutral-500">Columns</span>
+              <select
+                value={profileFilter}
+                onChange={(e) => setProfileFilter(e.target.value as ProfileFilter)}
+                className="rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-xs text-neutral-700 focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
+                title="Choose which profile's fields are shown as columns"
+              >
+                {profileOptions.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.id === 'all' ? `All profiles (${profiles.length})` : opt.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="relative w-full sm:w-64">
+              <Search className="pointer-events-none absolute left-3 top-2 h-4 w-4 text-neutral-400" />
+              <input
+                ref={searchRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    if (searchQuery) setSearchQuery('');
+                    else searchRef.current?.blur();
+                  }
+                }}
+                aria-label="Search filenames, paths or values"
+                placeholder="Search filenames or values…"
+                className="w-full rounded-md border border-neutral-300 bg-white py-1.5 pl-9 pr-14 text-xs focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery('');
+                    searchRef.current?.focus();
+                  }}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1.5 rounded p-0.5 text-neutral-400 hover:text-neutral-900"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <span className="pointer-events-none absolute right-2 top-1.5">
+                  <Kbd>/</Kbd>
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-0.5 rounded-md bg-neutral-100 p-0.5">
+              <button
+                type="button"
+                onClick={() => setCompact(false)}
+                aria-pressed={!compact}
+                aria-label="Comfortable rows"
+                title="Comfortable rows"
+                className={`rounded p-1.5 ${!compact ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-500 hover:text-neutral-900'}`}
+              >
+                <Rows3 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCompact(true)}
+                aria-pressed={compact}
+                aria-label="Compact rows"
+                title="Compact rows — more documents on screen"
+                className={`rounded p-1.5 ${compact ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-500 hover:text-neutral-900'}`}
+              >
+                <Rows4 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowShortcuts((s) => !s)}
+              aria-pressed={showShortcuts}
+              aria-label="Keyboard shortcuts"
+              title="Keyboard shortcuts (?)"
+              className="rounded-md p-1.5 text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-900"
+            >
+              <Keyboard className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
-        {/* Search input */}
-        <div className="relative w-full sm:w-72">
-          <Search className="w-4 h-4 absolute left-3 top-2.5 text-neutral-400" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search filenames or values..."
-            className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-neutral-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
-          />
-        </div>
+        {showShortcuts && (
+          <div
+            role="region"
+            aria-label="Keyboard shortcuts"
+            className="flex flex-wrap gap-x-6 gap-y-1.5 rounded-lg border border-neutral-200 bg-white px-4 py-3 text-xs text-neutral-600"
+          >
+            {SHORTCUTS.map((s) => (
+              <span key={s.label} className="flex items-center gap-2">
+                <span className="flex gap-1">
+                  {s.keys.map((k) => (
+                    <Kbd key={k}>{k}</Kbd>
+                  ))}
+                </span>
+                {s.label}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {hasActiveFilters && (
+          <div className="flex items-center gap-2 text-xs text-neutral-500" role="status">
+            <span>
+              Showing <span className="font-semibold text-neutral-800">{sortedDocuments.length}</span> of{' '}
+              {job.documents.length} documents
+            </span>
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 font-medium text-neutral-700 underline-offset-2 hover:bg-neutral-100 hover:underline"
+            >
+              <X className="h-3 w-3" /> Clear filters
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* 3. High-Density Spreadsheet Data Grid */}
-      <div className="bg-white rounded-xl border border-neutral-200 overflow-hidden shadow-xs">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr className="bg-neutral-50/80 border-b border-neutral-200 text-neutral-600 font-semibold select-none">
-                <th className="py-2.5 px-3 w-10 text-center">Status</th>
-                <th className="py-2.5 px-3 w-20 text-center">Profile</th>
-                <th
-                  onClick={() => handleSort('filename')}
-                  className="py-2.5 px-3 cursor-pointer hover:text-neutral-900 whitespace-nowrap"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span>Document / Filename</span>
-                    <ArrowUpDown className="w-3 h-3 text-neutral-400" />
-                  </div>
-                </th>
-                <th
-                  onClick={() => handleSort('path')}
-                  className="py-2.5 px-3 cursor-pointer hover:text-neutral-900 whitespace-nowrap"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span>Path</span>
-                    <ArrowUpDown className="w-3 h-3 text-neutral-400" />
-                  </div>
-                </th>
+      {/* 3. Data grid */}
+      <div className="relative overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-xs">
+        {flash && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="absolute bottom-14 left-1/2 z-40 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-full bg-neutral-900 px-3 py-1.5 text-[11px] font-medium text-white shadow-lg"
+          >
+            <Check className="h-3 w-3 text-emerald-400" />
+            {flash}
+          </div>
+        )}
 
-                {/* Profile Field Columns */}
+        <div ref={tableScrollRef} className="max-h-[70vh] overflow-auto">
+          <table className="w-full border-collapse text-left text-xs">
+            <thead>
+              <tr className="select-none">
+                <th
+                  scope="col"
+                  className="sticky left-0 top-0 z-30 w-12 min-w-[3rem] border-b border-neutral-200 bg-neutral-50 px-3 py-2.5 text-center font-semibold text-neutral-600"
+                >
+                  Status
+                </th>
+                <SortHeader
+                  id="filename"
+                  label="Document"
+                  stickyClass="left-12 z-30 shadow-[1px_0_0_0_theme(colors.neutral.200)]"
+                />
+                <SortHeader id="profile" label="Profile" />
+                <SortHeader id="path" label="Path" />
+
+                {/* Profile field columns */}
                 {activeFields.map((field) => (
-                  <th
-                    key={field.id}
-                    onClick={() => handleSort(field.id)}
-                    className="py-2.5 px-3 cursor-pointer hover:text-neutral-900 whitespace-nowrap"
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <span>{field.name}</span>
-                      <ArrowUpDown className="w-3 h-3 text-neutral-400" />
-                    </div>
-                  </th>
+                  <SortHeader key={field.id} id={field.id} label={field.name} />
                 ))}
 
-                <th className="py-2.5 px-3 text-right whitespace-nowrap">Actions</th>
+                <th
+                  scope="col"
+                  className="sticky top-0 z-20 whitespace-nowrap border-b border-neutral-200 bg-neutral-50 px-3 py-2.5 text-right font-semibold text-neutral-600"
+                >
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-neutral-100">
               {sortedDocuments.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={activeFields.length + 5}
-                    className="py-12 text-center text-neutral-500 text-xs"
-                  >
-                    No documents found matching the active filter and search terms.
+                  <td colSpan={activeFields.length + 5} className="py-14 text-center">
+                    <p className="text-sm font-medium text-neutral-800">No documents match</p>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {hasActiveFilters
+                        ? 'Try a different search term or filter.'
+                        : 'Documents will appear here as they are processed.'}
+                    </p>
+                    {hasActiveFilters && (
+                      <button
+                        type="button"
+                        onClick={clearFilters}
+                        className="mt-3 rounded-md border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-800 hover:bg-neutral-100"
+                      >
+                        Clear filters
+                      </button>
+                    )}
                   </td>
                 </tr>
               ) : (
                 sortedDocuments.map((doc) => {
                   const docProfile = getDocProfile(doc);
-                  const hasConflict = Object.values(doc.diagnostics).some((d) => d.isConflict);
-                  const invalidDiagnostics = Object.values(doc.diagnostics).filter(
-                    (d) => d.status === 'INVALID'
-                  );
-                  const hasInvalid = invalidDiagnostics.length > 0;
-                  const invalidTooltip = invalidDiagnostics
-                    .map((d) => `${d.fieldName || d.fieldId}: ${d.validationError || 'Validation failed'}`)
-                    .join('\n');
                   const isPending =
                     doc.processingStatus === 'pending' ||
                     doc.processingStatus === 'processing';
                   const isExcluded = doc.processingStatus === 'excluded';
-                  const hasProcessingWarning = Boolean(doc.errorDetails);
-                  const hasMissingRequired = Object.values(doc.diagnostics).some(
-                    (d) =>
-                      d.status === 'NOT_FOUND' &&
-                      getDocFields(doc).find((f) => f.id === d.fieldId)?.required
-                  );
-                  const isOcrOrAi =
-                    doc.extractionMethodUsed === 'OCR_EXTRACTED' ||
-                    doc.extractionMethodUsed === 'AI_EXTRACTED';
-                  const isAi = doc.extractionMethodUsed === 'AI_EXTRACTED';
+                  const isSelected = selectedDocId === doc.id;
+                  const docFields = getDocFields(doc);
+
+                  const stickyBg = isSelected ? 'bg-neutral-100' : 'bg-white group-hover:bg-neutral-50';
 
                   return (
                     <tr
                       key={doc.id}
-                      className={`transition-colors group ${isPending || isExcluded ? 'opacity-60' : 'hover:bg-neutral-50/70'}`}
+                      data-doc-id={doc.id}
+                      aria-selected={isSelected}
+                      onClick={() => setSelectedDocId(doc.id)}
+                      className={`group transition-colors ${isPending || isExcluded ? 'opacity-60' : ''
+                        } ${isSelected ? 'bg-neutral-100' : 'hover:bg-neutral-50/70'}`}
                     >
-                      {/* Status Icon */}
-                      <td className="py-2.5 px-3 text-center">
-                        {isPending ? (
-                          <span
-                            title={
-                              doc.processingStatus === 'processing'
-                                ? 'Processing...'
-                                : 'Queued for processing'
-                            }
-                            className="inline-flex items-center justify-center"
-                          >
-                            <span
-                              className={`inline-block w-3.5 h-3.5 rounded-full border-2 ${doc.processingStatus === 'processing'
-                                ? 'border-neutral-300 border-t-neutral-700 animate-spin'
-                                : 'border-neutral-200'
-                                }`}
-                            />
-                          </span>
-                        ) : isExcluded ? (
-                          <span
-                            title="Excluded from processing by the user"
-                            className="inline-flex items-center justify-center"
-                          >
-                            <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-dashed border-neutral-400" />
-                          </span>
-                        ) : hasProcessingWarning ? (
-                          <span
-                            title={`Processing warning: ${doc.errorDetails}`}
-                            className="inline-flex items-center justify-center"
-                          >
-                            <AlertTriangle className="w-4 h-4 text-amber-600 inline" />
-                          </span>
-                        ) : hasInvalid ? (
-                          <span
-                            title={`Invalid values hidden from export:\n${invalidTooltip}`}
-                            className="inline-flex items-center justify-center"
-                          >
-                            <AlertCircle className="w-4 h-4 text-rose-600 inline" />
-                          </span>
-                        ) : doc.isReviewed ? (
-                          <span title="Reviewed and Verified" className="inline-flex items-center justify-center">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600 inline" />
-                          </span>
-                        ) : hasConflict ? (
-                          <span title="Conflict detected between Filename and PDF" className="inline-flex items-center justify-center">
-                            <AlertTriangle className="w-4 h-4 text-amber-500 inline" />
-                          </span>
-                        ) : hasMissingRequired ? (
-                          <span title="Missing required fields" className="inline-flex items-center justify-center">
-                            <AlertCircle className="w-4 h-4 text-rose-500 inline" />
-                          </span>
-                        ) : isOcrOrAi ? (
-                          <span
-                            title={
-                              isAi
-                                ? 'Local AI-assisted extraction; verify values'
-                                : 'Extracted via OCR Fallback'
-                            }
-                            className="inline-flex items-center justify-center"
-                          >
-                            <Sparkles
-                              className={`w-4 h-4 ${isAi ? 'text-sky-700' : 'text-purple-600'
-                                } inline`}
-                            />
-                          </span>
-                        ) : (
-                          <span title="Ready for review" className="inline-flex items-center justify-center">
-                            <Check className="w-3.5 h-3.5 text-neutral-400 inline" />
-                          </span>
-                        )}
+                      {/* Status */}
+                      <td className={`sticky left-0 z-10 w-12 min-w-[3rem] text-center ${cellPad} ${stickyBg} ${isSelected ? 'shadow-[inset_3px_0_0_0_theme(colors.neutral.900)]' : ''}`}>
+                        {renderStatus(doc)}
                       </td>
 
-                      {/* Profile Column */}
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <span
-                          className="inline-flex items-center gap-1.5 text-xs font-medium"
+                      {/* Filename */}
+                      <td
+                        className={`sticky left-12 z-10 max-w-xs truncate whitespace-nowrap font-medium text-neutral-900 shadow-[1px_0_0_0_theme(colors.neutral.200)] ${cellPad} ${stickyBg}`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onInspectDocument(doc)}
+                          className="max-w-full truncate text-left hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900"
+                          title={`Inspect ${doc.filename}`}
                         >
-                          <span className="w-2 h-2 rounded-full shrink-0 bg-neutral-200" />
+                          {doc.filename}
+                        </button>
+                      </td>
+
+                      {/* Profile */}
+                      <td className={`whitespace-nowrap ${cellPad}`}>
+                        <span className="inline-flex items-center gap-1.5 text-xs font-medium">
+                          <span className={`h-2 w-2 shrink-0 rounded-full ${docProfile ? 'bg-neutral-300' : 'bg-rose-400'}`} />
                           <span
-                            className={`truncate max-w-[120px] ${docProfile ? 'text-neutral-700' : 'text-rose-600'}`}
+                            className={`max-w-[120px] truncate ${docProfile ? 'text-neutral-700' : 'text-rose-600'}`}
                             title={doc.assignmentReason || undefined}
                           >
                             {docProfile?.name || doc.profileName || 'Unassigned'}
@@ -862,28 +1325,19 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         </span>
                       </td>
 
-                      {/* Filename */}
-                      <td className="py-2.5 px-3 font-medium text-neutral-900 whitespace-nowrap max-w-xs truncate">
-                        <button
-                          onClick={() => onInspectDocument(doc)}
-                          className="hover:underline text-left"
-                          title="Click to inspect PDF"
-                        >
-                          {doc.filename}
-                        </button>
-                      </td>
-
                       {/* Path */}
-                      <td className="py-2.5 px-3 text-neutral-500 font-mono text-[11px] whitespace-nowrap max-w-[140px] truncate" title={doc.relativePath}>
+                      <td
+                        className={`max-w-[140px] truncate whitespace-nowrap font-mono text-[11px] text-neutral-500 ${cellPad}`}
+                        title={doc.relativePath}
+                      >
                         {doc.relativePath}
                       </td>
 
-                      {/* Field Value Cells with Status Tinting & Inline Edit */}
+                      {/* Field value cells */}
                       {activeFields.map((field) => {
                         const diag = doc.diagnostics[field.id];
                         const val = doc.finalValues[field.id] || diag?.finalValue || '';
                         const isConflictCell = diag?.isConflict;
-                        const isMissingCell = diag?.status === 'NOT_FOUND';
                         const isInvalidCell = diag?.status === 'INVALID';
                         const isFilenameOnlyCell = diag?.status === 'FILENAME_ONLY';
                         const isCorrected = diag?.isManuallyCorrected;
@@ -892,7 +1346,6 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         const isFormCell = diag?.source === 'form_field';
 
                         // Check if this field belongs to the document's assigned profile
-                        const docFields = getDocFields(doc);
                         const fieldAppliesToDoc = docFields.some((f) => f.id === field.id);
 
                         const isCurrentlyEditing =
@@ -902,7 +1355,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         // no value to show or edit.
                         if (isExcluded) {
                           return (
-                            <td key={field.id} className="py-2.5 px-3 whitespace-nowrap">
+                            <td key={field.id} className={`whitespace-nowrap ${cellPad}`}>
                               <span
                                 className="text-[11px] italic text-neutral-400"
                                 title="Excluded from processing - no extraction was run"
@@ -915,18 +1368,35 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
 
                         if (isCurrentlyEditing) {
                           return (
-                            <td key={field.id} className="py-1 px-2 whitespace-nowrap">
+                            <td key={field.id} className="whitespace-nowrap px-2 py-1">
                               <input
                                 autoFocus
                                 type="text"
                                 value={inlineValue}
+                                aria-label={`Edit ${field.name} for ${doc.filename}`}
                                 onChange={(e) => setInlineValue(e.target.value)}
-                                onBlur={commitInlineEdit}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') commitInlineEdit();
-                                  if (e.key === 'Escape') setEditingCell(null);
+                                onFocus={(e) => e.currentTarget.select()}
+                                onBlur={() => {
+                                  // Ignore blurs from an input that has already been
+                                  // replaced by the next cell's editor.
+                                  const live = editingCellRef.current;
+                                  if (live?.docId === doc.id && live?.fieldId === field.id) {
+                                    finishInlineEdit(true);
+                                  }
                                 }}
-                                className="px-2 py-1 text-xs border border-neutral-900 rounded bg-white font-mono w-full min-w-[120px]"
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    finishInlineEdit(true, e.shiftKey ? undefined : 'down');
+                                  } else if (e.key === 'Tab') {
+                                    e.preventDefault();
+                                    finishInlineEdit(true, e.shiftKey ? 'prev' : 'next');
+                                  } else if (e.key === 'Escape') {
+                                    e.preventDefault();
+                                    finishInlineEdit(false);
+                                  }
+                                }}
+                                className="w-full min-w-[140px] rounded border border-neutral-900 bg-white px-2 py-1 font-mono text-xs focus:outline-hidden focus:ring-2 focus:ring-neutral-900/30"
                               />
                             </td>
                           );
@@ -934,11 +1404,9 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
 
                         if (isPending) {
                           return (
-                            <td key={field.id} className="py-2.5 px-3 whitespace-nowrap">
+                            <td key={field.id} className={`whitespace-nowrap ${cellPad}`}>
                               <span className="text-[11px] italic text-neutral-400">
-                                {doc.processingStatus === 'processing'
-                                  ? 'Processing…'
-                                  : 'Queued'}
+                                {doc.processingStatus === 'processing' ? 'Processing…' : 'Queued'}
                               </span>
                             </td>
                           );
@@ -948,20 +1416,20 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                           <td
                             key={field.id}
                             onDoubleClick={() => startInlineEdit(doc.id, field.id, val)}
-                            className="py-2.5 px-3 whitespace-nowrap"
+                            className={`group/cell whitespace-nowrap ${cellPad}`}
                           >
                             <div className="flex items-center gap-1.5">
                               {val ? (
                                 <span
                                   className={`font-mono text-xs ${!fieldAppliesToDoc
-                                    ? 'text-neutral-500 opacity-60'
-                                    : isConflictCell
-                                      ? 'text-amber-800 font-semibold bg-amber-50 px-1.5 py-0.5 rounded'
-                                      : isInvalidCell
-                                        ? 'text-rose-800 font-semibold bg-rose-50 px-1.5 py-0.5 rounded'
-                                        : isCorrected
-                                          ? 'text-blue-800 font-medium'
-                                          : 'text-neutral-800'
+                                      ? 'text-neutral-500 opacity-60'
+                                      : isConflictCell
+                                        ? 'rounded bg-amber-50 px-1.5 py-0.5 font-semibold text-amber-800'
+                                        : isInvalidCell
+                                          ? 'rounded bg-rose-50 px-1.5 py-0.5 font-semibold text-rose-800'
+                                          : isCorrected
+                                            ? 'font-medium text-blue-800'
+                                            : 'text-neutral-800'
                                     }`}
                                   title={
                                     isInvalidCell
@@ -974,12 +1442,14 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                               ) : (
                                 <span
                                   className={`text-[11px] italic ${!fieldAppliesToDoc
-                                    ? 'text-neutral-400'
-                                    : field.required ? 'text-rose-500 font-medium' : 'text-neutral-400'
+                                      ? 'text-neutral-400'
+                                      : field.required
+                                        ? 'font-medium text-rose-500'
+                                        : 'text-neutral-400'
                                     }`}
                                   title={
                                     !fieldAppliesToDoc
-                                      ? 'Field not in this document\'s assigned profile'
+                                      ? "Field not in this document's assigned profile"
                                       : diag?.explanation || val
                                   }
                                 >
@@ -988,73 +1458,77 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                               )}
 
                               {isConflictCell && (
-                                <span
-                                  className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0"
-                                  title="Conflict between sources"
-                                />
+                                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" title="Conflict between sources" />
                               )}
                               {isInvalidCell && (
                                 <span
                                   title={diag?.validationError || 'Value failed validation; hidden from export'}
                                   className="inline-flex shrink-0"
                                 >
-                                  <AlertCircle className="w-3 h-3 text-rose-600" />
+                                  <AlertCircle className="h-3 w-3 text-rose-600" />
                                 </span>
                               )}
                               {isFormCell && (
-                                <span
-                                  className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"
-                                  title="Filled form-field (AcroForm) value"
-                                />
+                                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" title="Filled form-field (AcroForm) value" />
                               )}
                               {isFilenameOnlyCell && (
                                 <span
-                                  className="w-1.5 h-1.5 rounded-full border border-amber-500 bg-amber-200 shrink-0"
+                                  className="h-1.5 w-1.5 shrink-0 rounded-full border border-amber-500 bg-amber-200"
                                   title="Filename-only match; no document-side value existed to cross-check it"
                                 />
                               )}
                               {isOcrCell && (
-                                <span
-                                  className="w-1.5 h-1.5 rounded-full bg-purple-500 shrink-0"
-                                  title="OCR extracted"
-                                />
+                                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-purple-500" title="OCR extracted" />
                               )}
                               {isAiCell && (
-                                <span
-                                  className="w-1.5 h-1.5 rounded-full bg-sky-600 shrink-0"
-                                  title="Local AI extracted; verify this value"
-                                />
+                                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-600" title="Local AI extracted; verify this value" />
                               )}
                               {isCorrected && (
-                                <span
-                                  className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0"
-                                  title="Manually edited"
-                                />
+                                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-500" title="Manually edited" />
                               )}
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  startInlineEdit(doc.id, field.id, val);
+                                }}
+                                aria-label={`Edit ${field.name} for ${doc.filename}`}
+                                title="Edit value (or double-click)"
+                                className="ml-0.5 shrink-0 rounded p-0.5 text-neutral-400 opacity-0 transition-opacity hover:bg-neutral-200/70 hover:text-neutral-900 focus-visible:opacity-100 group-hover/cell:opacity-100"
+                              >
+                                <Pencil className="h-3 w-3" />
+                              </button>
                             </div>
                           </td>
                         );
                       })}
 
-                      {/* Row Action Buttons */}
-                      <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                        <div className="flex items-center justify-end gap-1.5">
+                      {/* Row actions */}
+                      <td className={`whitespace-nowrap text-right ${cellPad}`}>
+                        <div className="flex items-center justify-end gap-1">
                           <button
+                            type="button"
                             onClick={() => onInspectDocument(doc)}
-                            className="p-1 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded transition-colors"
-                            title="Inspect PDF and Diagnostics"
+                            className="flex items-center gap-1 rounded px-1.5 py-1 text-neutral-600 transition-colors hover:bg-neutral-100 hover:text-neutral-900"
+                            title="Inspect PDF and diagnostics"
+                            aria-label={`Inspect ${doc.filename}`}
                           >
-                            <Eye className="w-3.5 h-3.5" />
+                            <Eye className="h-3.5 w-3.5" />
+                            <span className="text-[11px] font-medium">Inspect</span>
                           </button>
                           <button
+                            type="button"
                             onClick={() => onToggleReviewed(doc.id)}
-                            className={`p-1 rounded transition-colors ${doc.isReviewed
-                              ? 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
-                              : 'text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100'
+                            aria-pressed={doc.isReviewed}
+                            aria-label={doc.isReviewed ? 'Mark unreviewed' : 'Mark reviewed'}
+                            className={`rounded p-1.5 transition-colors ${doc.isReviewed
+                                ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                                : 'text-neutral-400 hover:bg-neutral-100 hover:text-neutral-900'
                               }`}
-                            title={doc.isReviewed ? 'Mark Unreviewed' : 'Mark Reviewed'}
+                            title={doc.isReviewed ? 'Mark unreviewed (R)' : 'Mark reviewed (R)'}
                           >
-                            <Check className="w-3.5 h-3.5" />
+                            <Check className="h-3.5 w-3.5" />
                           </button>
                         </div>
                       </td>
@@ -1066,13 +1540,14 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
           </table>
         </div>
 
-        {/* Table Footer info */}
-        <div className="px-4 py-3 bg-neutral-50/60 border-t border-neutral-200 flex items-center justify-between text-xs text-neutral-500 font-mono">
-          <span>
+        {/* Footer */}
+        <div className="flex items-center justify-between gap-3 border-t border-neutral-200 bg-neutral-50/60 px-4 py-2.5 text-xs text-neutral-500">
+          <span className="font-mono">
             Showing {sortedDocuments.length} of {job.documents.length} documents
           </span>
-          <span className="hidden sm:inline">
-            Double-click any cell to quickly edit value inline
+          <span className="hidden items-center gap-2 sm:flex">
+            Double-click a cell to edit · <Kbd>Enter</Kbd> next row · <Kbd>Tab</Kbd> next cell · <Kbd>J</Kbd>
+            <Kbd>K</Kbd> move · <Kbd>?</Kbd> all shortcuts
           </span>
         </div>
       </div>

@@ -24,9 +24,21 @@ import {
   LayoutTemplate,
   Eye,
   Ban,
+  Copy,
+  Keyboard,
+  ChevronDown,
+  SkipForward,
+  FileInput,
+  ScanText,
+  FileSearch,
+  FileType2,
 } from 'lucide-react';
 import { PDFDocumentRecord, ExtractionProfile, FieldDefinition } from '../../types/extraction';
 import { renderPdfPageToCanvas } from '../../services/pdfService';
+
+/* -------------------------------------------------------------------------- */
+/*  Constants & helpers                                                       */
+/* -------------------------------------------------------------------------- */
 
 const ASSIGNMENT_BADGE_LABEL: Record<PDFDocumentRecord['assignmentStatus'], string> = {
   legacy: 'Job default',
@@ -45,6 +57,215 @@ const ASSIGNMENT_BADGE_STYLES: Record<PDFDocumentRecord['assignmentStatus'], str
   unassigned: 'border-rose-200 bg-rose-50 text-rose-700',
   excluded: 'border-neutral-300 bg-neutral-200 text-neutral-700',
 };
+
+const STATUS_STYLES: Record<string, string> = {
+  MATCHED: 'bg-emerald-100 text-emerald-800',
+  MISMATCH: 'bg-amber-100 text-amber-900',
+  INVALID: 'bg-rose-100 text-rose-900',
+  OCR_EXTRACTED: 'bg-purple-100 text-purple-900',
+  AI_EXTRACTED: 'bg-sky-100 text-sky-900',
+  FILENAME_ONLY: 'bg-amber-50 text-amber-800 border border-amber-200',
+};
+
+type SourceTone = 'neutral' | 'emerald' | 'purple' | 'sky';
+
+const TONE_STYLES: Record<
+  SourceTone,
+  { row: string; selectedRow: string; title: string; value: string; meta: string; icon: string }
+> = {
+  neutral: {
+    row: 'bg-white',
+    selectedRow: 'bg-neutral-50',
+    title: 'text-neutral-800',
+    value: 'text-neutral-900',
+    meta: 'text-neutral-500',
+    icon: 'text-neutral-500',
+  },
+  emerald: {
+    row: 'bg-emerald-50/50',
+    selectedRow: 'bg-emerald-50',
+    title: 'text-emerald-900',
+    value: 'text-emerald-950',
+    meta: 'text-emerald-800',
+    icon: 'text-emerald-600',
+  },
+  purple: {
+    row: 'bg-purple-50/40',
+    selectedRow: 'bg-purple-50',
+    title: 'text-purple-900',
+    value: 'text-purple-950',
+    meta: 'text-purple-800',
+    icon: 'text-purple-600',
+  },
+  sky: {
+    row: 'bg-sky-50/50',
+    selectedRow: 'bg-sky-50',
+    title: 'text-sky-900',
+    value: 'text-sky-950',
+    meta: 'text-sky-800',
+    icon: 'text-sky-700',
+  },
+};
+
+const SHORTCUTS: { keys: string[]; label: string }[] = [
+  { keys: ['J', 'K'], label: 'Next / previous field' },
+  { keys: ['N'], label: 'Jump to next field needing attention' },
+  { keys: ['1', '2', '3', '4', '5'], label: 'Use the numbered source value' },
+  { keys: ['E'], label: 'Edit value' },
+  { keys: ['Enter'], label: 'Save edit (while editing)' },
+  { keys: ['R'], label: 'Mark reviewed / unreviewed' },
+  { keys: ['[', ']'], label: 'Previous / next page' },
+  { keys: ['+', '−', '0'], label: 'Zoom in / out / reset' },
+  { keys: ['Esc'], label: 'Cancel edit, then close' },
+];
+
+type FieldHealth = 'edited' | 'invalid' | 'conflict' | 'missing' | 'ok';
+
+const HEALTH_META: Record<FieldHealth, { dot: string; label: string }> = {
+  edited: { dot: 'bg-blue-500', label: 'Manually edited' },
+  invalid: { dot: 'bg-rose-500', label: 'Invalid format' },
+  conflict: { dot: 'bg-amber-500', label: 'Sources conflict' },
+  missing: { dot: 'bg-neutral-400 ring-2 ring-neutral-200', label: 'Required value missing' },
+  ok: { dot: 'bg-emerald-500', label: 'Looks good' },
+};
+
+const getFieldHealth = (
+  field: FieldDefinition,
+  diag: PDFDocumentRecord['diagnostics'][string] | undefined,
+): FieldHealth => {
+  if (diag?.isManuallyCorrected) return 'edited';
+  if (diag?.status === 'INVALID' || diag?.validationPassed === false) return 'invalid';
+  if (diag?.isConflict || diag?.status === 'MISMATCH') return 'conflict';
+  if (diag?.status === 'NOT_FOUND' && field.required) return 'missing';
+  return 'ok';
+};
+
+const needsAttention = (health: FieldHealth) =>
+  health === 'invalid' || health === 'conflict' || health === 'missing';
+
+const isTypingTarget = (el: EventTarget | null) => {
+  const node = el as HTMLElement | null;
+  if (!node || !node.tagName) return false;
+  const tag = node.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
+};
+
+const Kbd: React.FC<{ children: React.ReactNode; dark?: boolean }> = ({ children, dark }) => (
+  <kbd
+    className={`inline-flex min-w-[1.25rem] items-center justify-center rounded border px-1 py-px font-mono text-[10px] font-semibold leading-none ${dark
+        ? 'border-white/30 bg-white/10 text-white/90'
+        : 'border-neutral-300 bg-white text-neutral-600'
+      }`}
+  >
+    {children}
+  </kbd>
+);
+
+/* -------------------------------------------------------------------------- */
+/*  Source row (one candidate value from one extraction source)               */
+/* -------------------------------------------------------------------------- */
+
+interface SourceRowProps {
+  title: string;
+  icon?: React.ReactNode;
+  tone?: SourceTone;
+  value?: string | null;
+  emptyText?: string;
+  isSelectedSource?: boolean;
+  selectedLabel?: string;
+  isCurrent: boolean;
+  shortcut?: number;
+  details?: React.ReactNode[];
+  onUse: () => void;
+}
+
+const SourceRow: React.FC<SourceRowProps> = ({
+  title,
+  icon,
+  tone = 'neutral',
+  value,
+  emptyText = 'No match',
+  isSelectedSource,
+  selectedLabel = 'Selected source',
+  isCurrent,
+  shortcut,
+  details,
+  onUse,
+}) => {
+  const t = TONE_STYLES[tone];
+  const hasValue = Boolean(value);
+
+  return (
+    <div
+      className={`flex items-start justify-between gap-4 border-b border-neutral-200 p-3 last:border-b-0 ${isSelectedSource ? t.selectedRow : t.row
+        }`}
+    >
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`flex items-center gap-1.5 text-xs font-semibold ${t.title}`}>
+            {icon && <span className={t.icon}>{icon}</span>}
+            {title}
+          </span>
+          {isSelectedSource && (
+            <span className="rounded-full bg-neutral-900 px-1.5 py-px text-[10px] font-medium text-white">
+              {selectedLabel}
+            </span>
+          )}
+        </div>
+        <div className={`break-words font-mono text-xs ${hasValue ? t.value : 'italic text-neutral-400'}`}>
+          {hasValue ? value : emptyText}
+        </div>
+        {details?.filter(Boolean).map((d, i) => (
+          <p key={i} className={`whitespace-pre-wrap break-words text-[11px] leading-relaxed ${t.meta}`}>
+            {d}
+          </p>
+        ))}
+      </div>
+
+      {hasValue &&
+        (isCurrent ? (
+          <span className="mt-0.5 flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-medium text-emerald-800">
+            <Check className="h-3 w-3" /> In use
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onUse}
+            className="mt-0.5 flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded border border-neutral-300 bg-white px-2 py-1 text-[11px] font-medium text-neutral-800 transition-colors hover:border-neutral-900 hover:bg-neutral-900 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900"
+          >
+            Use this value
+            {shortcut !== undefined && <Kbd>{shortcut}</Kbd>}
+          </button>
+        ))}
+    </div>
+  );
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Collapsible section                                                       */
+/* -------------------------------------------------------------------------- */
+
+const Collapsible: React.FC<{
+  title: string;
+  badge?: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}> = ({ title, badge, defaultOpen = false, children }) => (
+  <details open={defaultOpen} className="group rounded-lg border border-neutral-200 bg-white">
+    <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3.5 py-2.5 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 [&::-webkit-details-marker]:hidden">
+      <span className="flex items-center gap-2">
+        {title}
+        {badge}
+      </span>
+      <ChevronDown className="h-3.5 w-3.5 text-neutral-400 transition-transform group-open:rotate-180" />
+    </summary>
+    <div className="border-t border-neutral-200 p-3.5">{children}</div>
+  </details>
+);
+
+/* -------------------------------------------------------------------------- */
+/*  Main component                                                            */
+/* -------------------------------------------------------------------------- */
 
 interface DocumentInspectorModalProps {
   document: PDFDocumentRecord;
@@ -74,11 +295,28 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
   const [editingValue, setEditingValue] = useState<string>('');
   const [isEditing, setIsEditing] = useState<boolean>(false);
 
+  // Review-flow UX state
+  const [autoAdvance, setAutoAdvance] = useState<boolean>(true);
+  const [flash, setFlash] = useState<string | null>(null);
+  const [showShortcuts, setShowShortcuts] = useState<boolean>(false);
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const editInputRef = useRef<HTMLInputElement | null>(null);
+  const activeChipRef = useRef<HTMLButtonElement | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
 
   const activeField: FieldDefinition | undefined = profile.fields.find((f) => f.id === activeFieldId);
   const activeDiagnostic = doc.diagnostics[activeFieldId];
   const currentValue = doc.finalValues[activeFieldId] || activeDiagnostic?.finalValue || '';
+
+  const fieldIndex = profile.fields.findIndex((f) => f.id === activeFieldId);
+  const fieldHealth = profile.fields.map((f) => getFieldHealth(f, doc.diagnostics[f.id]));
+  const attentionCount = fieldHealth.filter(needsAttention).length;
+  const editedCount = fieldHealth.filter((h) => h === 'edited').length;
+  const isDirty = isEditing && editingValue !== currentValue;
+
+  /* ------------------------------- Effects -------------------------------- */
 
   // A batch can mix profiles, so the fields offered here must belong to the
   // profile this document was actually extracted with.
@@ -153,127 +391,469 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     };
   }, [pdfBuffer, currentPage, zoomScale, viewMode, currentValue, doc.filename, doc.finalValues, doc.rawExtractedPdfText]);
 
-  const handleSaveCorrection = () => {
-    onUpdateFieldValue(doc.id, activeFieldId, editingValue);
-    setIsEditing(false);
+  // Lock background scroll and move focus into the dialog while it is open.
+  useEffect(() => {
+    const previouslyFocused = window.document.activeElement as HTMLElement | null;
+    const previousOverflow = window.document.body.style.overflow;
+    window.document.body.style.overflow = 'hidden';
+    dialogRef.current?.focus();
+    return () => {
+      window.document.body.style.overflow = previousOverflow;
+      previouslyFocused?.focus?.();
+    };
+  }, []);
+
+  // Keep the active field chip visible in the horizontal selector.
+  useEffect(() => {
+    activeChipRef.current?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+  }, [activeFieldId]);
+
+  // Focus the input when editing begins.
+  useEffect(() => {
+    if (isEditing) {
+      editInputRef.current?.focus();
+      editInputRef.current?.select();
+    }
+  }, [isEditing]);
+
+  useEffect(
+    () => () => {
+      if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    },
+    [],
+  );
+
+  /* ------------------------------ Actions --------------------------------- */
+
+  const showFlash = (message: string) => {
+    setFlash(message);
+    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => setFlash(null), 2200);
   };
 
-  const handleQuickAccept = (val: string) => {
+  const goToField = (index: number) => {
+    const f = profile.fields[index];
+    if (f) setActiveFieldId(f.id);
+  };
+
+  /** Jumps to the next field (after the current one, wrapping) that needs a look. */
+  const goToNextIssue = (): boolean => {
+    const n = profile.fields.length;
+    for (let step = 1; step < n; step++) {
+      const idx = (fieldIndex + step) % n;
+      if (needsAttention(fieldHealth[idx])) {
+        goToField(idx);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const commitValue = (val: string) => {
     onUpdateFieldValue(doc.id, activeFieldId, val);
     setEditingValue(val);
     setIsEditing(false);
+    showFlash(`${activeField?.name ?? 'Field'} saved`);
+    if (autoAdvance) goToNextIssue();
+  };
+
+  const handleSaveCorrection = () => commitValue(editingValue);
+  const handleQuickAccept = (val: string) => commitValue(val);
+
+  const startEditing = () => {
+    setEditingValue(currentValue);
+    setIsEditing(true);
+  };
+
+  const cancelEditing = () => {
+    setIsEditing(false);
+    setEditingValue(currentValue);
+  };
+
+  const handleCopy = async () => {
+    if (!currentValue) return;
+    try {
+      await navigator.clipboard.writeText(currentValue);
+      showFlash('Value copied');
+    } catch {
+      showFlash('Copy is not available in this browser');
+    }
+  };
+
+  const handleRequestClose = () => {
+    if (isDirty && !window.confirm('Discard your unsaved edit?')) return;
+    onClose();
   };
 
   const totalPages = doc.pageCount || 1;
 
-  return (
-    <div className="fixed inset-0 z-50 bg-neutral-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="bg-white rounded-xl shadow-2xl border border-neutral-200 w-full max-w-7xl h-[92vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-98 duration-150">
+  /* --------------------- Source candidates (data-driven) ------------------- */
 
-        {/* Modal Top Bar */}
-        <div className="flex items-center justify-between px-6 py-3.5 border-b border-neutral-200 bg-neutral-50/70 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="p-1.5 rounded-md bg-white border border-neutral-200 text-neutral-700">
-              <FileText className="w-4 h-4" />
+  const d = activeDiagnostic;
+  const sourceRows: (Omit<SourceRowProps, 'isCurrent' | 'shortcut' | 'onUse'> & { key: string })[] = d
+    ? [
+      {
+        key: 'filename',
+        title: 'Filename pattern',
+        icon: <FileType2 className="h-3.5 w-3.5" />,
+        value: d.filenameValue,
+        isSelectedSource: d.source === 'filename',
+        details: [activeField?.filenameRules.patterns[0] ? `Rule: ${activeField.filenameRules.patterns[0]}` : null],
+      },
+      ...(d.formValue
+        ? [
+          {
+            key: 'form',
+            title: 'Form field value',
+            icon: <FileInput className="h-3.5 w-3.5" />,
+            tone: 'emerald' as SourceTone,
+            value: d.formValue,
+            isSelectedSource: d.source === 'form_field',
+            details: [
+              d.formConfidenceScore !== undefined
+                ? `Evidence score: ${Math.round((d.formConfidenceScore ?? 0) * 100)}%${d.formMethod ? ` · ${d.formMethod.replace('acroform_', 'AcroForm ')}` : ''
+                }${d.formPageNumber ? ` · Page ${d.formPageNumber}` : ''}`
+                : null,
+              d.formEvidence ? `Evidence: ${d.formEvidence}` : null,
+            ],
+          },
+        ]
+        : []),
+      {
+        key: 'pdf',
+        title: 'PDF text',
+        icon: <FileSearch className="h-3.5 w-3.5" />,
+        value: d.pdfValue,
+        isSelectedSource: d.source === 'pdf_text',
+        details: [
+          d.candidateScores?.pdf_text !== undefined
+            ? `Evidence score: ${Math.round(d.candidateScores.pdf_text * 100)}%${d.pdfPageNumber ? ` · Page ${d.pdfPageNumber}` : ''
+            }`
+            : null,
+          d.pdfEvidence ? `Evidence: ${d.pdfEvidence}` : null,
+          d.matchedPatternOrLabel ? `Label/Pattern: ${d.matchedPatternOrLabel}` : null,
+        ],
+      },
+      ...(d.ocrValue
+        ? [
+          {
+            key: 'ocr',
+            title: 'OCR candidate',
+            icon: <ScanText className="h-3.5 w-3.5" />,
+            tone: 'purple' as SourceTone,
+            value: d.ocrValue,
+            details: [
+              d.candidateScores?.ocr !== undefined
+                ? `Evidence score: ${Math.round(d.candidateScores.ocr * 100)}%${d.ocrPageNumber ? ` · Page ${d.ocrPageNumber}` : ''
+                }`
+                : null,
+              d.ocrEvidence ? `Evidence: ${d.ocrEvidence}` : null,
+            ],
+          },
+        ]
+        : []),
+      ...(d.aiValue
+        ? [
+          {
+            key: 'ai',
+            title: 'AI candidate (Ollama)',
+            icon: <Sparkles className="h-3.5 w-3.5" />,
+            tone: 'sky' as SourceTone,
+            value: d.aiValue,
+            isSelectedSource: d.source === 'ai',
+            selectedLabel: 'Selected source · verify',
+            details: [
+              d.aiEvidence
+                ? `${d.aiSourceKind ? `Source: ${d.aiSourceKind} · ` : ''}Evidence: ${d.aiEvidence}${d.source === 'ai' && d.pageNumber ? ` (page ${d.pageNumber})` : ''
+                }`
+                : null,
+            ],
+          },
+        ]
+        : []),
+    ]
+    : [];
+
+  // Number only the rows that actually have a value, in display order.
+  let shortcutCounter = 0;
+  const numberedRows = sourceRows.map((row) => ({
+    ...row,
+    shortcut: row.value ? ++shortcutCounter : undefined,
+  }));
+
+  /* --------------------------- Keyboard shortcuts -------------------------- */
+
+  // Latest-closure pattern: one stable listener always sees fresh state.
+  const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => undefined);
+  keyHandlerRef.current = (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (showShortcuts) setShowShortcuts(false);
+      else if (isEditing) cancelEditing();
+      else handleRequestClose();
+      return;
+    }
+
+    if (isTypingTarget(e.target)) return;
+
+    const key = e.key.toLowerCase();
+
+    if (/^[1-9]$/.test(key)) {
+      const row = numberedRows.find((r) => r.shortcut === Number(key));
+      if (row?.value) {
+        e.preventDefault();
+        if (row.value === currentValue) showFlash('Already using this value');
+        else handleQuickAccept(row.value);
+      }
+      return;
+    }
+
+    switch (key) {
+      case 'j':
+        e.preventDefault();
+        if (fieldIndex < profile.fields.length - 1) goToField(fieldIndex + 1);
+        break;
+      case 'k':
+        e.preventDefault();
+        if (fieldIndex > 0) goToField(fieldIndex - 1);
+        break;
+      case 'n':
+        e.preventDefault();
+        if (!goToNextIssue()) showFlash('No other fields need attention');
+        break;
+      case 'e':
+        if (activeField) {
+          e.preventDefault();
+          startEditing();
+        }
+        break;
+      case 'r':
+        e.preventDefault();
+        onToggleReviewed(doc.id);
+        break;
+      case '[':
+        if (viewMode === 'canvas') setCurrentPage((p) => Math.max(1, p - 1));
+        break;
+      case ']':
+        if (viewMode === 'canvas') setCurrentPage((p) => Math.min(totalPages, p + 1));
+        break;
+      case '+':
+      case '=':
+        if (viewMode === 'canvas') setZoomScale((z) => Math.min(2.5, z + 0.2));
+        break;
+      case '-':
+        if (viewMode === 'canvas') setZoomScale((z) => Math.max(0.6, z - 0.2));
+        break;
+      case '0':
+        if (viewMode === 'canvas') setZoomScale(1.2);
+        break;
+      case '?':
+        setShowShortcuts((s) => !s);
+        break;
+      default:
+        break;
+    }
+  };
+
+  useEffect(() => {
+    const listener = (e: KeyboardEvent) => keyHandlerRef.current(e);
+    window.addEventListener('keydown', listener);
+    return () => window.removeEventListener('keydown', listener);
+  }, []);
+
+  /* -------------------------------- Render -------------------------------- */
+
+  const statusBadgeClass = activeDiagnostic
+    ? STATUS_STYLES[activeDiagnostic.status] || 'bg-neutral-200 text-neutral-800'
+    : '';
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/60 p-2 backdrop-blur-xs sm:p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) handleRequestClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="inspector-title"
+        tabIndex={-1}
+        className="relative flex h-[96vh] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-2xl outline-hidden animate-in fade-in zoom-in-98 duration-150 sm:h-[92vh]"
+      >
+        {/* ---------------------------- Top bar ---------------------------- */}
+        <div className="flex shrink-0 items-center justify-between gap-4 border-b border-neutral-200 bg-neutral-50/70 px-4 py-3 sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="rounded-md border border-neutral-200 bg-white p-1.5 text-neutral-700">
+              <FileText className="h-4 w-4" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-sm font-semibold text-neutral-900 truncate max-w-lg">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <h3 id="inspector-title" className="max-w-lg truncate text-sm font-semibold text-neutral-900">
                   {doc.filename}
                 </h3>
                 {doc.isReviewed ? (
-                  <span className="text-xs font-medium text-emerald-700 flex items-center gap-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" /> Reviewed
+                  <span className="flex items-center gap-1 text-xs font-medium text-emerald-700">
+                    <CheckCircle2 className="h-3.5 w-3.5" /> Reviewed
                   </span>
                 ) : (
-                  <span className="text-xs font-medium text-amber-700 flex items-center gap-1">
-                    <AlertTriangle className="w-3.5 h-3.5" /> Pending Verification
+                  <span className="flex items-center gap-1 text-xs font-medium text-amber-700">
+                    <AlertTriangle className="h-3.5 w-3.5" /> Pending verification
+                  </span>
+                )}
+                {attentionCount > 0 ? (
+                  <button
+                    type="button"
+                    onClick={goToNextIssue}
+                    className="flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900 transition-colors hover:bg-amber-100"
+                    title="Jump to the next field that needs attention (N)"
+                  >
+                    <AlertCircle className="h-3 w-3" />
+                    {attentionCount} of {profile.fields.length} need attention
+                  </button>
+                ) : (
+                  <span className="flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                    <Check className="h-3 w-3" />
+                    All fields look good{editedCount > 0 ? ` · ${editedCount} edited` : ''}
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <p className="text-xs text-neutral-500 font-mono">
-                  {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount} page(s) · Method: {doc.extractionMethodUsed}
+              <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                <p className="truncate font-mono text-xs text-neutral-500" title={doc.relativePath}>
+                  {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount} page(s) · Method:{' '}
+                  {doc.extractionMethodUsed}
                 </p>
                 <span
-                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-white text-[10px] font-semibold text-neutral-700"
+                  className="inline-flex items-center gap-1 rounded border border-neutral-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-neutral-700"
                   title={doc.assignmentRule || doc.assignmentReason || 'Extraction Profile used for this document'}
                 >
-                  <LayoutTemplate className="w-3 h-3" />
-                  {doc.profileName ||
-                    (doc.profileId ? profile.name : 'No profile assigned')}
+                  <LayoutTemplate className="h-3 w-3" />
+                  {doc.profileName || (doc.profileId ? profile.name : 'No profile assigned')}
                 </span>
                 <span
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-semibold ${ASSIGNMENT_BADGE_STYLES[doc.assignmentStatus]}`}
+                  className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${ASSIGNMENT_BADGE_STYLES[doc.assignmentStatus]}`}
                   title={doc.assignmentReason || undefined}
                 >
-                  {doc.assignmentStatus === 'excluded' && <Ban className="w-3 h-3" />}
+                  {doc.assignmentStatus === 'excluded' && <Ban className="h-3 w-3" />}
                   {ASSIGNMENT_BADGE_LABEL[doc.assignmentStatus]}
                 </span>
               </div>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <button
+              type="button"
               onClick={() => onToggleReviewed(doc.id)}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 ${doc.isReviewed
-                ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
-                : 'bg-emerald-600 text-white hover:bg-emerald-700'
+              className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 ${doc.isReviewed
+                  ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
                 }`}
+              title="Toggle reviewed (R)"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>{doc.isReviewed ? 'Mark as Unreviewed' : 'Mark as Reviewed'}</span>
+              <Check className="h-3.5 w-3.5" />
+              <span>{doc.isReviewed ? 'Mark as unreviewed' : 'Mark as reviewed'}</span>
+              <Kbd dark={!doc.isReviewed}>R</Kbd>
             </button>
             <button
-              onClick={onClose}
-              className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 rounded-md transition-colors"
+              type="button"
+              onClick={() => setShowShortcuts((s) => !s)}
+              aria-pressed={showShortcuts}
+              aria-label="Keyboard shortcuts"
+              className="rounded-md p-1.5 text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900"
+              title="Keyboard shortcuts (?)"
             >
-              <X className="w-4 h-4" />
+              <Keyboard className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={handleRequestClose}
+              aria-label="Close inspector"
+              className="rounded-md p-1.5 text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900"
+              title="Close (Esc)"
+            >
+              <X className="h-4 w-4" />
             </button>
           </div>
         </div>
 
-        {/* Modal Body: Two Column Split (Left: PDF Viewer, Right: Field Diagnostics & Trace) */}
-        <div className="flex-1 flex flex-col md:flex-row overflow-hidden min-h-0">
+        {/* Shortcut cheat-sheet */}
+        {showShortcuts && (
+          <div
+            role="region"
+            aria-label="Keyboard shortcuts"
+            className="absolute right-6 top-16 z-30 w-80 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold text-neutral-800">Keyboard shortcuts</span>
+              <button
+                type="button"
+                onClick={() => setShowShortcuts(false)}
+                aria-label="Close shortcuts"
+                className="rounded p-0.5 text-neutral-400 hover:text-neutral-900"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <ul className="space-y-1.5">
+              {SHORTCUTS.map((s) => (
+                <li key={s.label} className="flex items-center justify-between gap-3 text-xs text-neutral-600">
+                  <span>{s.label}</span>
+                  <span className="flex shrink-0 gap-1">
+                    {s.keys.map((k) => (
+                      <Kbd key={k}>{k}</Kbd>
+                    ))}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
-          {/* Left Column: Interactive PDF Preview */}
-          <div className="flex-1 flex flex-col bg-neutral-100 border-r border-neutral-200 overflow-hidden">
-            {/* PDF Toolbar */}
-            <div className="flex items-center justify-between px-4 py-2 bg-white border-b border-neutral-200 text-xs text-neutral-600 shrink-0 gap-3">
-              <div className="flex items-center gap-1.5 p-0.5 bg-neutral-100 rounded-md">
+        {/* ---------------------------- Body ------------------------------- */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row">
+          {/* ---------------- Left column: PDF preview ---------------- */}
+          <div className="flex min-h-[40vh] flex-1 flex-col overflow-hidden border-b border-neutral-200 bg-neutral-100 md:min-h-0 md:border-b-0 md:border-r">
+            {/* Toolbar */}
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-600">
+              <div className="flex items-center gap-1 rounded-md bg-neutral-100 p-0.5">
                 <button
                   type="button"
                   onClick={() => setViewMode('canvas')}
-                  className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors flex items-center gap-1.5 ${viewMode === 'canvas'
-                    ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-                    : 'text-neutral-600 hover:text-neutral-900'
+                  aria-pressed={viewMode === 'canvas'}
+                  className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${viewMode === 'canvas'
+                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                      : 'text-neutral-600 hover:text-neutral-900'
                     }`}
-                  title="PDF Canvas rendering with active field highlighting"
+                  title="PDF canvas rendering with active field highlighting"
                 >
-                  <Eye className="w-3.5 h-3.5" />
-                  <span>Canvas Preview</span>
+                  <Eye className="h-3.5 w-3.5" />
+                  <span>Canvas preview</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setViewMode('form')}
-                  className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors flex items-center gap-1.5 ${viewMode === 'form'
-                    ? 'bg-white text-neutral-900 shadow-xs font-semibold'
-                    : 'text-neutral-600 hover:text-neutral-900'
+                  aria-pressed={viewMode === 'form'}
+                  className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${viewMode === 'form'
+                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                      : 'text-neutral-600 hover:text-neutral-900'
                     }`}
-                  title="Structured Form layout with extracted fields"
+                  title="Structured form layout with extracted fields"
                 >
-                  <LayoutTemplate className="w-3.5 h-3.5" />
-                  <span>Form Document View</span>
+                  <LayoutTemplate className="h-3.5 w-3.5" />
+                  <span>Form view</span>
                 </button>
                 {blobUrl && (
                   <a
                     href={blobUrl}
                     download={doc.filename}
-                    className="px-2.5 py-1 text-[11px] font-medium rounded transition-colors flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900 hover:bg-white"
+                    className="flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-medium text-neutral-600 transition-colors hover:bg-white hover:text-neutral-900"
                     title="Download original PDF file"
                   >
-                    <Download className="w-3.5 h-3.5" />
+                    <Download className="h-3.5 w-3.5" />
                     <span>Download PDF</span>
                   </a>
                 )}
@@ -282,174 +862,179 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
               {viewMode === 'canvas' && (
                 <div className="flex items-center gap-1">
                   <button
+                    type="button"
                     disabled={currentPage <= 1}
                     onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                    className="p-1 rounded hover:bg-neutral-100 disabled:opacity-30 disabled:cursor-not-allowed"
-                    title="Previous Page"
+                    className="rounded p-1 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
+                    title="Previous page ( [ )"
+                    aria-label="Previous page"
                   >
-                    <ChevronLeft className="w-4 h-4" />
+                    <ChevronLeft className="h-4 w-4" />
                   </button>
-                  <span className="font-mono tabular-nums px-2">
+                  <span className="px-1.5 font-mono tabular-nums">
                     Page {currentPage} of {totalPages}
                   </span>
                   <button
+                    type="button"
                     disabled={currentPage >= totalPages}
                     onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                    className="p-1 rounded hover:bg-neutral-100 disabled:opacity-30 disabled:cursor-not-allowed"
-                    title="Next Page"
+                    className="rounded p-1 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
+                    title="Next page ( ] )"
+                    aria-label="Next page"
                   >
-                    <ChevronRight className="w-4 h-4" />
+                    <ChevronRight className="h-4 w-4" />
                   </button>
-                </div>
-              )}
 
-              {viewMode === 'canvas' && (
-                <div className="flex items-center gap-1">
+                  <span className="mx-1.5 h-4 w-px bg-neutral-200" aria-hidden />
+
                   <button
+                    type="button"
                     onClick={() => setZoomScale((z) => Math.max(0.6, z - 0.2))}
-                    className="p-1 rounded hover:bg-neutral-100"
-                    title="Zoom Out"
+                    className="rounded p-1 hover:bg-neutral-100"
+                    title="Zoom out ( − )"
+                    aria-label="Zoom out"
                   >
-                    <ZoomOut className="w-4 h-4" />
+                    <ZoomOut className="h-4 w-4" />
                   </button>
-                  <span className="font-mono tabular-nums px-1 text-neutral-500">
+                  <span className="w-10 text-center font-mono tabular-nums text-neutral-500">
                     {Math.round(zoomScale * 100)}%
                   </span>
                   <button
+                    type="button"
                     onClick={() => setZoomScale((z) => Math.min(2.5, z + 0.2))}
-                    className="p-1 rounded hover:bg-neutral-100"
-                    title="Zoom In"
+                    className="rounded p-1 hover:bg-neutral-100"
+                    title="Zoom in ( + )"
+                    aria-label="Zoom in"
                   >
-                    <ZoomIn className="w-4 h-4" />
+                    <ZoomIn className="h-4 w-4" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => setZoomScale(1.2)}
-                    className="p-1 rounded hover:bg-neutral-100 text-neutral-500 ml-1"
-                    title="Reset Zoom"
+                    className="ml-0.5 rounded p-1 text-neutral-500 hover:bg-neutral-100"
+                    title="Reset zoom ( 0 )"
+                    aria-label="Reset zoom"
                   >
-                    <RotateCcw className="w-3.5 h-3.5" />
+                    <RotateCcw className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )}
             </div>
 
-            {/* Viewport Container */}
-            <div className="flex-1 overflow-auto p-4 flex items-center justify-center relative bg-neutral-200/50">
+            {/* Viewport */}
+            <div className="relative flex flex-1 items-start justify-center overflow-auto bg-neutral-200/50 p-4">
               {viewMode === 'canvas' ? (
                 <>
                   {isRendering && (
-                    <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex flex-col items-center justify-center z-10 gap-2">
-                      <div className="w-6 h-6 border-2 border-neutral-900 border-t-transparent rounded-full animate-spin" />
-                      <span className="text-xs font-medium text-neutral-700">
-                        Rendering PDF page from digital stream...
-                      </span>
+                    <div
+                      role="status"
+                      className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-neutral-200 bg-white/95 px-3 py-1.5 shadow-md"
+                    >
+                      <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-900 border-t-transparent motion-reduce:animate-none" />
+                      <span className="text-xs font-medium text-neutral-700">Rendering page {currentPage}…</span>
                     </div>
                   )}
 
                   {renderError ? (
-                    <div className="p-8 text-center max-w-md bg-white rounded-xl shadow-md border border-neutral-200 space-y-4">
-                      <AlertCircle className="w-8 h-8 text-rose-500 mx-auto" />
+                    <div className="my-auto max-w-md space-y-4 rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-md">
+                      <AlertCircle className="mx-auto h-8 w-8 text-rose-500" />
                       <div className="space-y-1">
-                        <p className="text-sm font-semibold text-neutral-900">
-                          Canvas Rendering Notice
-                        </p>
-                        <p className="text-xs text-neutral-600 leading-relaxed">
-                          {renderError}
-                        </p>
+                        <p className="text-sm font-semibold text-neutral-900">Can’t show the PDF preview</p>
+                        <p className="text-xs leading-relaxed text-neutral-600">{renderError}</p>
                       </div>
                       <div className="flex items-center justify-center gap-2 pt-2">
                         <button
                           type="button"
                           onClick={() => setViewMode('form')}
-                          className="px-3.5 py-1.5 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-md transition-colors"
+                          className="rounded-md bg-neutral-900 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-neutral-800"
                         >
-                          Switch to Form Document View
+                          Switch to form view
                         </button>
                         {blobUrl && (
                           <a
                             href={blobUrl}
                             download={doc.filename}
-                            className="px-3.5 py-1.5 text-xs font-semibold text-neutral-800 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors border border-neutral-200 flex items-center gap-1.5"
+                            className="flex items-center gap-1.5 rounded-md border border-neutral-200 bg-neutral-100 px-3.5 py-1.5 text-xs font-semibold text-neutral-800 transition-colors hover:bg-neutral-200"
                           >
-                            <Download className="w-3.5 h-3.5" />
+                            <Download className="h-3.5 w-3.5" />
                             <span>Download PDF</span>
                           </a>
                         )}
                       </div>
                     </div>
                   ) : (
-                    <div className="shadow-lg border border-neutral-300 bg-white transition-transform rounded-xs overflow-hidden my-auto">
+                    <div className="mx-auto overflow-hidden rounded-xs border border-neutral-300 bg-white shadow-lg">
                       <canvas ref={canvasRef} className="block" />
                     </div>
                   )}
                 </>
               ) : (
                 /* Form Document View: Authentic digital form rendering */
-                <div className="w-full max-w-2xl bg-white rounded-lg shadow-lg border border-neutral-300 p-8 space-y-6 my-auto text-neutral-900 font-sans">
-                  {/* Official Header */}
-                  <div className="border-b-2 border-neutral-900 pb-4 text-center space-y-1">
-                    <span className="text-[10px] uppercase font-bold tracking-widest text-neutral-500 block">
+                <div className="my-auto w-full max-w-2xl space-y-6 rounded-lg border border-neutral-300 bg-white p-6 font-sans text-neutral-900 shadow-lg sm:p-8">
+                  <div className="space-y-1 border-b-2 border-neutral-900 pb-4 text-center">
+                    <span className="block text-[10px] font-bold uppercase tracking-widest text-neutral-500">
                       OFFICIAL CIVIL REGISTRY &amp; PUBLIC APPLICATION RECORD
                     </span>
                     <h2 className="text-lg font-black tracking-tight text-neutral-900">
                       {doc.filename.replace(/\.pdf$/i, '').replace(/[-_]/g, ' ')}
                     </h2>
-                    <p className="text-[11px] text-neutral-500 font-mono">
+                    <p className="font-mono text-[11px] text-neutral-500">
                       Relative Archive Path: {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB
                     </p>
                   </div>
 
-                  {/* Structured Form Fields */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                    {profile.fields.map((field) => {
+                  <div className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
+                    {profile.fields.map((field, idx) => {
                       const diag = doc.diagnostics[field.id];
                       const val = doc.finalValues[field.id] || diag?.finalValue || '';
                       const isSelected = activeFieldId === field.id;
-                      const isConflict = diag?.isConflict;
+                      const health = fieldHealth[idx];
 
                       return (
-                        <div
+                        <button
+                          type="button"
                           key={field.id}
                           onClick={() => setActiveFieldId(field.id)}
-                          className={`p-3 rounded-lg border transition-all cursor-pointer ${isSelected
-                            ? 'border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900'
-                            : isConflict
-                              ? 'border-amber-300 bg-amber-50/50 hover:bg-amber-50'
-                              : 'border-neutral-200 hover:bg-neutral-50/60'
+                          aria-pressed={isSelected}
+                          className={`rounded-lg border p-3 text-left transition-all ${isSelected
+                              ? 'border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900'
+                              : health === 'conflict' || health === 'invalid'
+                                ? 'border-amber-300 bg-amber-50/50 hover:bg-amber-50'
+                                : 'border-neutral-200 hover:bg-neutral-50/60'
                             }`}
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-[11px] font-semibold text-neutral-500 uppercase tracking-wider">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
+                              <span
+                                className={`h-1.5 w-1.5 rounded-full ${HEALTH_META[health].dot}`}
+                                title={HEALTH_META[health].label}
+                              />
                               {field.label || field.name}
                             </span>
                             {isSelected && (
-                              <span className="text-[10px] font-bold text-neutral-900 uppercase">
-                                Selected
-                              </span>
+                              <span className="text-[10px] font-bold uppercase text-neutral-900">Selected</span>
                             )}
                           </div>
-                          <div className="text-sm font-bold font-mono text-neutral-900 mt-1">
-                            {val || <span className="text-neutral-400 font-normal italic">Not Specified</span>}
+                          <div className="mt-1 break-words font-mono text-sm font-bold text-neutral-900">
+                            {val || <span className="font-normal italic text-neutral-400">Not specified</span>}
                           </div>
-                        </div>
+                        </button>
                       );
                     })}
                   </div>
 
-                  {/* Supporting Extracted Text Stream */}
                   {doc.rawExtractedPdfText && (
-                    <div className="space-y-1.5 pt-4 border-t border-neutral-200">
-                      <span className="text-[11px] font-semibold text-neutral-500 uppercase tracking-wider block">
+                    <div className="space-y-1.5 border-t border-neutral-200 pt-4">
+                      <span className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
                         Raw PDF Digital Content Stream ({doc.pdfTextLength} characters)
                       </span>
-                      <pre className="p-3 bg-neutral-900 text-neutral-200 rounded-md text-[11px] font-mono leading-relaxed max-h-36 overflow-y-auto whitespace-pre-wrap">
+                      <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-md bg-neutral-900 p-3 font-mono text-[11px] leading-relaxed text-neutral-200">
                         {doc.rawExtractedPdfText}
                       </pre>
                     </div>
                   )}
 
-                  {/* Official Footer & Verification Stamp */}
-                  <div className="pt-4 border-t border-neutral-200 flex items-center justify-between text-[10px] text-neutral-400 font-mono">
+                  <div className="flex items-center justify-between border-t border-neutral-200 pt-4 font-mono text-[10px] text-neutral-400">
                     <span>Extraction Method: {doc.extractionMethodUsed}</span>
                     <span>System Generated Form · Verification Code: 2026-REG-AUTO</span>
                   </div>
@@ -458,43 +1043,61 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
             </div>
           </div>
 
-          {/* Right Column: Field Diagnostics, Reconciliation & Audit Trace */}
-          <div className="w-full md:w-[480px] lg:w-[520px] flex flex-col bg-white overflow-hidden shrink-0">
-
-            {/* Field Tabs Selector */}
-            <div className="p-3 border-b border-neutral-200 bg-neutral-50/50 shrink-0">
-              <label className="text-xs font-semibold text-neutral-500 uppercase tracking-wider block mb-2">
-                Select Field to Inspect
-              </label>
-              <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-thin">
-                {profile.fields.map((field) => {
-                  const diag = doc.diagnostics[field.id];
-                  const hasConflict = diag?.isConflict;
-                  const isMissing = diag?.status === 'NOT_FOUND';
-                  const isInvalid = diag?.status === 'INVALID';
-                  const isCorrected = diag?.isManuallyCorrected;
-
+          {/* ------------- Right column: diagnostics & review ------------- */}
+          <div className="flex min-h-0 w-full shrink-0 flex-col overflow-hidden bg-white md:w-[480px] lg:w-[520px]">
+            {/* Field selector */}
+            <div className="shrink-0 border-b border-neutral-200 bg-neutral-50/50 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-semibold text-neutral-600">
+                  Fields{' '}
+                  <span className="font-normal text-neutral-400">
+                    · {fieldIndex + 1} of {profile.fields.length}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!goToNextIssue()) showFlash('No other fields need attention');
+                  }}
+                  disabled={attentionCount === 0}
+                  className="flex items-center gap-1.5 rounded-md border border-neutral-200 bg-white px-2 py-1 text-[11px] font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Jump to the next field that needs attention (N)"
+                >
+                  <SkipForward className="h-3 w-3" />
+                  Next issue
+                  <Kbd>N</Kbd>
+                </button>
+              </div>
+              <div
+                role="tablist"
+                aria-label="Fields"
+                className="scrollbar-thin flex gap-1.5 overflow-x-auto pb-1"
+              >
+                {profile.fields.map((field, idx) => {
+                  const health = fieldHealth[idx];
+                  const isActive = activeFieldId === field.id;
                   return (
                     <button
+                      type="button"
+                      role="tab"
+                      aria-selected={isActive}
                       key={field.id}
+                      ref={isActive ? activeChipRef : undefined}
                       onClick={() => setActiveFieldId(field.id)}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap transition-colors flex items-center gap-1.5 ${activeFieldId === field.id
-                        ? 'bg-neutral-900 text-white shadow-xs'
-                        : 'bg-white border border-neutral-200 text-neutral-700 hover:bg-neutral-100'
+                      className={`flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${isActive
+                          ? 'bg-neutral-900 text-white shadow-xs'
+                          : 'border border-neutral-200 bg-white text-neutral-700 hover:bg-neutral-100'
                         }`}
                     >
+                      <span
+                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${HEALTH_META[health].dot}`}
+                        title={HEALTH_META[health].label}
+                      />
                       <span>{field.name}</span>
-                      {hasConflict && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" title="Conflict" />
-                      )}
-                      {isInvalid && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-rose-500" title="Invalid format" />
-                      )}
-                      {isMissing && field.required && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-neutral-400" title="Missing required" />
-                      )}
-                      {isCorrected && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500" title="Manually edited" />
+                      {field.required && (
+                        <span className={isActive ? 'text-white/60' : 'text-rose-500'} title="Required">
+                          *
+                        </span>
                       )}
                     </button>
                   );
@@ -502,16 +1105,16 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
               </div>
             </div>
 
-            {/* Diagnostic Details Scrollable Panel */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+            {/* Scrollable detail panel */}
+            <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
               {doc.processingStatus === 'excluded' && (
                 <div
                   role="status"
                   className="rounded-lg border border-neutral-300 bg-neutral-100 px-4 py-3 text-xs text-neutral-700"
                 >
                   <span className="font-semibold">Excluded from processing: </span>
-                  This document was intentionally skipped, so no fields were extracted for{' '}
-                  {profile.name}. {doc.assignmentReason}
+                  This document was intentionally skipped, so no fields were extracted for {profile.name}.{' '}
+                  {doc.assignmentReason}
                 </div>
               )}
               {doc.errorDetails && (
@@ -523,17 +1126,21 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   {doc.errorDetails}
                 </div>
               )}
+
               {activeField && activeDiagnostic ? (
                 <>
-                  {/* Current Reconciled Value Card */}
-                  <div className="p-4 rounded-lg border border-neutral-200 bg-neutral-50/40 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                        Reconciled Final Value
-                      </span>
+                  {/* Final value card */}
+                  <section
+                    aria-label={`Final value for ${activeField.name}`}
+                    className="space-y-3 rounded-lg border border-neutral-200 bg-neutral-50/40 p-4"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-xs font-semibold text-neutral-700">
+                        {activeField.label || activeField.name}
+                      </h4>
                       {activeDiagnostic.isManuallyCorrected && (
-                        <span className="text-xs text-blue-700 font-medium">
-                          Manually Corrected
+                        <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700">
+                          Manually corrected
                         </span>
                       )}
                     </div>
@@ -541,312 +1148,154 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                     {isEditing ? (
                       <div className="space-y-2">
                         <input
+                          ref={editInputRef}
                           type="text"
                           value={editingValue}
                           onChange={(e) => setEditingValue(e.target.value)}
-                          className="w-full px-3 py-2 text-sm bg-white border border-neutral-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
-                          placeholder="Enter corrected value..."
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && isDirty) {
+                              e.preventDefault();
+                              handleSaveCorrection();
+                            }
+                          }}
+                          aria-label={`Corrected value for ${activeField.name}`}
+                          className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 font-mono text-sm focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
+                          placeholder="Enter corrected value…"
                         />
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            onClick={() => {
-                              setIsEditing(false);
-                              setEditingValue(currentValue);
-                            }}
-                            className="px-2.5 py-1 text-xs text-neutral-600 hover:text-neutral-900"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            onClick={handleSaveCorrection}
-                            className="px-3 py-1 text-xs font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-md flex items-center gap-1"
-                          >
-                            <Save className="w-3 h-3" />
-                            <span>Save Value</span>
-                          </button>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-neutral-500">
+                            <Kbd>Enter</Kbd> to save · <Kbd>Esc</Kbd> to cancel
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={cancelEditing}
+                              className="rounded px-2.5 py-1 text-xs text-neutral-600 hover:bg-neutral-200/60 hover:text-neutral-900"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleSaveCorrection}
+                              disabled={!isDirty}
+                              className="flex items-center gap-1 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              <Save className="h-3 w-3" />
+                              <span>Save value</span>
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ) : (
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-base font-semibold text-neutral-900 font-mono">
-                          {currentValue || <span className="text-neutral-400 italic">No value</span>}
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="break-words font-mono text-lg font-semibold leading-snug text-neutral-900">
+                          {currentValue || <span className="text-sm font-normal italic text-neutral-400">No value yet</span>}
                         </span>
-                        <button
-                          onClick={() => setIsEditing(true)}
-                          className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200/60 rounded-md transition-colors"
-                          title="Edit value"
-                        >
-                          <Pencil className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex shrink-0 items-center gap-0.5">
+                          <button
+                            type="button"
+                            onClick={handleCopy}
+                            disabled={!currentValue}
+                            className="rounded-md p-1.5 text-neutral-500 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900 disabled:opacity-30"
+                            title="Copy value"
+                            aria-label="Copy value"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={startEditing}
+                            className="flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900"
+                            title="Edit value (E)"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                            Edit
+                            <Kbd>E</Kbd>
+                          </button>
+                        </div>
                       </div>
                     )}
 
-                    {/* Diagnostic Status Badge & Explanation */}
-                    <div className="pt-2 border-t border-neutral-200/80 space-y-1">
-                      <div className="flex items-center gap-2 text-xs">
-                        <span className="font-semibold text-neutral-700">Diagnostic Status:</span>
-                        <span className={`font-mono px-1.5 py-0.5 rounded text-[11px] font-semibold ${activeDiagnostic.status === 'MATCHED'
-                          ? 'bg-emerald-100 text-emerald-800'
-                          : activeDiagnostic.status === 'MISMATCH'
-                            ? 'bg-amber-100 text-amber-900'
-                            : activeDiagnostic.status === 'INVALID'
-                              ? 'bg-rose-100 text-rose-900'
-                              : activeDiagnostic.status === 'OCR_EXTRACTED'
-                                ? 'bg-purple-100 text-purple-900'
-                                : activeDiagnostic.status === 'AI_EXTRACTED'
-                                  ? 'bg-sky-100 text-sky-900'
-                                  : activeDiagnostic.status === 'FILENAME_ONLY'
-                                    ? 'bg-amber-50 text-amber-800 border border-amber-200'
-                                    : 'bg-neutral-200 text-neutral-800'
-                          }`}>
+                    {/* Status & explanation */}
+                    <div className="space-y-1.5 border-t border-neutral-200/80 pt-3">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold ${statusBadgeClass}`}>
                           {activeDiagnostic.status}
                         </span>
                         {activeDiagnostic.confidenceScore !== undefined && (
-                          <span className="text-neutral-500 font-mono text-[11px]">
+                          <span className="font-mono text-[11px] text-neutral-500">
                             {Math.round(activeDiagnostic.confidenceScore * 100)}% evidence score
                           </span>
                         )}
+                        <span
+                          className={`ml-auto flex items-center gap-1 text-[11px] font-semibold ${activeDiagnostic.validationPassed ? 'text-emerald-700' : 'text-rose-700'
+                            }`}
+                        >
+                          {activeDiagnostic.validationPassed ? (
+                            <>
+                              <CheckCircle2 className="h-3 w-3" /> Validation passed
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="h-3 w-3" /> {activeDiagnostic.validationError || 'Validation failed'}
+                            </>
+                          )}
+                        </span>
                       </div>
-                      <p className="text-xs text-neutral-600 leading-relaxed">
-                        {activeDiagnostic.explanation}
-                      </p>
+                      <p className="text-xs leading-relaxed text-neutral-600">{activeDiagnostic.explanation}</p>
                       {activeDiagnostic.selectionReason && (
-                        <p className="text-[11px] text-neutral-500 leading-relaxed">
-                          Selection: {activeDiagnostic.selectionReason}
+                        <p className="text-[11px] leading-relaxed text-neutral-500">
+                          Why this value: {activeDiagnostic.selectionReason}
                         </p>
                       )}
                     </div>
-                  </div>
+                  </section>
 
-                  {/* Multi-Source Comparison Table */}
-                  <div className="space-y-2">
-                    <h4 className="text-xs font-semibold text-neutral-700 uppercase tracking-wider">
-                      Extraction Sources Comparison
-                    </h4>
-
-                    <div className="border border-neutral-200 rounded-lg overflow-hidden text-xs">
-                      {/* Filename Extraction Row */}
-                      <div className="p-3 bg-white border-b border-neutral-200 flex items-start justify-between gap-4">
-                        <div className="space-y-1 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-semibold text-neutral-800">Filename Regex Extraction</span>
-                            {activeDiagnostic.source === 'filename' && (
-                              <span className="text-[10px] text-emerald-700 font-medium">Selected Source</span>
-                            )}
-                          </div>
-                          <div className="text-xs font-mono text-neutral-700">
-                            {activeDiagnostic.filenameValue || <span className="text-neutral-400 italic">No match</span>}
-                          </div>
-                          {activeField.filenameRules.patterns[0] && (
-                            <p className="text-[11px] text-neutral-500 font-mono truncate">
-                              Rule: {activeField.filenameRules.patterns[0]}
-                            </p>
-                          )}
-                        </div>
-                        {activeDiagnostic.filenameValue && activeDiagnostic.filenameValue !== currentValue && (
-                          <button
-                            onClick={() => handleQuickAccept(activeDiagnostic.filenameValue!)}
-                            className="text-[11px] text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-2 py-1 rounded bg-neutral-50 hover:bg-neutral-100 whitespace-nowrap"
-                          >
-                            Use This Value
-                          </button>
-                        )}
-                      </div>
-
-                      {/* AcroForm Filled Field Value Row (authoritative) */}
-                      {activeDiagnostic.formValue && (
-                        <div className="p-3 bg-emerald-50/60 border-b border-neutral-200 flex items-start justify-between gap-4">
-                          <div className="space-y-1 flex-1">
-                            <div className="flex items-center gap-2">
-                              <span className="font-semibold text-emerald-900 flex items-center gap-1">
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Form Field Value
-                              </span>
-                              {activeDiagnostic.source === 'form_field' && (
-                                <span className="text-[10px] text-emerald-700 font-medium">Selected Source</span>
-                              )}
-                            </div>
-                            <div className="text-xs font-mono text-emerald-950">
-                              {activeDiagnostic.formValue}
-                            </div>
-                            {activeDiagnostic.formConfidenceScore !== undefined && (
-                              <p className="text-[11px] text-emerald-800">
-                                Evidence score: {Math.round((activeDiagnostic.formConfidenceScore ?? 0) * 100)}%
-                                {activeDiagnostic.formMethod ? ` · ${activeDiagnostic.formMethod.replace('acroform_', 'AcroForm ')}` : ''}
-                                {activeDiagnostic.formPageNumber ? ` · Page ${activeDiagnostic.formPageNumber}` : ''}
-                              </p>
-                            )}
-                            {activeDiagnostic.formEvidence && (
-                              <p className="text-[11px] text-emerald-800 whitespace-pre-wrap">
-                                Evidence: {activeDiagnostic.formEvidence}
-                              </p>
-                            )}
-                          </div>
-                          {activeDiagnostic.formValue !== currentValue && (
-                            <button
-                              onClick={() => handleQuickAccept(activeDiagnostic.formValue!)}
-                              className="text-[11px] text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-2 py-1 rounded bg-white hover:bg-neutral-100 whitespace-nowrap"
-                            >
-                              Use This Value
-                            </button>
-                          )}
-                        </div>
-                      )}
-
-                      {/* PDF Content Extraction Row */}
-                      <div className="p-3 bg-white border-b border-neutral-200 flex items-start justify-between gap-4">
-                        <div className="space-y-1 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-semibold text-neutral-800">PDF Content Extraction</span>
-                            {activeDiagnostic.source === 'pdf_text' && (
-                              <span className="text-[10px] text-emerald-700 font-medium">Selected Source</span>
-                            )}
-                          </div>
-                          <div className="text-xs font-mono text-neutral-700">
-                            {activeDiagnostic.pdfValue || <span className="text-neutral-400 italic">No match</span>}
-                          </div>
-                          {activeDiagnostic.candidateScores?.pdf_text !== undefined && (
-                            <p className="text-[11px] text-neutral-500">
-                              Evidence score: {Math.round(activeDiagnostic.candidateScores.pdf_text * 100)}%
-                              {activeDiagnostic.pdfPageNumber ? ` · Page ${activeDiagnostic.pdfPageNumber}` : ''}
-                            </p>
-                          )}
-                          {activeDiagnostic.pdfEvidence && (
-                            <p className="text-[11px] text-neutral-500 whitespace-pre-wrap">
-                              Evidence: {activeDiagnostic.pdfEvidence}
-                            </p>
-                          )}
-                          {activeDiagnostic.matchedPatternOrLabel && (
-                            <p className="text-[11px] text-neutral-500 font-mono truncate">
-                              Label/Pattern: {activeDiagnostic.matchedPatternOrLabel}
-                            </p>
-                          )}
-                        </div>
-                        {activeDiagnostic.pdfValue && activeDiagnostic.pdfValue !== currentValue && (
-                          <button
-                            onClick={() => handleQuickAccept(activeDiagnostic.pdfValue!)}
-                            className="text-[11px] text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-2 py-1 rounded bg-neutral-50 hover:bg-neutral-100 whitespace-nowrap"
-                          >
-                            Use This Value
-                          </button>
-                        )}
-                      </div>
-
-                      {/* OCR Extraction Row (if available) */}
-                      {activeDiagnostic.ocrValue && (
-                        <div className="p-3 bg-purple-50/50 flex items-start justify-between gap-4">
-                          <div className="space-y-1 flex-1">
-                            <div className="flex items-center gap-2">
-                              <span className="font-semibold text-purple-900 flex items-center gap-1">
-                                <Sparkles className="w-3 h-3 text-purple-600" /> OCR Candidate
-                              </span>
-                            </div>
-                            <div className="text-xs font-mono text-purple-950">
-                              {activeDiagnostic.ocrValue}
-                            </div>
-                            {activeDiagnostic.candidateScores?.ocr !== undefined && (
-                              <p className="text-[11px] text-purple-800">
-                                Evidence score: {Math.round(activeDiagnostic.candidateScores.ocr * 100)}%
-                                {activeDiagnostic.ocrPageNumber ? ` · Page ${activeDiagnostic.ocrPageNumber}` : ''}
-                              </p>
-                            )}
-                            {activeDiagnostic.ocrEvidence && (
-                              <p className="text-[11px] text-purple-800 whitespace-pre-wrap">
-                                Evidence: {activeDiagnostic.ocrEvidence}
-                              </p>
-                            )}
-                          </div>
-                          {activeDiagnostic.ocrValue !== currentValue && (
-                            <button
-                              onClick={() => handleQuickAccept(activeDiagnostic.ocrValue!)}
-                              className="text-[11px] text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-2 py-1 rounded bg-white hover:bg-neutral-100 whitespace-nowrap"
-                            >
-                              Use This Value
-                            </button>
-                          )}
-                        </div>
-                      )}
-
-                      {activeDiagnostic.aiValue && (
-                        <div className="p-3 bg-sky-50 flex items-start justify-between gap-4">
-                          <div className="space-y-1 flex-1">
-                            <div className="flex items-center gap-2">
-                              <span className="font-semibold text-sky-900 flex items-center gap-1">
-                                <Sparkles className="w-3 h-3 text-sky-700" />
-                                AI Candidate (Ollama)
-                              </span>
-                              {activeDiagnostic.source === 'ai' && (
-                                <span className="text-[10px] text-sky-800 font-medium">
-                                  Selected Source · Verify
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-xs font-mono text-sky-950">
-                              {activeDiagnostic.aiValue}
-                            </div>
-                            {activeDiagnostic.aiEvidence && (
-                              <div className="text-[11px] text-sky-800">
-                                {activeDiagnostic.aiSourceKind
-                                  ? `Source: ${activeDiagnostic.aiSourceKind} · `
-                                  : ''}
-                                Evidence: {activeDiagnostic.aiEvidence}
-                                {activeDiagnostic.source === 'ai' &&
-                                  activeDiagnostic.pageNumber &&
-                                  ` (page ${activeDiagnostic.pageNumber})`}
-                              </div>
-                            )}
-                          </div>
-                          {activeDiagnostic.aiValue !== currentValue && (
-                            <button
-                              onClick={() =>
-                                handleQuickAccept(activeDiagnostic.aiValue!)
-                              }
-                              className="text-[11px] text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-2 py-1 rounded bg-white hover:bg-neutral-100 whitespace-nowrap"
-                            >
-                              Use This Value
-                            </button>
-                          )}
-                        </div>
-                      )}
+                  {/* Sources */}
+                  <section aria-label="Extraction sources" className="space-y-2">
+                    <div className="flex items-baseline justify-between">
+                      <h4 className="text-xs font-semibold text-neutral-700">Compare sources</h4>
+                      <span className="text-[11px] text-neutral-400">Pick the value that matches the PDF</span>
                     </div>
-                  </div>
+                    <div className="overflow-hidden rounded-lg border border-neutral-200 text-xs">
+                      {numberedRows.map(({ key, ...row }) => (
+                        <SourceRow
+                          key={key}
+                          {...row}
+                          isCurrent={Boolean(row.value) && row.value === currentValue}
+                          onUse={() => row.value && handleQuickAccept(row.value)}
+                        />
+                      ))}
+                    </div>
+                  </section>
 
-                  {/* Supporting Contextual Text Evidence */}
+                  {/* Context text */}
                   {activeDiagnostic.supportingEvidence && (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-semibold text-neutral-700 uppercase tracking-wider">
-                          Contextual Text Evidence (Page {activeDiagnostic.pageNumber || 1})
-                        </span>
-                      </div>
-                      <div className="p-3 bg-neutral-900 text-neutral-200 rounded-lg text-xs font-mono whitespace-pre-wrap leading-relaxed max-h-36 overflow-y-auto">
+                    <section className="space-y-1.5">
+                      <h4 className="text-xs font-semibold text-neutral-700">
+                        Text around the match (page {activeDiagnostic.pageNumber || 1})
+                      </h4>
+                      <div className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-lg bg-neutral-900 p-3 font-mono text-xs leading-relaxed text-neutral-200">
                         {activeDiagnostic.supportingEvidence}
                       </div>
-                      <p className="text-[11px] text-neutral-500">
-                        Extracted text surrounding the matched pattern in the original PDF content.
-                      </p>
-                    </div>
+                    </section>
                   )}
 
-                  {/* Field Configuration Rules Preview */}
-                  <div className="p-3.5 rounded-lg border border-neutral-200 bg-white space-y-2 text-xs">
-                    <span className="font-semibold text-neutral-700 block">
-                      Active Extraction Rules for {activeField.name}
-                    </span>
-                    <div className="grid grid-cols-2 gap-2 text-neutral-600">
+                  {/* Rules (secondary) */}
+                  <Collapsible title={`Extraction rules for ${activeField.name}`}>
+                    <div className="grid grid-cols-2 gap-3 text-xs text-neutral-600">
                       <div>
-                        <span className="text-neutral-400 block text-[11px]">Priority:</span>
-                        <span className="font-medium text-neutral-800">
-                          {activeField.priority.replace('_', ' ')}
-                        </span>
+                        <span className="block text-[11px] text-neutral-400">Priority</span>
+                        <span className="font-medium text-neutral-800">{activeField.priority.replace('_', ' ')}</span>
                       </div>
                       <div>
-                        <span className="text-neutral-400 block text-[11px]">Normalization:</span>
+                        <span className="block text-[11px] text-neutral-400">Normalization</span>
                         <span className="font-medium text-neutral-800">
                           {activeField.normalization.caseTransform} · Trim
                         </span>
                       </div>
-                      <div>
-                        <span className="text-neutral-400 block text-[11px]">Validation:</span>
+                      <div className="col-span-2">
+                        <span className="block text-[11px] text-neutral-400">Validation</span>
                         <span className="font-medium text-neutral-800">
                           {activeField.required ? 'Required' : 'Optional'}
                           {activeField.validation.allowedValues
@@ -854,87 +1303,106 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                             : ''}
                         </span>
                       </div>
-                      <div>
-                        <span className="text-neutral-400 block text-[11px]">Validation Result:</span>
-                        <span
-                          className={`font-semibold ${activeDiagnostic.validationPassed
-                            ? 'text-emerald-700'
-                            : 'text-rose-700'
-                            }`}
-                        >
-                          {activeDiagnostic.validationPassed ? 'Passed' : activeDiagnostic.validationError}
-                        </span>
-                      </div>
                     </div>
-                  </div>
+                  </Collapsible>
 
-                  {/* Audit Trail of User Corrections */}
+                  {/* Audit trail (secondary) */}
                   {doc.editHistory && doc.editHistory.length > 0 && (
-                    <div className="space-y-1.5 pt-2">
-                      <span className="text-xs font-semibold text-neutral-700 uppercase tracking-wider block">
-                        Audit Trail of Modifications
-                      </span>
+                    <Collapsible
+                      title="Edit history"
+                      badge={
+                        <span className="rounded-full bg-neutral-100 px-1.5 py-px text-[10px] font-medium text-neutral-600">
+                          {doc.editHistory.length}
+                        </span>
+                      }
+                    >
                       <div className="space-y-1.5">
                         {doc.editHistory.map((item, idx) => (
                           <div
                             key={idx}
-                            className="p-2.5 rounded bg-neutral-50 border border-neutral-200 text-xs flex items-center justify-between"
+                            className={`flex items-center justify-between rounded border p-2.5 text-xs ${item.fieldId === activeFieldId
+                                ? 'border-neutral-300 bg-neutral-100'
+                                : 'border-neutral-200 bg-neutral-50'
+                              }`}
                           >
-                            <div className="space-y-0.5">
+                            <div className="min-w-0 space-y-0.5">
                               <span className="font-medium text-neutral-800">
                                 {profile.fields.find((f) => f.id === item.fieldId)?.name || item.fieldId}
                               </span>
                               <div className="flex items-center gap-1.5 font-mono text-[11px] text-neutral-600">
-                                <span className="line-through text-neutral-400">{item.previousValue || '(empty)'}</span>
-                                <ArrowRight className="w-3 h-3 text-neutral-400" />
-                                <span className="font-semibold text-neutral-900">{item.newValue}</span>
+                                <span className="break-all text-neutral-400 line-through">
+                                  {item.previousValue || '(empty)'}
+                                </span>
+                                <ArrowRight className="h-3 w-3 shrink-0 text-neutral-400" />
+                                <span className="break-all font-semibold text-neutral-900">{item.newValue}</span>
                               </div>
                             </div>
-                            <span className="text-[10px] text-neutral-400 font-mono">
+                            <span className="ml-2 shrink-0 font-mono text-[10px] text-neutral-400">
                               {new Date(item.timestamp).toLocaleTimeString()}
                             </span>
                           </div>
                         ))}
                       </div>
-                    </div>
+                    </Collapsible>
                   )}
                 </>
               ) : (
-                <div className="text-center py-12 text-neutral-400 text-xs">
-                  Select a field above to inspect diagnostic details.
+                <div className="py-12 text-center text-xs text-neutral-400">
+                  Select a field above to inspect its details.
                 </div>
               )}
             </div>
 
-            {/* Modal Bottom Action Strip */}
-            <div className="p-3.5 border-t border-neutral-200 bg-neutral-50 flex items-center justify-between text-xs shrink-0">
-              <span className="text-neutral-500 font-mono">
-                Field {profile.fields.findIndex((f) => f.id === activeFieldId) + 1} of {profile.fields.length}
-              </span>
+            {/* Action strip */}
+            <div className="relative flex shrink-0 items-center justify-between gap-3 border-t border-neutral-200 bg-neutral-50 p-3 text-xs">
+              {flash && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="absolute -top-10 left-1/2 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-full bg-neutral-900 px-3 py-1.5 text-[11px] font-medium text-white shadow-lg"
+                >
+                  <Check className="h-3 w-3 text-emerald-400" />
+                  {flash}
+                </div>
+              )}
+
+              <label className="flex cursor-pointer select-none items-center gap-2 text-neutral-600">
+                <input
+                  type="checkbox"
+                  checked={autoAdvance}
+                  onChange={(e) => setAutoAdvance(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-neutral-300 accent-neutral-900"
+                />
+                <span title="After saving or picking a value, jump to the next field that needs attention">
+                  Auto-advance
+                </span>
+              </label>
+
               <div className="flex items-center gap-2">
                 <button
-                  disabled={profile.fields.findIndex((f) => f.id === activeFieldId) <= 0}
-                  onClick={() => {
-                    const idx = profile.fields.findIndex((f) => f.id === activeFieldId);
-                    if (idx > 0) setActiveFieldId(profile.fields[idx - 1].id);
-                  }}
-                  className="px-2.5 py-1 rounded border border-neutral-200 bg-white hover:bg-neutral-100 disabled:opacity-30"
+                  type="button"
+                  disabled={fieldIndex <= 0}
+                  onClick={() => goToField(fieldIndex - 1)}
+                  className="flex items-center gap-1.5 rounded border border-neutral-200 bg-white px-2.5 py-1 hover:bg-neutral-100 disabled:opacity-30"
+                  title="Previous field (K)"
                 >
-                  Previous Field
+                  <ChevronLeft className="h-3 w-3" />
+                  Previous
+                  <Kbd>K</Kbd>
                 </button>
                 <button
-                  disabled={profile.fields.findIndex((f) => f.id === activeFieldId) >= profile.fields.length - 1}
-                  onClick={() => {
-                    const idx = profile.fields.findIndex((f) => f.id === activeFieldId);
-                    if (idx < profile.fields.length - 1) setActiveFieldId(profile.fields[idx + 1].id);
-                  }}
-                  className="px-2.5 py-1 rounded border border-neutral-200 bg-white hover:bg-neutral-100 disabled:opacity-30"
+                  type="button"
+                  disabled={fieldIndex >= profile.fields.length - 1}
+                  onClick={() => goToField(fieldIndex + 1)}
+                  className="flex items-center gap-1.5 rounded border border-neutral-200 bg-white px-2.5 py-1 hover:bg-neutral-100 disabled:opacity-30"
+                  title="Next field (J)"
                 >
-                  Next Field
+                  Next
+                  <ChevronRight className="h-3 w-3" />
+                  <Kbd>J</Kbd>
                 </button>
               </div>
             </div>
-
           </div>
         </div>
       </div>
