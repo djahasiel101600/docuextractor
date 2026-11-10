@@ -25,12 +25,59 @@ class DocumentResponseSerializer(serializers.Serializer):
     rawExtractedPdfText = serializers.CharField(allow_blank=True)
     pdfTextLength = serializers.IntegerField()
     diagnostics = serializers.DictField(child=serializers.JSONField())
-    finalValues = serializers.DictField(child=serializers.CharField(allow_blank=True))
+    finalValues = serializers.DictField(
+        child=serializers.CharField(allow_blank=True))
     isReviewed = serializers.BooleanField()
     reviewedAt = serializers.CharField(allow_null=True)
     reviewedBy = serializers.CharField(allow_null=True)
     editHistory = serializers.ListField(child=serializers.JSONField())
     fileUrl = serializers.CharField()
+    # Assignment fields
+    profileId = serializers.CharField(allow_null=True)
+    assignmentStatus = serializers.CharField()
+    assignmentMethod = serializers.CharField(allow_blank=True)
+    assignmentRule = serializers.CharField(allow_blank=True)
+    assignmentConfidence = serializers.FloatField()
+    assignmentReason = serializers.CharField(allow_blank=True)
+
+
+class DocumentAssignmentSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    filename = serializers.CharField()
+    profileId = serializers.CharField(allow_null=True)
+    profileName = serializers.CharField(allow_null=True)
+    assignmentStatus = serializers.CharField()
+    assignmentConfidence = serializers.FloatField()
+    assignmentReason = serializers.CharField()
+
+
+class DocumentAssignmentUpdateSerializer(serializers.Serializer):
+    """Body for the manual assignment-override branch of PATCH /documents/{id}/.
+
+    - `profileId`: a profile primary key, or null to exclude the document.
+    - `assignmentStatus`: optional status override applied after the profile
+      change (or independently).
+
+    At least one field is required; an empty body is rejected so callers
+    cannot accidentally no-op a PATCH.
+    """
+
+    profileId = serializers.CharField(
+        required=False,
+        allow_null=True,
+        allow_blank=False,
+    )
+    assignmentStatus = serializers.ChoiceField(
+        required=False,
+        choices=["assigned", "ambiguous", "excluded", "unassigned"],
+    )
+
+    def validate(self, attrs):
+        if "profileId" not in attrs and "assignmentStatus" not in attrs:
+            raise serializers.ValidationError(
+                "Provide at least one of 'profileId' or 'assignmentStatus'."
+            )
+        return attrs
 
 
 class ProcessingJobResponseSerializer(serializers.Serializer):
@@ -44,13 +91,15 @@ class ProcessingJobResponseSerializer(serializers.Serializer):
     totalDiscovered = serializers.IntegerField()
     processedCount = serializers.IntegerField()
     failedCount = serializers.IntegerField()
+    skippedCount = serializers.IntegerField()
     reviewRequiredCount = serializers.IntegerField()
     conflictCount = serializers.IntegerField()
     missingCount = serializers.IntegerField()
     invalidCount = serializers.IntegerField()
     status = serializers.CharField()
     currentProcessingFile = serializers.CharField(allow_blank=True)
-    currentProcessingFiles = serializers.ListField(child=serializers.CharField())
+    currentProcessingFiles = serializers.ListField(
+        child=serializers.CharField())
     documents = DocumentResponseSerializer(many=True)
 
 
@@ -60,8 +109,10 @@ class ProcessingJobProgressSerializer(serializers.Serializer):
     totalDiscovered = serializers.IntegerField()
     processedCount = serializers.IntegerField()
     failedCount = serializers.IntegerField()
+    skippedCount = serializers.IntegerField()
     currentProcessingFile = serializers.CharField(allow_blank=True)
-    currentProcessingFiles = serializers.ListField(child=serializers.CharField())
+    currentProcessingFiles = serializers.ListField(
+        child=serializers.CharField())
     remainingCount = serializers.IntegerField()
     elapsedSeconds = serializers.FloatField()
     averageSecondsPerDocument = serializers.FloatField(allow_null=True)
@@ -113,12 +164,24 @@ def document_data(document):
         "reviewedBy": document.reviewed_by or None,
         "editHistory": document.edit_history,
         "fileUrl": f"documents/{document.id}/file/",
+        # Per-document assignment. A batch can mix profiles, so the client must
+        # be able to resolve the profile this document was processed with
+        # instead of assuming the job-level default.
+        "profileId": document.profile_id,
+        "profileName": document.profile.name if document.profile_id else None,
+        "assignmentStatus": document.assignment_status,
+        "assignmentMethod": document.assignment_method,
+        "assignmentRule": document.assignment_rule,
+        "assignmentConfidence": document.assignment_confidence,
+        "assignmentReason": document.assignment_reason,
     }
 
 
 def job_data(job):
     document_records = list(
-        job.documents.prefetch_related("extracted_fields", "field_diagnostics")
+        job.documents.select_related("profile").prefetch_related(
+            "extracted_fields", "field_diagnostics"
+        )
     )
     documents = [document_data(document) for document in document_records]
     current_processing_files = [
@@ -141,6 +204,7 @@ def job_data(job):
         "totalDiscovered": job.total_discovered,
         "processedCount": job.processed_count,
         "failedCount": job.failed_count,
+        "skippedCount": job.skipped_count,
         "reviewRequiredCount": job.review_required_count,
         "conflictCount": job.conflict_count,
         "missingCount": job.missing_count,

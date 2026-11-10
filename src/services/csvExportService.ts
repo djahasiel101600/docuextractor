@@ -13,6 +13,74 @@ export interface CsvExportOptions {
   useCorrectedValues: boolean; // if false, use initial extracted value
   selectedFieldIds?: string[];
   onlyReviewed?: boolean;
+  // Every profile in the workspace. A batch can mix profiles, so each document
+  // resolves the profile it was actually extracted with from this list.
+  profiles?: ExtractionProfile[];
+}
+
+export interface ExportFieldDefinition {
+  id: string;
+  name: string;
+}
+
+/**
+ * Resolves the Extraction Profile a document was processed with. The document's
+ * own assignment wins; the job-level profile is only the fallback the backend
+ * pipeline itself uses.
+ */
+export function resolveDocumentProfile(
+  document: PDFDocumentRecord,
+  profiles: ExtractionProfile[],
+  jobProfile?: ExtractionProfile
+): ExtractionProfile | undefined {
+  if (document.profileId) {
+    const assigned = profiles.find((profile) => profile.id === document.profileId);
+    if (assigned) return assigned;
+  }
+  return jobProfile;
+}
+
+/**
+ * Union of the field definitions across the job-level profile and every profile
+ * actually used by the exported documents, in stable order. Mirrors the backend
+ * export so the preview and the downloaded file share the same columns.
+ */
+export function collectExportFields(
+  documents: PDFDocumentRecord[],
+  profiles: ExtractionProfile[],
+  jobProfile?: ExtractionProfile,
+  selectedFieldIds?: string[]
+): ExportFieldDefinition[] {
+  const ordered: ExportFieldDefinition[] = [];
+  const seen = new Set<string>();
+  const pushProfile = (target?: ExtractionProfile) => {
+    target?.fields.forEach((field) => {
+      if (seen.has(field.id)) return;
+      if (selectedFieldIds && !selectedFieldIds.includes(field.id)) return;
+      seen.add(field.id);
+      ordered.push({ id: field.id, name: field.name });
+    });
+  };
+  pushProfile(jobProfile);
+  documents.forEach((document) =>
+    pushProfile(resolveDocumentProfile(document, profiles, jobProfile))
+  );
+  return ordered;
+}
+
+/**
+ * Display name of the profile a document was processed with.
+ */
+function documentProfileName(
+  document: PDFDocumentRecord,
+  profiles: ExtractionProfile[],
+  jobProfile?: ExtractionProfile
+): string {
+  return (
+    document.profileName ||
+    resolveDocumentProfile(document, profiles, jobProfile)?.name ||
+    ''
+  );
 }
 
 /**
@@ -40,17 +108,17 @@ export function generatePrimaryCsv(
   profile: ExtractionProfile,
   options: CsvExportOptions = { delimiter: ',', includeBom: true, useCorrectedValues: true }
 ): string {
-  const { delimiter, includeBom, useCorrectedValues, selectedFieldIds } = options;
+  const { delimiter, includeBom, useCorrectedValues, selectedFieldIds, profiles = [] } = options;
 
-  // Filter fields if specific IDs are selected
-  const activeFields = profile.fields.filter(
-    (f) => !selectedFieldIds || selectedFieldIds.includes(f.id)
-  );
+  // Columns cover every profile used by the exported documents, so a mixed
+  // batch never silently drops fields that only another profile defines.
+  const activeFields = collectExportFields(documents, profiles, profile, selectedFieldIds);
 
-  // Headers
+  // Headers (order matches the backend export)
   const headers = [
     'Document Filename',
     'Relative Directory Path',
+    'Extraction Profile',
     'Processing Status',
     'Extraction Method Used',
     'Review Status',
@@ -63,6 +131,7 @@ export function generatePrimaryCsv(
     const rowValues: string[] = [
       escapeCsvCell(doc.filename, delimiter),
       escapeCsvCell(doc.relativePath, delimiter),
+      escapeCsvCell(documentProfileName(doc, profiles, profile), delimiter),
       escapeCsvCell(doc.processingStatus, delimiter),
       escapeCsvCell(doc.extractionMethodUsed, delimiter),
       escapeCsvCell(doc.isReviewed ? 'Reviewed' : 'Pending Review', delimiter),
@@ -97,17 +166,23 @@ export function generateDiagnosticsCsv(
   profile: ExtractionProfile,
   options: CsvExportOptions = { delimiter: ',', includeBom: true, useCorrectedValues: true }
 ): string {
-  const { delimiter, includeBom, selectedFieldIds } = options;
+  const { delimiter, includeBom, selectedFieldIds, profiles = [] } = options;
+
+  // Same union of fields as the primary report: a document extracted with a
+  // different profile still contributes its own field diagnostics.
+  const activeFields = collectExportFields(documents, profiles, profile, selectedFieldIds);
 
   const headers = [
     'Document Filename',
     'Relative Path',
+    'Extraction Profile',
     'Field ID',
     'Field Name',
     'Match Status',
     'Final Value',
     'Filename Extracted Value',
     'PDF Extracted Value',
+    'Form Field Extracted Value',
     'OCR Extracted Value',
     'Extraction Source',
     'Extraction Method',
@@ -132,23 +207,21 @@ export function generateDiagnosticsCsv(
   const rows: string[] = [headers.map((h) => escapeCsvCell(h, delimiter)).join(delimiter)];
 
   for (const doc of documents) {
-    for (const field of profile.fields) {
-      if (selectedFieldIds && !selectedFieldIds.includes(field.id)) {
-        continue;
-      }
-
+    for (const field of activeFields) {
       const diag = doc.diagnostics[field.id];
       if (!diag) continue;
 
       const rowValues = [
         escapeCsvCell(doc.filename, delimiter),
         escapeCsvCell(doc.relativePath, delimiter),
+        escapeCsvCell(documentProfileName(doc, profiles, profile), delimiter),
         escapeCsvCell(field.id, delimiter),
         escapeCsvCell(field.name, delimiter),
         escapeCsvCell(diag.status, delimiter),
         escapeCsvCell(doc.finalValues[field.id] || diag.finalValue, delimiter),
         escapeCsvCell(diag.filenameValue || '', delimiter),
         escapeCsvCell(diag.pdfValue || '', delimiter),
+        escapeCsvCell(diag.formValue || '', delimiter),
         escapeCsvCell(diag.ocrValue || '', delimiter),
         escapeCsvCell(diag.source, delimiter),
         escapeCsvCell(diag.method, delimiter),

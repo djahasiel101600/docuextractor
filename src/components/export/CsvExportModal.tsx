@@ -17,24 +17,39 @@ import { ProcessingJob, ExtractionProfile } from '../../types/extraction';
 import {
   generatePrimaryCsv,
   generateDiagnosticsCsv,
+  collectExportFields,
   CsvDelimiter,
 } from '../../services/csvExportService';
-import {downloadJobExport, getApiErrorMessage} from '../../services/apiClient';
+import { downloadJobExport, getApiErrorMessage } from '../../services/apiClient';
 
 interface CsvExportModalProps {
   job: ProcessingJob;
   profile: ExtractionProfile;
+  // Every workspace profile, so documents processed with a different profile
+  // contribute their own columns instead of being read against the job default.
+  profiles: ExtractionProfile[];
   onClose: () => void;
 }
 
-export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, onClose }) => {
+export const CsvExportModal: React.FC<CsvExportModalProps> = ({
+  job,
+  profile,
+  profiles,
+  onClose,
+}) => {
   const [activeTab, setActiveTab] = useState<'primary' | 'diagnostics'>('primary');
   const [delimiter, setDelimiter] = useState<CsvDelimiter>(',');
   const [includeBom, setIncludeBom] = useState<boolean>(true);
   const [useCorrectedValues, setUseCorrectedValues] = useState<boolean>(true);
   const [onlyReviewed, setOnlyReviewed] = useState<boolean>(false);
+  // Columns are the union of every profile used in this batch, matching what
+  // the backend export produces.
+  const availableFields = useMemo(
+    () => collectExportFields(job.documents, profiles, profile),
+    [job.documents, profiles, profile]
+  );
   const [selectedFieldIds, setSelectedFieldIds] = useState<string[]>(
-    profile.fields.map((f) => f.id)
+    () => availableFields.map((f) => f.id)
   );
   const [copied, setCopied] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -52,8 +67,9 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
       includeBom,
       useCorrectedValues,
       selectedFieldIds,
+      profiles,
     });
-  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, selectedFieldIds]);
+  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, selectedFieldIds, profiles]);
 
   const diagnosticsCsvContent = useMemo(() => {
     return generateDiagnosticsCsv(targetDocs, profile, {
@@ -61,8 +77,9 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
       includeBom,
       useCorrectedValues,
       selectedFieldIds,
+      profiles,
     });
-  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, selectedFieldIds]);
+  }, [targetDocs, profile, delimiter, includeBom, useCorrectedValues, selectedFieldIds, profiles]);
 
   const activeCsvContent = activeTab === 'primary' ? primaryCsvContent : diagnosticsCsvContent;
 
@@ -116,7 +133,7 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
   return (
     <div className="fixed inset-0 z-50 bg-neutral-900/60 backdrop-blur-xs flex items-center justify-center p-4">
       <div className="bg-white rounded-xl shadow-2xl border border-neutral-200 w-full max-w-4xl h-[88vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-98 duration-150">
-        
+
         {/* Top Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-200 bg-neutral-50/70 shrink-0">
           <div className="flex items-center gap-3">
@@ -148,7 +165,7 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
 
         {/* Modal Body */}
         <div className="flex-1 flex flex-col md:flex-row overflow-hidden min-h-0">
-          
+
           {/* Left Column: Export Controls & Field Selector */}
           <div className="w-full md:w-80 border-r border-neutral-200 p-5 overflow-y-auto space-y-5 bg-neutral-50/40 shrink-0">
             {/* Format & Delimiter */}
@@ -160,33 +177,30 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
                 <button
                   type="button"
                   onClick={() => setDelimiter(',')}
-                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${
-                    delimiter === ','
+                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === ','
                       ? 'bg-neutral-900 text-white border-neutral-900'
                       : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
-                  }`}
+                    }`}
                 >
                   Comma ( , )
                 </button>
                 <button
                   type="button"
                   onClick={() => setDelimiter(';')}
-                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${
-                    delimiter === ';'
+                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === ';'
                       ? 'bg-neutral-900 text-white border-neutral-900'
                       : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
-                  }`}
+                    }`}
                 >
                   Semicolon ( ; )
                 </button>
                 <button
                   type="button"
                   onClick={() => setDelimiter('\t')}
-                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${
-                    delimiter === '\t'
+                  className={`py-1.5 px-3 text-xs font-medium rounded-md border text-center transition-colors ${delimiter === '\t'
                       ? 'bg-neutral-900 text-white border-neutral-900'
                       : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100'
-                  }`}
+                    }`}
                 >
                   Tab ( \t )
                 </button>
@@ -196,7 +210,7 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
             {/* Encoding & Options */}
             <div className="space-y-2.5 pt-3 border-t border-neutral-200 text-xs">
               <span className="font-semibold text-neutral-700 block">Encoding &amp; Filtering</span>
-              
+
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -234,25 +248,25 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
             <div className="space-y-2 pt-3 border-t border-neutral-200">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-neutral-700">
-                  Include Fields ({selectedFieldIds.length}/{profile.fields.length})
+                  Include Fields ({selectedFieldIds.length}/{availableFields.length})
                 </span>
                 <button
                   type="button"
                   onClick={() =>
                     setSelectedFieldIds(
-                      selectedFieldIds.length === profile.fields.length
+                      selectedFieldIds.length === availableFields.length
                         ? []
-                        : profile.fields.map((f) => f.id)
+                        : availableFields.map((f) => f.id)
                     )
                   }
                   className="text-[11px] text-neutral-500 hover:text-neutral-900 underline"
                 >
-                  {selectedFieldIds.length === profile.fields.length ? 'Deselect All' : 'Select All'}
+                  {selectedFieldIds.length === availableFields.length ? 'Deselect All' : 'Select All'}
                 </button>
               </div>
 
               <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                {profile.fields.map((field) => (
+                {availableFields.map((field) => (
                   <label
                     key={field.id}
                     className="flex items-center gap-2 text-xs text-neutral-700 cursor-pointer hover:bg-neutral-100 p-1.5 rounded"
@@ -301,22 +315,20 @@ export const CsvExportModal: React.FC<CsvExportModalProps> = ({ job, profile, on
                 <button
                   type="button"
                   onClick={() => setActiveTab('primary')}
-                  className={`px-3 py-1.5 rounded-md transition-colors ${
-                    activeTab === 'primary'
+                  className={`px-3 py-1.5 rounded-md transition-colors ${activeTab === 'primary'
                       ? 'bg-neutral-900 text-white font-semibold'
                       : 'text-neutral-600 hover:text-neutral-900'
-                  }`}
+                    }`}
                 >
                   Primary Reconciled Dataset ({targetDocs.length} rows)
                 </button>
                 <button
                   type="button"
                   onClick={() => setActiveTab('diagnostics')}
-                  className={`px-3 py-1.5 rounded-md transition-colors ${
-                    activeTab === 'diagnostics'
+                  className={`px-3 py-1.5 rounded-md transition-colors ${activeTab === 'diagnostics'
                       ? 'bg-neutral-900 text-white font-semibold'
                       : 'text-neutral-600 hover:text-neutral-900'
-                  }`}
+                    }`}
                 >
                   Diagnostics Trace Report ({targetDocs.length * selectedFieldIds.length} events)
                 </button>

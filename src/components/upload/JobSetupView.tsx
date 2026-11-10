@@ -2,8 +2,9 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
+const DEBUG = import.meta.env.DEV; // or a feature flag
 
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import {
   Upload,
   FileArchive,
@@ -11,34 +12,34 @@ import {
   AlertCircle,
   Play,
   Sparkles,
-  FolderTree,
   ChevronDown,
   ChevronRight,
-  Sliders,
   CheckCircle2,
   FileWarning,
   RefreshCw,
-  Folder,
   Search,
   X,
   History,
   Gauge,
   Clock,
-} from 'lucide-react';
-import {
-  ExtractionProfile,
-  FieldDefinition,
-  PDFDocumentRecord,
-} from '../../types/extraction';
+  LayoutTemplate,
+} from "lucide-react";
+import { ExtractionProfile, DocumentAssignment } from "../../types/extraction";
 import {
   unpackZipArchive,
   unpackMultipleZipArchives,
   collectLoosePdfFiles,
   ArchiveDiscoveryResult,
   DiscoveredFileItem,
-} from '../../services/zipService';
-import { createDemoZipArchive } from '../../services/sampleArchiveGenerator';
-import { extractFromFilename } from '../../services/extractionEngine';
+} from "../../services/zipService";
+import { createDemoZipArchive } from "../../services/sampleArchiveGenerator";
+import {
+  assignJobProfiles,
+  createBatchJob,
+  getJobAssignments,
+  uploadJobArchive,
+  updateDocumentAssignment,
+} from "../../services/apiClient";
 
 interface JobSetupViewProps {
   profiles: ExtractionProfile[];
@@ -46,14 +47,16 @@ interface JobSetupViewProps {
   onSelectProfileId: (id: string) => void;
   onStartProcessing: (
     archiveResult: ArchiveDiscoveryResult,
-    profile: ExtractionProfile
+    profile: ExtractionProfile,
+    existingJobId?: string,
   ) => void;
   isProcessing: boolean;
   processingProgress: {
-    phase: 'uploading' | 'processing';
+    phase: "uploading" | "processing";
     total: number;
     completed: number;
     failed: number;
+    skipped: number;
     currentFile: string;
     uploadPercent: number;
     remaining: number;
@@ -65,8 +68,19 @@ interface JobSetupViewProps {
   } | null;
 }
 
+// ---------------------------------------------------------------------------
+// Debug logging (Fix #7): every noisy [Debug] line is gated so nothing
+// PII-adjacent runs in production builds.
+// ---------------------------------------------------------------------------
+function debugLog(...args: unknown[]): void {
+  if (DEBUG) console.log(...args);
+}
+
+// ---------------------------------------------------------------------------
+// Small formatting helpers
+// ---------------------------------------------------------------------------
 function formatDuration(seconds: number | null): string {
-  if (seconds === null || !Number.isFinite(seconds)) return 'Calculating...';
+  if (seconds === null || !Number.isFinite(seconds)) return "Calculating...";
   const totalSeconds = Math.max(0, Math.ceil(seconds));
   const minutes = Math.floor(totalSeconds / 60);
   const remainder = totalSeconds % 60;
@@ -76,15 +90,15 @@ function formatDuration(seconds: number | null): string {
 // Returns the lowercased extension of a filename (without the dot), or '' when
 // there is none (e.g. dotfiles or names ending in a trailing dot).
 function getExtension(filename: string): string {
-  const idx = filename.lastIndexOf('.');
-  if (idx <= 0 || idx === filename.length - 1) return '';
+  const idx = filename.lastIndexOf(".");
+  if (idx <= 0 || idx === filename.length - 1) return "";
   return filename.slice(idx + 1).toLowerCase();
 }
 
 // Human-readable byte size. Unsupported entries in the ZIP path may report 0
 // when the archive header exposes no size, so fall back to a neutral label.
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return 'Unknown size';
+  if (!Number.isFinite(bytes) || bytes <= 0) return "Unknown size";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -92,13 +106,54 @@ function formatBytes(bytes: number): string {
 
 // Categories used to group unsupported non-PDF files for readability.
 const UNSUPPORTED_CATEGORIES: { label: string; extensions: string[] }[] = [
-  { label: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'heif', 'svg'] },
-  { label: 'Spreadsheets', extensions: ['xlsx', 'xls', 'xlsm', 'xlsb', 'csv', 'tsv', 'ods'] },
-  { label: 'Documents', extensions: ['doc', 'docx', 'rtf', 'odt', 'pages', 'epub'] },
-  { label: 'Presentations', extensions: ['ppt', 'pptx', 'key', 'odp'] },
-  { label: 'Text & data', extensions: ['txt', 'md', 'log', 'json', 'xml', 'yaml', 'yml'] },
-  { label: 'Archives', extensions: ['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz'] },
-  { label: 'Audio & video', extensions: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'mp4', 'mov', 'avi', 'mkv', 'wmv'] },
+  {
+    label: "Images",
+    extensions: [
+      "jpg",
+      "jpeg",
+      "png",
+      "gif",
+      "bmp",
+      "tif",
+      "tiff",
+      "webp",
+      "heic",
+      "heif",
+      "svg",
+    ],
+  },
+  {
+    label: "Spreadsheets",
+    extensions: ["xlsx", "xls", "xlsm", "xlsb", "csv", "tsv", "ods"],
+  },
+  {
+    label: "Documents",
+    extensions: ["doc", "docx", "rtf", "odt", "pages", "epub"],
+  },
+  { label: "Presentations", extensions: ["ppt", "pptx", "key", "odp"] },
+  {
+    label: "Text & data",
+    extensions: ["txt", "md", "log", "json", "xml", "yaml", "yml"],
+  },
+  {
+    label: "Archives",
+    extensions: ["zip", "rar", "7z", "tar", "gz", "bz2", "xz"],
+  },
+  {
+    label: "Audio & video",
+    extensions: [
+      "mp3",
+      "wav",
+      "m4a",
+      "aac",
+      "flac",
+      "mp4",
+      "mov",
+      "avi",
+      "mkv",
+      "wmv",
+    ],
+  },
 ];
 
 interface UnsupportedGroup {
@@ -110,18 +165,25 @@ interface UnsupportedGroup {
 // Buckets unsupported files into known categories (by extension) and one
 // "Other" bucket per unrecognized extension, so the panel reads naturally
 // (e.g. "Spreadsheets (.xlsx): 3", "Other (.psd): 1").
-function groupUnsupportedFiles(items: DiscoveredFileItem[]): UnsupportedGroup[] {
+function groupUnsupportedFiles(
+  items: DiscoveredFileItem[],
+): UnsupportedGroup[] {
   const extToCategory = new Map<string, string>();
   UNSUPPORTED_CATEGORIES.forEach((category) =>
-    category.extensions.forEach((ext) => extToCategory.set(ext, category.label))
+    category.extensions.forEach((ext) =>
+      extToCategory.set(ext, category.label),
+    ),
   );
 
-  const buckets = new Map<string, { label: string; order: number; items: DiscoveredFileItem[] }>();
+  const buckets = new Map<
+    string,
+    { label: string; order: number; items: DiscoveredFileItem[] }
+  >();
   items.forEach((item) => {
     const ext = getExtension(item.filename);
     const categoryLabel = ext ? extToCategory.get(ext) : undefined;
-    const key = categoryLabel ?? `other:${ext || 'none'}`;
-    const label = categoryLabel ?? 'Other';
+    const key = categoryLabel ?? `other:${ext || "none"}`;
+    const label = categoryLabel ?? "Other";
     const order = categoryLabel
       ? UNSUPPORTED_CATEGORIES.findIndex((c) => c.label === categoryLabel)
       : 1000 + (ext ? ext.charCodeAt(0) : 0);
@@ -133,7 +195,11 @@ function groupUnsupportedFiles(items: DiscoveredFileItem[]): UnsupportedGroup[] 
     .map((bucket) => ({
       label: bucket.label,
       extensions: Array.from(
-        new Set(bucket.items.map((item) => getExtension(item.filename)).filter(Boolean))
+        new Set(
+          bucket.items
+            .map((item) => getExtension(item.filename))
+            .filter(Boolean),
+        ),
       ).sort(),
       items: bucket.items,
       order: bucket.order,
@@ -142,14 +208,12 @@ function groupUnsupportedFiles(items: DiscoveredFileItem[]): UnsupportedGroup[] 
 }
 
 // --- Processing time estimation (tunable heuristic) ------------------------
-// Rough wall-clock seconds per document per configured target field. Kept as
-// constants at the top of the component file so the estimate is easy to adjust
-// after real profiling. Very large archives will only ever get a rough figure.
 const ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MIN = 2;
 const ESTIMATE_SECONDS_PER_DOC_PER_FIELD_MAX = 5;
 
 // --- "Re-use last archive" cache -------------------------------------------
-const ARCHIVE_CACHE_STORAGE_KEY = 'docuextract.lastArchiveMeta';
+const ARCHIVE_CACHE_STORAGE_KEY = "docuextract.lastArchiveMeta";
+const JOB_ID_STORAGE_KEY = "docuextract.currentJobId";
 
 interface ArchiveCacheMeta {
   zipName: string;
@@ -168,6 +232,9 @@ interface ArchiveCacheMeta {
 // the in-memory archive is gone (a hard refresh), the re-use affordance is
 // dropped and the user simply uploads again - a graceful, non-crashing fallback.
 let inMemoryArchiveCache: ArchiveDiscoveryResult | null = null;
+// Module-level mirror of the current job id. Kept in sync with the component's
+// jobIdRef via setJobId() so remounts (tab switches) preserve the job.
+let inMemoryJobId: string | null = null;
 
 function sumPdfBytes(result: ArchiveDiscoveryResult): number {
   return result.pdfFiles.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
@@ -204,9 +271,36 @@ function writeArchiveMeta(meta: ArchiveCacheMeta): void {
 function removeArchiveMeta(): void {
   try {
     localStorage.removeItem(ARCHIVE_CACHE_STORAGE_KEY);
+    localStorage.removeItem(JOB_ID_STORAGE_KEY);
   } catch {
     // ignore
   }
+}
+
+/**
+ * Fix #2 / #5: normalize an ArchiveDiscoveryResult into the list of archive
+ * blobs that must be uploaded for the job. Preference order:
+ *   1. `sourceArchives` if it has any entries (batch or single ZIP)
+ *   2. fall back to `sourceFile` / `zipName` (legacy/single-file shape)
+ *   3. empty list → caller throws a clear error
+ *
+ * Crucially this is *not* asymmetric like the old code: a single-entry
+ * `sourceArchives` is still honored (previously it fell through to
+ * `sourceFile`, which could be a different, repacked blob).
+ */
+function collectArchivesToUpload(
+  result: ArchiveDiscoveryResult,
+): Array<{ blob: Blob; filename: string }> {
+  if (result.sourceArchives?.length) {
+    return result.sourceArchives.map((a) => ({
+      blob: a.blob,
+      filename: a.filename,
+    }));
+  }
+  if (result.sourceFile && result.zipName) {
+    return [{ blob: result.sourceFile, filename: result.zipName }];
+  }
+  return [];
 }
 
 export const JobSetupView: React.FC<JobSetupViewProps> = ({
@@ -215,26 +309,55 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
   onSelectProfileId,
   onStartProcessing,
   isProcessing,
-  processingProgress,
+  processingProgress: _processingProgress,
 }) => {
-  const [archiveResult, setArchiveResult] = useState<ArchiveDiscoveryResult | null>(null);
+  const [archiveResult, setArchiveResult] =
+    useState<ArchiveDiscoveryResult | null>(null);
   const [isUnpacking, setIsUnpacking] = useState(false);
   const [unpackError, setUnpackError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [showRegexTester, setShowRegexTester] = useState(false);
+
+  // Document Assignment state
+  const [assignments, setAssignments] = useState<DocumentAssignment[]>([]);
+  const [isAssigning, setIsAssigning] = useState(false);
+  const [hasAnalyzed, setHasAnalyzed] = useState(false);
+  const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  // Profile the analysed batch job was created with. Frozen once analysed so a
+  // later change to the global profile selection cannot misrepresent (or
+  // silently replace) the job default the assignments were computed against.
+  const [jobProfileId, setJobProfileId] = useState<string | null>(null);
 
   // Step 2 discovery UI state. The filename filter is purely visual: it never
   // mutates archiveResult.pdfFiles or excludes anything from processing.
-  const [filenameFilter, setFilenameFilter] = useState('');
-  const [debouncedFilter, setDebouncedFilter] = useState('');
+  const [filenameFilter, setFilenameFilter] = useState("");
+  const [debouncedFilter, setDebouncedFilter] = useState("");
   const [showUnsupported, setShowUnsupported] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
 
   // "Re-use last archive" state. The full object lives in a module-scoped
   // cache (with binary data) for instant, processable restore; this component
   // state mirrors it for reactive UI.
-  const [cachedArchive, setCachedArchive] = useState<ArchiveDiscoveryResult | null>(null);
-  const [cachedArchiveMeta, setCachedArchiveMeta] = useState<ArchiveCacheMeta | null>(null);
+  const [cachedArchive, setCachedArchive] =
+    useState<ArchiveDiscoveryResult | null>(null);
+  const [cachedArchiveMeta, setCachedArchiveMeta] =
+    useState<ArchiveCacheMeta | null>(null);
+
+  // Fix #1: component-scoped job id. Kept in sync with the module-level
+  // `inMemoryJobId` (for remount persistence) via setJobId().
+  const jobIdRef = useRef<string | null>(inMemoryJobId);
+
+  // Fix #3: synchronous in-flight guard. State alone cannot prevent two clicks
+  // in the same tick from both seeing `false`.
+  const isAssigningRef = useRef(false);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Fix #2: single writer for the job id. Callers must use this instead of
+  // assigning `inMemoryJobId` directly so the ref and module mirror never drift.
+  const setJobId = (id: string | null) => {
+    jobIdRef.current = id;
+    inMemoryJobId = id;
+  };
 
   // Debounce the applied filter ~200ms so fast typing does not thrash the list.
   useEffect(() => {
@@ -249,16 +372,27 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     if (inMemoryArchiveCache) {
       setCachedArchive(inMemoryArchiveCache);
       setCachedArchiveMeta(
-        readArchiveMeta() ?? buildArchiveMeta(inMemoryArchiveCache)
+        readArchiveMeta() ?? buildArchiveMeta(inMemoryArchiveCache),
       );
     } else {
       removeArchiveMeta();
     }
   }, []);
 
+  // Fix #4: whenever the selected archive changes, forget the previous job so
+  // the next "Analyze" creates a fresh one and uploads the new file(s).
+  // This centralizes the reset that used to be duplicated across handlers.
+  useEffect(() => {
+    setJobId(null);
+    setHasAnalyzed(false);
+    setAssignments([]);
+    setAssignmentError(null);
+    setJobProfileId(null);
+  }, [archiveResult]);
+
   const resetDiscoveryViews = () => {
-    setFilenameFilter('');
-    setDebouncedFilter('');
+    setFilenameFilter("");
+    setDebouncedFilter("");
     setShowUnsupported(false);
     setShowInsights(false);
   };
@@ -277,11 +411,12 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
       setCachedArchive(null);
       setCachedArchiveMeta(null);
       setUnpackError(
-        'The previous archive is no longer available in this browser session. Please upload it again.'
+        "The previous archive is no longer available in this browser session. Please upload it again.",
       );
       return;
     }
     resetDiscoveryViews();
+    // Setting archiveResult triggers the reset useEffect above.
     setArchiveResult(inMemoryArchiveCache);
   };
 
@@ -296,12 +431,18 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
 
   const unsupportedGroups = useMemo(
     () => groupUnsupportedFiles(archiveResult?.unsupportedFiles ?? []),
-    [archiveResult]
+    [archiveResult],
   );
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeProfile =
+    profiles.find((p) => p.id === selectedProfileId) || profiles[0];
 
-  const activeProfile = profiles.find((p) => p.id === selectedProfileId) || profiles[0];
+  // The profile the analysed job is actually bound to. Before analysis this is
+  // simply the current selection; afterwards it is frozen to the profile the
+  // backend job was created with, so nothing in this step can diverge from the
+  // assignments the user just reviewed.
+  const jobProfile =
+    (hasAnalyzed && profiles.find((p) => p.id === jobProfileId)) || activeProfile;
 
   // Aggregate metrics + processing estimate for the Insights panel, computed
   // entirely client-side from archiveResult (no network). Based on ALL PDFs in
@@ -340,25 +481,27 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
     try {
       const fileArray = Array.from(files);
       const zipFiles = fileArray.filter((file) =>
-        file.name.toLowerCase().endsWith('.zip')
+        file.name.toLowerCase().endsWith(".zip"),
       );
 
       let result: ArchiveDiscoveryResult;
       if (zipFiles.length > 1) {
-        // Batch selection: aggregate every archive into one discovery result
-        // while each ZIP is still uploaded as its own small request later.
         result = await unpackMultipleZipArchives(zipFiles);
       } else if (zipFiles.length === 1) {
         result = await unpackZipArchive(zipFiles[0], zipFiles[0].name);
       } else {
-        // Multiple loose PDF files
+        // collectLoosePdfFiles filters non-PDF entries internally, so passing
+        // the raw dropped files (which bypass `accept`) is safe here.
         result = await collectLoosePdfFiles(fileArray);
       }
+      resetDiscoveryViews();
+      // Setting archiveResult triggers the reset useEffect above.
       setArchiveResult(result);
       rememberArchive(result);
-      resetDiscoveryViews();
     } catch (err: unknown) {
-      setUnpackError(err instanceof Error ? err.message : 'Failed to read uploaded archive');
+      setUnpackError(
+        err instanceof Error ? err.message : "Failed to read uploaded archive",
+      );
     } finally {
       setIsUnpacking(false);
     }
@@ -371,37 +514,153 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
 
     try {
       const demoBlob = await createDemoZipArchive();
-      const result = await unpackZipArchive(demoBlob, 'batch_2026_q1_civil_forms.zip');
+      const result = await unpackZipArchive(
+        demoBlob,
+        "batch_2026_q1_civil_forms.zip",
+      );
+      resetDiscoveryViews();
       setArchiveResult(result);
       rememberArchive(result);
-      resetDiscoveryViews();
     } catch (err: unknown) {
-      setUnpackError(err instanceof Error ? err.message : 'Failed to generate demo archive');
+      setUnpackError(
+        err instanceof Error ? err.message : "Failed to generate demo archive",
+      );
     } finally {
       setIsUnpacking(false);
     }
   };
 
   const handleStart = () => {
-    if (!archiveResult || !activeProfile || archiveResult.pdfFiles.length === 0) return;
-    onStartProcessing(archiveResult, activeProfile);
+    if (!archiveResult || !jobProfile || archiveResult.pdfFiles.length === 0)
+      return;
+    // Fix #2: read the unified source of truth.
+    onStartProcessing(
+      archiveResult,
+      jobProfile,
+      jobIdRef.current ?? undefined,
+    );
+  };
+
+  const handleAnalyzeDocuments = async () => {
+    if (!archiveResult || !activeProfile) return;
+
+    // Fix #3: synchronous in-flight guard.
+    if (isAssigningRef.current) return;
+    isAssigningRef.current = true;
+
+    setIsAssigning(true);
+    setAssignmentError(null);
+
+    try {
+      let jobId = jobIdRef.current;
+
+      if (!jobId) {
+        debugLog("[Debug] JobSetupView: createBatchJob payload", {
+          endpoint: "POST /api/jobs/batch/",
+          body: { profileId: activeProfile.id },
+        });
+        const job = await createBatchJob(activeProfile.id);
+        jobId = job.id;
+        setJobId(jobId);
+        setJobProfileId(activeProfile.id);
+        debugLog("[Debug] JobSetupView: createBatchJob response", {
+          jobId: job.id,
+          status: job.status,
+          totalDiscovered: job.totalDiscovered,
+        });
+
+        const archives = collectArchivesToUpload(archiveResult);
+        if (archives.length === 0) {
+          throw new Error("No archive file available to upload.");
+        }
+
+        for (const archive of archives) {
+          debugLog("[Debug] JobSetupView: uploadJobArchive payload", {
+            endpoint: `POST /api/jobs/${jobId}/archives/`,
+            body: {
+              fieldName: "file",
+              filename: archive.filename,
+              sizeBytes: archive.blob.size,
+              type: archive.blob.type,
+              jobId,
+            },
+            note: "multipart/form-data - binary blob not logged for brevity",
+          });
+          await uploadJobArchive(jobId, archive.blob, archive.filename);
+        }
+      }
+
+      debugLog("[Debug] JobSetupView: assignJobProfiles payload", {
+        endpoint: `POST /api/jobs/${jobId}/assign/`,
+        body: null,
+        note: "Empty POST body - backend reads only job_id from URL",
+      });
+      await assignJobProfiles(jobId);
+
+      debugLog("[Debug] JobSetupView: getJobAssignments payload", {
+        endpoint: `GET /api/jobs/${jobId}/assignments/`,
+        body: null,
+        note: "GET request - no body",
+      });
+      const results = await getJobAssignments(jobId);
+
+      debugLog("[Debug] JobSetupView: getJobAssignments response", {
+        count: results.length,
+        // Fix #6: do not log filenames/PII. Use fields that are safe to emit.
+        sample: results.slice(0, 5).map((r) => ({
+          id: r.id,
+          profileId: r.profileId,
+          status: r.assignmentStatus,
+        })),
+      });
+
+      setAssignments(results);
+      setHasAnalyzed(true);
+    } catch (err: unknown) {
+      setAssignmentError(
+        err instanceof Error ? err.message : "Failed to analyze documents",
+      );
+    } finally {
+      isAssigningRef.current = false;
+      setIsAssigning(false);
+    }
+  };
+
+  const handleUpdateAssignment = async (
+    docId: string,
+    update: { profileId?: string | null; assignmentStatus?: string },
+  ) => {
+    try {
+      // Fix #2: unified source of truth.
+      const jobId = jobIdRef.current;
+      if (!jobId) {
+        setAssignmentError(
+          "No job has been created yet. Please analyze documents first.",
+        );
+        return;
+      }
+      await updateDocumentAssignment(docId, update);
+      const results = await getJobAssignments(jobId);
+      setAssignments(results);
+    } catch (err: unknown) {
+      setAssignmentError(
+        err instanceof Error ? err.message : "Failed to update assignment",
+      );
+    }
   };
 
   return (
     <div className="max-w-6xl mx-auto space-y-8">
-
       {/* View Title */}
       <div>
         <h2 className="text-xl font-bold text-neutral-900 tracking-tight">
           New Document Processing Job
         </h2>
         <p className="text-xs text-neutral-500 mt-1">
-          Upload a ZIP archive containing multiple digital PDF forms or test with our sample archive.
+          Upload a ZIP archive containing multiple digital PDF forms or test
+          with our sample archive.
         </p>
       </div>
-
-      {/* Live processing progress is surfaced by the global banner in App so it
-          stays visible across tabs and after a reload. */}
 
       {/* Step 1: Upload Archive Box */}
       <div className="bg-white rounded-xl border border-neutral-200 p-6 shadow-xs space-y-5">
@@ -415,7 +674,6 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             </h3>
           </div>
 
-          {/* Quick Demo Button + Re-use last archive */}
           <div className="flex items-center gap-2">
             {cachedArchive && (
               <button
@@ -425,7 +683,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                 title={
                   cachedArchiveMeta
                     ? `${cachedArchiveMeta.zipName} · ${cachedArchiveMeta.pdfCount} PDFs`
-                    : 'Re-use the last discovered archive'
+                    : "Re-use the last discovered archive"
                 }
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-neutral-800 bg-white hover:bg-neutral-100 rounded-md transition-colors border border-neutral-300"
               >
@@ -459,8 +717,8 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
           }}
           onClick={() => fileInputRef.current?.click()}
           className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors ${isDragging
-            ? 'border-neutral-900 bg-neutral-50'
-            : 'border-neutral-300 hover:border-neutral-400 bg-neutral-50/50'
+              ? "border-neutral-900 bg-neutral-50"
+              : "border-neutral-300 hover:border-neutral-400 bg-neutral-50/50"
             }`}
         >
           <input
@@ -484,11 +742,13 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             </div>
             <div>
               <p className="text-sm font-semibold text-neutral-900">
-                {isUnpacking ? 'Reading & unpacking archive contents...' : 'Click to browse or drop ZIP archive here'}
+                {isUnpacking
+                  ? "Reading & unpacking archive contents..."
+                  : "Click to browse or drop ZIP archive here"}
               </p>
               <p className="text-xs text-neutral-500 mt-1">
-                Supports nested directories, folder structures, multiple loose .pdf files,
-                or several ZIP archives at once (batch upload).
+                Supports nested directories, folder structures, multiple loose
+                .pdf files, or several ZIP archives at once (batch upload).
               </p>
             </div>
           </div>
@@ -502,7 +762,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
         )}
       </div>
 
-      {/* Step 2: Archive Discovered Contents */}
+      {/* Step 2: Discover Documents */}
       {archiveResult && (
         <div className="bg-white rounded-xl border border-neutral-200 p-6 shadow-xs space-y-5 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -512,20 +772,19 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
               </span>
               <div>
                 <h3 className="text-sm font-bold text-neutral-900">
-                  Discovered Documents ({archiveResult.pdfFiles.length} PDFs)
+                  Discover Documents ({archiveResult.pdfFiles.length} PDFs)
                 </h3>
                 <p className="text-xs text-neutral-500 font-mono">
-                  {archiveResult.sourceArchives && archiveResult.sourceArchives.length > 1 ? (
-                    `Batch: ${archiveResult.sourceArchives.length} archives · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`
-                  ) : (
-                    `Archive: ${archiveResult.zipName} · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`
-                  )}
+                  {archiveResult.sourceArchives &&
+                    archiveResult.sourceArchives.length > 1
+                    ? `Batch: ${archiveResult.sourceArchives.length} archives · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`
+                    : `Archive: ${archiveResult.zipName} · ${Math.round(archiveResult.zipSizeBytes / 1024)} KB total`}
                 </p>
               </div>
             </div>
           </div>
 
-          {/* Filename filter (visual only: never changes what gets processed) */}
+          {/* Filename filter (visual only) */}
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -544,7 +803,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             {filenameFilter && (
               <button
                 type="button"
-                onClick={() => setFilenameFilter('')}
+                onClick={() => setFilenameFilter("")}
                 className="flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-neutral-600 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 rounded-md transition-colors shrink-0"
                 aria-label="Clear filename filter"
               >
@@ -562,7 +821,10 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
               </div>
             ) : (
               visiblePdfFiles.map((file) => (
-                <div key={file.id} className="p-2.5 px-4 flex items-center justify-between hover:bg-neutral-50">
+                <div
+                  key={file.id}
+                  className="p-2.5 px-4 flex items-center justify-between hover:bg-neutral-50"
+                >
                   <div className="flex items-center gap-2.5 truncate">
                     <FileText className="w-4 h-4 text-neutral-500 shrink-0" />
                     <span className="font-medium text-neutral-900 truncate">
@@ -588,7 +850,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
             )}
           </div>
 
-          {/* Processing Insights: collapsible stats + estimate + unsupported */}
+          {/* Processing Insights */}
           <div className="border border-neutral-200 rounded-lg overflow-hidden">
             <button
               type="button"
@@ -608,7 +870,9 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
               <span className="flex items-center gap-2 text-[11px] text-neutral-500">
                 <span className="tabular-nums">{archiveStats.count} PDFs</span>
                 <span aria-hidden>&middot;</span>
-                <span className="tabular-nums">{formatBytes(archiveStats.total)}</span>
+                <span className="tabular-nums">
+                  {formatBytes(archiveStats.total)}
+                </span>
                 {archiveResult.unsupportedFiles.length > 0 && (
                   <>
                     <span aria-hidden>&middot;</span>
@@ -622,31 +886,43 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
 
             {showInsights && (
               <div className="p-3 border-t border-neutral-200 bg-white space-y-4 text-xs animate-in fade-in">
-                {/* Aggregate stats */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
-                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Total PDFs</div>
-                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{archiveStats.count}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">
+                      Total PDFs
+                    </div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">
+                      {archiveStats.count}
+                    </div>
                   </div>
                   <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
-                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Total Size</div>
-                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{formatBytes(archiveStats.total)}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">
+                      Total Size
+                    </div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">
+                      {formatBytes(archiveStats.total)}
+                    </div>
                   </div>
                   <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
-                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Avg File Size</div>
-                    <div className="text-sm font-bold text-neutral-900 tabular-nums">{formatBytes(archiveStats.avg)}</div>
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">
+                      Avg File Size
+                    </div>
+                    <div className="text-sm font-bold text-neutral-900 tabular-nums">
+                      {formatBytes(archiveStats.avg)}
+                    </div>
                   </div>
                   <div className="p-2.5 rounded border border-neutral-200 bg-neutral-50">
-                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">Size Range</div>
+                    <div className="text-[10px] uppercase tracking-wide text-neutral-500">
+                      Size Range
+                    </div>
                     <div className="text-[11px] font-semibold text-neutral-900 tabular-nums">
                       {archiveStats.count > 0
                         ? `${formatBytes(archiveStats.min)} \u2013 ${formatBytes(archiveStats.max)}`
-                        : 'N/A'}
+                        : "N/A"}
                     </div>
                   </div>
                 </div>
 
-                {/* Estimated processing time */}
                 <div className="flex items-start gap-2 p-2.5 rounded border border-neutral-200 bg-neutral-50">
                   <Clock className="w-4 h-4 text-neutral-500 shrink-0 mt-0.5" />
                   <div className="text-neutral-700">
@@ -655,17 +931,20 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                     ) : (
                       <>
                         <span className="font-semibold text-neutral-900">
-                          Estimated processing: ~{formatDuration(archiveStats.minSeconds)}&ndash;{formatDuration(archiveStats.maxSeconds)}
-                        </span>{' '}
-                        for {archiveStats.count} {archiveStats.count === 1 ? 'PDF' : 'PDFs'} with{' '}
-                        {archiveStats.fieldCount} {archiveStats.fieldCount === 1 ? 'field' : 'fields'}
-                        {archiveStats.count > 50 ? ' (rough estimate)' : ''}.
+                          Estimated processing: ~
+                          {formatDuration(archiveStats.minSeconds)}&ndash;
+                          {formatDuration(archiveStats.maxSeconds)}
+                        </span>{" "}
+                        for {archiveStats.count}{" "}
+                        {archiveStats.count === 1 ? "PDF" : "PDFs"} with{" "}
+                        {archiveStats.fieldCount}{" "}
+                        {archiveStats.fieldCount === 1 ? "field" : "fields"}
+                        {archiveStats.count > 50 ? " (rough estimate)" : ""}.
                       </>
                     )}
                   </div>
                 </div>
 
-                {/* Unsupported (non-PDF) files breakdown */}
                 {archiveResult.unsupportedFiles.length > 0 && (
                   <div className="border border-amber-200 rounded-lg overflow-hidden">
                     <button
@@ -692,16 +971,20 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                       <div className="p-3 border-t border-amber-200 bg-neutral-50 space-y-3 animate-in fade-in">
                         <p className="text-neutral-600 leading-relaxed">
                           These files were skipped because they are not PDFs.
-                          DocuExtractor only processes PDF documents &mdash; other
-                          formats cannot be parsed for form-field extraction, so
-                          they are ignored and not added to this job.
+                          DocuExtractor only processes PDF documents &mdash;
+                          other formats cannot be parsed for form-field
+                          extraction, so they are ignored and not added to this
+                          job.
                         </p>
 
                         {unsupportedGroups.map((group) => (
-                          <div key={`${group.label}:${group.extensions.join(',')}`} className="space-y-1">
+                          <div
+                            key={`${group.label}:${group.extensions.join(",")}`}
+                            className="space-y-1"
+                          >
                             <div className="font-semibold text-neutral-800">
                               {group.extensions.length > 0
-                                ? `${group.label} (${group.extensions.map((ext) => `.${ext}`).join(', ')})`
+                                ? `${group.label} (${group.extensions.map((ext) => `.${ext}`).join(", ")})`
                                 : group.label}
                               {`: ${group.items.length}`}
                             </div>
@@ -709,7 +992,10 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                               {group.items.map((item) => {
                                 const ext = getExtension(item.filename);
                                 return (
-                                  <div key={item.id} className="p-2 px-3 flex items-center justify-between gap-3">
+                                  <div
+                                    key={item.id}
+                                    className="p-2 px-3 flex items-center justify-between gap-3"
+                                  >
                                     <div className="flex items-center gap-2 min-w-0">
                                       <FileArchive className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
                                       <span className="font-medium text-neutral-900 truncate">
@@ -721,7 +1007,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
                                     </div>
                                     <div className="flex items-center gap-3 shrink-0">
                                       <span className="text-[10px] font-mono text-neutral-600 bg-neutral-100 border border-neutral-200 rounded px-1.5 py-0.5">
-                                        {ext ? `.${ext}` : 'no ext'}
+                                        {ext ? `.${ext}` : "no ext"}
                                       </span>
                                       <span className="text-neutral-400 font-mono text-[11px] tabular-nums">
                                         {formatBytes(item.sizeBytes)}
@@ -743,7 +1029,7 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
         </div>
       )}
 
-      {/* Step 3: Extraction Profile & Live Filename Regex Tester */}
+      {/* Step 3: Document Assignment Review */}
       {archiveResult && (
         <div className="bg-white rounded-xl border border-neutral-200 p-6 shadow-xs space-y-5 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -753,118 +1039,173 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
               </span>
               <div>
                 <h3 className="text-sm font-bold text-neutral-900">
-                  Select Extraction Profile &amp; Verify Rules
+                  Review Document Assignments
                 </h3>
                 <p className="text-xs text-neutral-500">
-                  Choose the field extraction rules and regex patterns for this document batch.
+                  Review auto-assigned profiles and manually override
+                  assignments if needed.
                 </p>
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setShowRegexTester(!showRegexTester)}
-              className="text-xs text-neutral-700 hover:text-neutral-900 border border-neutral-200 px-3 py-1.5 rounded-md bg-neutral-50 hover:bg-neutral-100 flex items-center gap-1.5"
-            >
-              <Sliders className="w-3.5 h-3.5" />
-              <span>{showRegexTester ? 'Hide Live Regex Preview' : 'Preview Live Regex Matches'}</span>
-            </button>
+            {!hasAnalyzed && (
+              <button
+                type="button"
+                onClick={handleAnalyzeDocuments}
+                disabled={isAssigning}
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-md transition-colors disabled:opacity-50"
+              >
+                {isAssigning ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  {isAssigning ? "Analyzing..." : "Analyze Documents"}
+                </span>
+              </button>
+            )}
           </div>
 
-          {/* Profile Selector Dropdown */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-neutral-700 block">
-                Active Profile Template
+          {/* Job default extraction profile. The batch job is created with it,
+              and it is the fallback for documents without their own match. It
+              is frozen once analysed so the reviewed assignments stay valid. */}
+          {!hasAnalyzed ? (
+            <div className="flex flex-wrap items-center gap-3 p-3 rounded-lg border border-neutral-200 bg-neutral-50">
+              <label
+                htmlFor="job-default-profile"
+                className="flex items-center gap-1.5 text-xs font-semibold text-neutral-800"
+              >
+                <LayoutTemplate className="w-4 h-4 text-neutral-600" />
+                <span>Default extraction profile</span>
               </label>
               <select
-                value={selectedProfileId}
+                id="job-default-profile"
+                value={activeProfile?.id ?? ""}
                 onChange={(e) => onSelectProfileId(e.target.value)}
-                className="w-full px-3 py-2 text-xs bg-white border border-neutral-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-neutral-900 font-medium"
+                disabled={isAssigning || isProcessing || profiles.length === 0}
+                className="px-2 py-1 text-xs bg-white border border-neutral-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-neutral-900 disabled:opacity-50"
               >
                 {profiles.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({p.fields.length} fields)
+                    {p.name}
                   </option>
                 ))}
               </select>
-            </div>
-
-            <div className="p-3 bg-neutral-50 border border-neutral-200 rounded-lg text-xs space-y-1">
-              <span className="font-semibold text-neutral-800">
-                {activeProfile.name}
+              <span className="text-[11px] text-neutral-500 leading-relaxed">
+                Applied to documents without a profile match. Every file can
+                still be overridden in the table below; unmatched documents are
+                reported instead of being processed with this profile.
               </span>
-              <p className="text-neutral-600 leading-relaxed text-[11px]">
-                {activeProfile.description}
-              </p>
-              <div className="text-[11px] text-neutral-500 pt-1 font-mono">
-                OCR Fallback: {activeProfile.ocrSettings.enabledFallback ? 'Enabled' : 'Disabled'} · Min threshold: {activeProfile.ocrSettings.minTextLengthThreshold} chars
-              </div>
             </div>
-          </div>
-
-          {/* Configured Fields Chips */}
-          <div className="space-y-1.5 pt-2">
-            <span className="text-xs font-semibold text-neutral-700 block">
-              Configured Target Fields ({activeProfile.fields.length})
-            </span>
-            <div className="flex flex-wrap gap-2">
-              {activeProfile.fields.map((f) => (
-                <div
-                  key={f.id}
-                  className="px-2.5 py-1 rounded bg-neutral-100 text-neutral-800 text-xs flex items-center gap-1.5"
-                >
-                  <span className="font-medium">{f.name}</span>
-                  <span className="text-[10px] text-neutral-500 font-mono">
-                    [{f.type}]
-                  </span>
-                  {f.required && (
-                    <span className="text-[10px] text-rose-600 font-semibold">*</span>
-                  )}
-                </div>
-              ))}
+          ) : (
+            <div className="flex flex-wrap items-center gap-2 p-3 rounded-lg border border-neutral-200 bg-neutral-50 text-xs">
+              <LayoutTemplate className="w-4 h-4 text-neutral-600" />
+              <span className="font-semibold text-neutral-800">
+                Default profile: {jobProfile?.name ?? "None"}
+              </span>
+              <span className="text-neutral-500">
+                Fixed once the batch is analysed. Change it before analyzing to
+                rebuild the assignments.
+              </span>
             </div>
-          </div>
+          )}
 
-          {/* Interactive Live Regex Tester on Discovered Filenames */}
-          {showRegexTester && (
-            <div className="p-4 rounded-lg bg-neutral-900 text-neutral-200 space-y-3 font-mono text-xs">
-              <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
-                <span className="font-bold text-white">
-                  Live Filename Regex Matches on Discovered Files
-                </span>
-                <span className="text-[11px] text-neutral-400">
-                  Testing against {archiveResult.pdfFiles.slice(0, 3).length} sample files
-                </span>
-              </div>
+          {assignmentError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+              <span>{assignmentError}</span>
+            </div>
+          )}
 
-              <div className="space-y-3 max-h-60 overflow-y-auto">
-                {archiveResult.pdfFiles.slice(0, 4).map((file) => (
-                  <div key={file.id} className="p-2.5 bg-neutral-800 rounded space-y-1.5">
-                    <div className="text-amber-400 font-bold truncate">
-                      Filename: {file.filename}
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
-                      {activeProfile.fields
-                        .filter((f) => f.filenameRules.enabled)
-                        .map((f) => {
-                          const res = extractFromFilename(file.filename, f);
-                          return (
-                            <div key={f.id} className="flex items-center gap-1.5 truncate">
-                              <span className="text-neutral-400">{f.name}:</span>
-                              {res.value ? (
-                                <span className="text-emerald-400 font-bold bg-emerald-950/80 px-1.5 py-0.5 rounded">
-                                  {res.value}
-                                </span>
-                              ) : (
-                                <span className="text-neutral-500 italic">No regex match</span>
-                              )}
+          {hasAnalyzed && (
+            <div className="space-y-3 animate-in fade-in">
+              <div className="overflow-x-auto border border-neutral-200 rounded-lg">
+                <table className="w-full text-xs text-left">
+                  <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-600 font-semibold">
+                    <tr>
+                      <th className="px-4 py-2">Filename</th>
+                      <th className="px-4 py-2">Profile</th>
+                      <th className="px-4 py-2">Status</th>
+                      <th className="px-4 py-2">Confidence / Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {assignments.length === 0 ? (
+                      <tr>
+                        <td
+                          colSpan={4}
+                          className="p-6 text-center text-neutral-400"
+                        >
+                          No assignments found.
+                        </td>
+                      </tr>
+                    ) : (
+                      assignments.map((asgn) => (
+                        <tr key={asgn.id} className="hover:bg-neutral-50">
+                          <td className="px-4 py-2 font-medium text-neutral-900 truncate max-w-xs">
+                            {asgn.filename}
+                          </td>
+                          <td className="px-4 py-2">
+                            <select
+                              value={asgn.profileId || ""}
+                              onChange={(e) =>
+                                handleUpdateAssignment(asgn.id, {
+                                  profileId: e.target.value || null,
+                                })
+                              }
+                              className="w-full px-2 py-1 bg-white border border-neutral-300 rounded text-xs focus:ring-1 focus:ring-neutral-900"
+                            >
+                              <option value="">No Profile / Exclude</option>
+                              {profiles.map((p) => (
+                                <option key={p.id} value={p.id}>
+                                  {p.name}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td className="px-4 py-2">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${asgn.assignmentStatus === "assigned"
+                                  ? "bg-emerald-100 text-emerald-800"
+                                  : asgn.assignmentStatus === "ambiguous"
+                                    ? "bg-amber-100 text-amber-800"
+                                    : asgn.assignmentStatus === "excluded"
+                                      ? "bg-neutral-100 text-neutral-800"
+                                      : "bg-rose-100 text-rose-800"
+                                }`}
+                            >
+                              {asgn.assignmentStatus}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-neutral-500">
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono font-bold text-neutral-700">
+                                {Math.round(
+                                  (asgn.assignmentConfidence || 0) * 100,
+                                )}
+                                %
+                              </span>
+                              <span className="truncate max-w-xs">
+                                {asgn.assignmentReason}
+                              </span>
                             </div>
-                          );
-                        })}
-                    </div>
-                  </div>
-                ))}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleAnalyzeDocuments}
+                  className="text-xs text-neutral-600 hover:text-neutral-900 flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>Re-analyze</span>
+                </button>
               </div>
             </div>
           )}
@@ -872,13 +1213,15 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
           {/* Step 4: Start Processing Button */}
           <div className="pt-4 border-t border-neutral-200 flex items-center justify-between">
             <span className="text-xs text-neutral-500">
-              Ready to process {archiveResult.pdfFiles.length} PDF documents with &quot;{activeProfile.name}&quot;.
+              {hasAnalyzed
+                ? `Ready to process ${archiveResult.pdfFiles.length} PDF documents with confirmed assignments.`
+                : "Please analyze documents before starting the pipeline."}
             </span>
             <button
               type="button"
               onClick={handleStart}
-              disabled={isProcessing}
-              className="flex items-center gap-2 px-5 py-2.5 text-xs font-bold text-white bg-neutral-900 hover:bg-neutral-800 rounded-md transition-colors shadow-xs"
+              disabled={isProcessing || !hasAnalyzed}
+              className="flex items-center gap-2 px-5 py-2.5 text-xs font-bold text-white bg-neutral-900 hover:bg-neutral-800 rounded-md transition-colors shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Play className="w-4 h-4 fill-current" />
               <span>Start Extraction Pipeline</span>
@@ -886,7 +1229,6 @@ export const JobSetupView: React.FC<JobSetupViewProps> = ({
           </div>
         </div>
       )}
-
     </div>
   );
 };

@@ -10,9 +10,46 @@ import {
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   timeout: 120_000,
+  // Ensures the csrftoken cookie is sent even when the API base URL is
+  // cross-origin in dev (e.g. VITE_API_BASE_URL=https://api.local).
+  withCredentials: true,
 });
 
+// ---------------------------------------------------------------------------
+// CSRF handling
+//
+// Django's CsrfViewMiddleware rejects unsafe requests (POST/PUT/PATCH/DELETE)
+// unless the X-CSRFToken header matches the csrftoken cookie. Axios does not
+// copy cookie values into headers automatically, so do it here once for every
+// mutating request instead of per-call.
+//
+// If CSRF_COOKIE_HTTPONLY=True on the server, document.cookie will not expose
+// the token and this will silently send nothing. In that case, fetch the token
+// from a dedicated endpoint instead.
+// ---------------------------------------------------------------------------
+function getCookie(name: string): string | null {
+  const match = document.cookie.match(
+    new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + '=([^;]*)')
+  );
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+api.interceptors.request.use((config) => {
+  const method = (config.method || 'get').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    const token = getCookie('csrftoken');
+    if (token) {
+      config.headers = config.headers ?? {};
+      // Axios v1 AxiosHeaders accepts a plain object or set() — both work.
+      (config.headers as Record<string, string>)['X-CSRFToken'] = token;
+    }
+  }
+  return config;
+});
+
+
 export async function listProfiles(): Promise<ExtractionProfile[]> {
+  console.log("Hit listprofiles function")
   const response = await api.get<ExtractionProfile[]>('/profiles/');
   return response.data;
 }
@@ -156,6 +193,31 @@ export async function startJob(jobId: string): Promise<ProcessingJob> {
 export async function getJob(jobId: string): Promise<ProcessingJob> {
   const response = await api.get<ProcessingJob>(
     `/jobs/${encodeURIComponent(jobId)}/`
+  );
+  return response.data;
+}
+
+export async function assignJobProfiles(jobId: string): Promise<{ detail: string }> {
+  const response = await api.post<{ detail: string }>(
+    `/jobs/${encodeURIComponent(jobId)}/assign/`
+  );
+  return response.data;
+}
+
+export async function getJobAssignments(jobId: string): Promise<any[]> {
+  const response = await api.get<any[]>(
+    `/jobs/${encodeURIComponent(jobId)}/assignments/`
+  );
+  return response.data;
+}
+
+export async function updateDocumentAssignment(
+  documentId: string,
+  update: { profileId?: string | null; assignmentStatus?: string }
+): Promise<PDFDocumentRecord> {
+  const response = await api.patch<PDFDocumentRecord>(
+    `/documents/${encodeURIComponent(documentId)}/`,
+    update
   );
   return response.data;
 }

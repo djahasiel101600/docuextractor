@@ -23,9 +23,28 @@ import {
   Download,
   LayoutTemplate,
   Eye,
+  Ban,
 } from 'lucide-react';
 import { PDFDocumentRecord, ExtractionProfile, FieldDefinition } from '../../types/extraction';
 import { renderPdfPageToCanvas } from '../../services/pdfService';
+
+const ASSIGNMENT_BADGE_LABEL: Record<PDFDocumentRecord['assignmentStatus'], string> = {
+  legacy: 'Job default',
+  assigned: 'Auto-assigned',
+  manual: 'Manual override',
+  ambiguous: 'Ambiguous match',
+  unassigned: 'Unassigned',
+  excluded: 'Excluded',
+};
+
+const ASSIGNMENT_BADGE_STYLES: Record<PDFDocumentRecord['assignmentStatus'], string> = {
+  legacy: 'border-neutral-200 bg-neutral-50 text-neutral-600',
+  assigned: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+  manual: 'border-blue-200 bg-blue-50 text-blue-800',
+  ambiguous: 'border-amber-200 bg-amber-50 text-amber-900',
+  unassigned: 'border-rose-200 bg-rose-50 text-rose-700',
+  excluded: 'border-neutral-300 bg-neutral-200 text-neutral-700',
+};
 
 interface DocumentInspectorModalProps {
   document: PDFDocumentRecord;
@@ -60,6 +79,14 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
   const activeField: FieldDefinition | undefined = profile.fields.find((f) => f.id === activeFieldId);
   const activeDiagnostic = doc.diagnostics[activeFieldId];
   const currentValue = doc.finalValues[activeFieldId] || activeDiagnostic?.finalValue || '';
+
+  // A batch can mix profiles, so the fields offered here must belong to the
+  // profile this document was actually extracted with.
+  useEffect(() => {
+    if (!profile.fields.some((field) => field.id === activeFieldId)) {
+      setActiveFieldId(profile.fields[0]?.id || '');
+    }
+  }, [profile.fields, activeFieldId]);
 
   useEffect(() => {
     setEditingValue(currentValue);
@@ -164,9 +191,26 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   </span>
                 )}
               </div>
-              <p className="text-xs text-neutral-500 font-mono">
-                {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount} page(s) · Method: {doc.extractionMethodUsed}
-              </p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <p className="text-xs text-neutral-500 font-mono">
+                  {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount} page(s) · Method: {doc.extractionMethodUsed}
+                </p>
+                <span
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-200 bg-white text-[10px] font-semibold text-neutral-700"
+                  title={doc.assignmentRule || doc.assignmentReason || 'Extraction Profile used for this document'}
+                >
+                  <LayoutTemplate className="w-3 h-3" />
+                  {doc.profileName ||
+                    (doc.profileId ? profile.name : 'No profile assigned')}
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-semibold ${ASSIGNMENT_BADGE_STYLES[doc.assignmentStatus]}`}
+                  title={doc.assignmentReason || undefined}
+                >
+                  {doc.assignmentStatus === 'excluded' && <Ban className="w-3 h-3" />}
+                  {ASSIGNMENT_BADGE_LABEL[doc.assignmentStatus]}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -460,6 +504,16 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
 
             {/* Diagnostic Details Scrollable Panel */}
             <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              {doc.processingStatus === 'excluded' && (
+                <div
+                  role="status"
+                  className="rounded-lg border border-neutral-300 bg-neutral-100 px-4 py-3 text-xs text-neutral-700"
+                >
+                  <span className="font-semibold">Excluded from processing: </span>
+                  This document was intentionally skipped, so no fields were extracted for{' '}
+                  {profile.name}. {doc.assignmentReason}
+                </div>
+              )}
               {doc.errorDetails && (
                 <div
                   role="alert"

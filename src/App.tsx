@@ -171,6 +171,7 @@ export default function App() {
     total: number;
     completed: number;
     failed: number;
+    skipped: number;
     currentFile: string;
     uploadPercent: number;
     remaining: number;
@@ -247,6 +248,7 @@ export default function App() {
           total: progress.totalDiscovered,
           completed: progress.processedCount,
           failed: progress.failedCount,
+          skipped: progress.skippedCount ?? 0,
           currentFile:
             progress.currentProcessingFiles.join(', ') ||
             'Preparing next document...',
@@ -286,9 +288,22 @@ export default function App() {
     profiles[0] ||
     DEFAULT_PROFILES[0];
 
+  // The inspector must open the profile this document was actually extracted
+  // with. A batch can mix profiles, so the document's own assignment wins and
+  // the job default is only the fallback the backend pipeline itself uses.
+  const inspectingDocJob = inspectingDoc
+    ? jobs.find((job) => job.documents.some((item) => item.id === inspectingDoc.id))
+    : undefined;
+  const inspectingProfile =
+    (inspectingDoc &&
+      (profiles.find((profile) => profile.id === inspectingDoc.profileId) ||
+        profiles.find((profile) => profile.id === inspectingDocJob?.profileId))) ||
+    activeProfile;
+
   const handleStartProcessing = async (
     archiveResult: ArchiveDiscoveryResult,
-    profile: ExtractionProfile
+    profile: ExtractionProfile,
+    existingJobId?: string
   ) => {
     setWorkspaceError(null);
     setIsProcessing(true);
@@ -297,6 +312,7 @@ export default function App() {
       total: archiveResult.pdfFiles.length,
       completed: 0,
       failed: 0,
+      skipped: 0,
       currentFile: 'Uploading archive to the local processing service...',
       uploadPercent: 0,
       remaining: archiveResult.pdfFiles.length,
@@ -308,6 +324,30 @@ export default function App() {
     });
 
     try {
+      // When documents were already analysed, an idle batch job was created
+      // up-front. Just start that existing job instead of creating a duplicate.
+      if (existingJobId) {
+        const started = await startJob(existingJobId);
+        setJobs((current) => [
+          started,
+          ...current.filter((existing) => existing.id !== started.id),
+        ]);
+        setActiveJobId(started.id);
+        setActiveTab('results');
+        if (started.status !== 'running') {
+          const detail = await getJob(started.id);
+          setJobs((current) =>
+            current.map((existing) => (existing.id === detail.id ? detail : existing))
+          );
+          setIsProcessing(false);
+          setProcessingProgress(null);
+          if (detail.status === 'error') {
+            setWorkspaceError('The archive processing job failed. Review the job details for documents that could not be processed.');
+          }
+        }
+        return;
+      }
+
       const batchArchives = archiveResult.sourceArchives ?? [];
       if (batchArchives.length > 1) {
         await handleStartBatchProcessing(archiveResult, profile, batchArchives);
@@ -654,7 +694,9 @@ export default function App() {
           (runningJobId || processingProgress.phase === 'uploading') &&
           (() => {
             const p = processingProgress;
-            const processedCount = p.completed + p.failed;
+            // Excluded documents never enter the extraction queue, so they have
+            // to count as settled or the bar would stall short of 100%.
+            const processedCount = p.completed + p.failed + p.skipped;
             const percent =
               p.phase === 'uploading'
                 ? p.uploadPercent
@@ -700,7 +742,8 @@ export default function App() {
                 </div>
                 {p.phase === 'processing' && (
                   <p className="mt-2 text-[11px] text-neutral-500 font-mono">
-                    Completed {p.completed} · Failed {p.failed} · Remaining{' '}
+                    Completed {p.completed} · Failed {p.failed} ·{' '}
+                    {p.skipped > 0 ? `Skipped ${p.skipped} · ` : ''}Remaining{' '}
                     {p.remaining} · Workers {p.workerCount} · Elapsed{' '}
                     {formatDuration(p.elapsedSeconds)} · Avg{' '}
                     {formatDuration(p.averageSecondsPerDocument)}/doc. Results
@@ -754,7 +797,7 @@ export default function App() {
             {activeJob ? (
               <ResultsTableView
                 job={activeJob}
-                profile={profiles.find((profile) => profile.id === activeJob.profileId) || activeProfile}
+                profiles={profiles}
                 onInspectDocument={handleInspectDocument}
                 onToggleReviewed={handleToggleReviewed}
                 onUpdateFieldValue={handleUpdateFieldValue}
@@ -817,11 +860,9 @@ export default function App() {
           }
         >
           <DocumentInspectorModal
+            key={inspectingDoc.id}
             document={inspectingDoc}
-            profile={
-              profiles.find((profile) => profile.id === (activeJob?.profileId || selectedProfileId)) ||
-              activeProfile
-            }
+            profile={inspectingProfile}
             onClose={() => setInspectingDoc(null)}
             onUpdateFieldValue={handleUpdateFieldValue}
             onToggleReviewed={handleToggleReviewed}
@@ -833,6 +874,7 @@ export default function App() {
         <CsvExportModal
           job={exportTargetJob}
           profile={profiles.find((profile) => profile.id === exportTargetJob.profileId) || activeProfile}
+          profiles={profiles}
           onClose={() => {
             setIsExportModalOpen(false);
             setExportJobOverride(null);

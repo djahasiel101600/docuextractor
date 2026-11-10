@@ -182,10 +182,19 @@ export interface PDFDocumentRecord {
   processingMetrics?: Record<string, number | number[]>;
 
   // Status
-  processingStatus: 'pending' | 'processing' | 'completed' | 'failed';
+  processingStatus: 'pending' | 'processing' | 'completed' | 'failed' | 'excluded';
   errorDetails?: string;
   isEncryptedOrCorrupted?: boolean;
   extractionMethodUsed: 'NATIVE_PDF_TEXT' | 'OCR_EXTRACTED' | 'AI_EXTRACTED' | 'FAILED';
+
+  // Assignment Metadata
+  profileId: string | null;
+  profileName?: string | null;
+  assignmentStatus: 'legacy' | 'assigned' | 'manual' | 'ambiguous' | 'unassigned' | 'excluded';
+  assignmentMethod?: string;
+  assignmentRule?: string;
+  assignmentConfidence?: number;
+  assignmentReason?: string;
 
   // Extracted raw data
   rawFilenameText: string;
@@ -215,6 +224,16 @@ export interface PDFDocumentRecord {
   fileUrl?: string;
 }
 
+export interface DocumentAssignment {
+  id: string;
+  filename: string;
+  profileId: string | null;
+  profileName: string | null;
+  assignmentStatus: 'legacy' | 'assigned' | 'manual' | 'ambiguous' | 'unassigned' | 'excluded';
+  assignmentConfidence: number;
+  assignmentReason: string;
+}
+
 export interface ProcessingJob {
   id: string;
   name: string;
@@ -228,6 +247,7 @@ export interface ProcessingJob {
   totalDiscovered: number;
   processedCount: number;
   failedCount: number;
+  skippedCount: number;
   reviewRequiredCount: number;
   conflictCount: number;
   missingCount: number;
@@ -245,6 +265,7 @@ export interface ProcessingJobProgress {
   totalDiscovered: number;
   processedCount: number;
   failedCount: number;
+  skippedCount: number;
   currentProcessingFile: string;
   currentProcessingFiles: string[];
   remainingCount: number;

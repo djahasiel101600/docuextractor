@@ -25,11 +25,12 @@ import {
   ExtractionProfile,
   PDFDocumentRecord,
   FieldDiagnostic,
+  FieldDefinition,
 } from '../../types/extraction';
 
 interface ResultsTableViewProps {
   job: ProcessingJob;
-  profile: ExtractionProfile;
+  profiles: ExtractionProfile[];
   onInspectDocument: (doc: PDFDocumentRecord) => void;
   onToggleReviewed: (docId: string) => void;
   onUpdateFieldValue: (docId: string, fieldId: string, newValue: string) => void;
@@ -38,9 +39,11 @@ interface ResultsTableViewProps {
 
 type FilterCategory = 'all' | 'review' | 'conflicts' | 'missing' | 'invalid' | 'reviewed';
 
+type ProfileFilter = 'all' | string;
+
 export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   job,
-  profile,
+  profiles,
   onInspectDocument,
   onToggleReviewed,
   onUpdateFieldValue,
@@ -50,17 +53,70 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   const [activeFilter, setActiveFilter] = useState<FilterCategory>('all');
   const [sortField, setSortField] = useState<string>('filename');
   const [sortAsc, setSortAsc] = useState<boolean>(true);
+  const [profileFilter, setProfileFilter] = useState<ProfileFilter>('all');
 
   // Inline quick-editing state: { docId, fieldId }
   const [editingCell, setEditingCell] = useState<{ docId: string; fieldId: string } | null>(null);
   const [inlineValue, setInlineValue] = useState<string>('');
 
-  // Calculate high-level summary metrics across the documents
+  // Profile filter options: 'All Profiles' (union) plus each individual profile
+  const profileOptions = useMemo(
+    () => [
+      { id: 'all', name: 'All Profiles' },
+      ...profiles.map((p) => ({ id: p.id, name: p.name })),
+    ],
+    [profiles]
+  );
+
+  // The single profile selected in the filter, or null when 'All Profiles' is active
+  const activeProfile = useMemo(
+    () => (profileFilter === 'all' ? null : profiles.find((p) => p.id === profileFilter) || null),
+    [profiles, profileFilter]
+  );
+
+  // Active field columns based on the profile filter.
+  // 'All Profiles' -> union of every field across all profiles (deduped by id, first-seen order)
+  // Single profile -> only that profile's fields
+  const activeFields = useMemo<FieldDefinition[]>(() => {
+    if (activeProfile) {
+      return activeProfile.fields;
+    }
+    const seen = new Set<string>();
+    const fields: FieldDefinition[] = [];
+    for (const p of profiles) {
+      for (const f of p.fields) {
+        if (!seen.has(f.id)) {
+          seen.add(f.id);
+          fields.push(f);
+        }
+      }
+    }
+    return fields;
+  }, [profiles, activeProfile]);
+
+  // Get the ExtractionProfile assigned to a specific document. The document's
+  // own assignment wins; the job-level default is only the fallback the
+  // pipeline itself uses. Never invent a profile: an unresolved document must
+  // read as unassigned instead of borrowing an unrelated one.
+  const getDocProfile = (doc: PDFDocumentRecord) =>
+    profiles.find((p) => p.id === doc.profileId) ||
+    profiles.find((p) => p.id === job.profileId) ||
+    null;
+
+  // Get the field definitions applicable to a document (from its own assigned profile)
+  const getDocFields = (doc: PDFDocumentRecord) => {
+    const p = getDocProfile(doc);
+    return p ? p.fields : [];
+  };
+
+  // Calculate high-level summary metrics across the documents.
+  // Each document is evaluated against its own assigned profile's field config.
   const summaryMetrics = useMemo(() => {
     let totalDocs = job.documents.length;
     let completed = 0;
     let errors = 0;
     let queued = 0;
+    let excluded = 0;
     let reviewRequired = 0;
     let conflicts = 0;
     let missingFields = 0;
@@ -83,12 +139,20 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
         errors++;
         continue;
       }
+      // Excluded documents were never extracted, so they belong to no quality
+      // KPI and are not counted as processed.
+      if (doc.processingStatus === 'excluded') {
+        excluded++;
+        continue;
+      }
       completed++;
       if (!doc.isReviewed) reviewRequired++;
       if (doc.extractionMethodUsed === 'OCR_EXTRACTED') ocrUsed++;
       if (doc.extractionMethodUsed === 'AI_EXTRACTED') aiUsed++;
 
-      for (const field of profile.fields) {
+      // Use this document's own assigned profile for field config
+      const docFields = getDocFields(doc);
+      for (const field of docFields) {
         const diag = doc.diagnostics[field.id];
         if (!diag) continue;
         if (diag.isConflict) conflicts++;
@@ -102,6 +166,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       completed,
       errors,
       queued,
+      excluded,
       reviewRequired,
       conflicts,
       missingFields,
@@ -109,7 +174,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       ocrUsed,
       aiUsed,
     };
-  }, [job.documents, profile.fields]);
+  }, [job.documents, profiles]);
 
   // Filter documents
   const filteredDocuments = useMemo(() => {
@@ -133,7 +198,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       if (
         activeFilter !== 'all' &&
         (doc.processingStatus === 'pending' ||
-          doc.processingStatus === 'processing')
+          doc.processingStatus === 'processing' ||
+          doc.processingStatus === 'excluded')
       ) {
         return false;
       }
@@ -148,7 +214,9 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       }
       if (activeFilter === 'missing') {
         return Object.values(doc.diagnostics).some(
-          (d) => d.status === 'NOT_FOUND' && profile.fields.find((f) => f.id === d.fieldId)?.required
+          (d) =>
+            d.status === 'NOT_FOUND' &&
+            getDocFields(doc).find((f) => f.id === d.fieldId)?.required
         );
       }
       if (activeFilter === 'invalid') {
@@ -160,7 +228,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
 
       return true;
     });
-  }, [job.documents, searchQuery, activeFilter, profile.fields]);
+  }, [job.documents, searchQuery, activeFilter, profiles]);
 
   // Sort documents
   const sortedDocuments = useMemo(() => {
@@ -174,6 +242,9 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       } else if (sortField === 'path') {
         valA = a.relativePath;
         valB = b.relativePath;
+      } else if (sortField === 'profile') {
+        valA = getDocProfile(a)?.name || '';
+        valB = getDocProfile(b)?.name || '';
       } else {
         valA = a.finalValues[sortField] || '';
         valB = b.finalValues[sortField] || '';
@@ -182,7 +253,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       const cmp = valA.localeCompare(valB, undefined, { numeric: true, sensitivity: 'base' });
       return sortAsc ? cmp : -cmp;
     });
-  }, [filteredDocuments, sortField, sortAsc]);
+  }, [filteredDocuments, sortField, sortAsc, profiles]);
 
   const handleSort = (fieldId: string) => {
     if (sortField === fieldId) {
@@ -207,7 +278,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
 
   const handleBatchMarkReviewed = () => {
     for (const doc of filteredDocuments) {
-      if (!doc.isReviewed) {
+      if (!doc.isReviewed && doc.processingStatus !== 'excluded') {
         onToggleReviewed(doc.id);
       }
     }
@@ -231,12 +302,23 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
             <p className="text-xs text-neutral-500 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
               <span>
                 Profile:{' '}
-                <span className="font-medium text-neutral-800">{profile.name}</span>
+                {activeProfile ? (
+                  <span className="font-medium text-neutral-800">{activeProfile.name}</span>
+                ) : (
+                  <span className="font-medium text-neutral-800">
+                    All Profiles ({profiles.length})
+                  </span>
+                )}
               </span>
               <span>
                 · {summaryMetrics.completed} of{' '}
                 {job.totalDiscovered || job.documents.length} processed
               </span>
+              {summaryMetrics.excluded > 0 && (
+                <span className="text-neutral-500">
+                  · {summaryMetrics.excluded} excluded from processing
+                </span>
+              )}
               {job.status === 'running' && (
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
                   <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-emerald-300 border-t-emerald-700 animate-spin" />
@@ -244,6 +326,24 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                 </span>
               )}
             </p>
+
+            {/* Profile Column Filter Dropdown */}
+            <div className="mt-3 flex items-center gap-2">
+              <label className="text-[10px] uppercase tracking-wider text-neutral-400 font-medium">
+                Profile Columns
+              </label>
+              <select
+                value={profileFilter}
+                onChange={(e) => setProfileFilter(e.target.value as ProfileFilter)}
+                className="text-xs bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-hidden focus:ring-2 focus:ring-neutral-900"
+              >
+                {profileOptions.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.name}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
@@ -402,6 +502,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
             <thead>
               <tr className="bg-neutral-50/80 border-b border-neutral-200 text-neutral-600 font-semibold select-none">
                 <th className="py-2.5 px-3 w-10 text-center">Status</th>
+                <th className="py-2.5 px-3 w-20 text-center">Profile</th>
                 <th
                   onClick={() => handleSort('filename')}
                   className="py-2.5 px-3 cursor-pointer hover:text-neutral-900 whitespace-nowrap"
@@ -422,7 +523,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                 </th>
 
                 {/* Profile Field Columns */}
-                {profile.fields.map((field) => (
+                {activeFields.map((field) => (
                   <th
                     key={field.id}
                     onClick={() => handleSort(field.id)}
@@ -442,7 +543,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
               {sortedDocuments.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={profile.fields.length + 4}
+                    colSpan={activeFields.length + 5}
                     className="py-12 text-center text-neutral-500 text-xs"
                   >
                     No documents found matching the active filter and search terms.
@@ -450,13 +551,17 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                 </tr>
               ) : (
                 sortedDocuments.map((doc) => {
+                  const docProfile = getDocProfile(doc);
                   const hasConflict = Object.values(doc.diagnostics).some((d) => d.isConflict);
                   const isPending =
                     doc.processingStatus === 'pending' ||
                     doc.processingStatus === 'processing';
+                  const isExcluded = doc.processingStatus === 'excluded';
                   const hasProcessingWarning = Boolean(doc.errorDetails);
                   const hasMissingRequired = Object.values(doc.diagnostics).some(
-                    (d) => d.status === 'NOT_FOUND' && profile.fields.find((f) => f.id === d.fieldId)?.required
+                    (d) =>
+                      d.status === 'NOT_FOUND' &&
+                      getDocFields(doc).find((f) => f.id === d.fieldId)?.required
                   );
                   const isOcrOrAi =
                     doc.extractionMethodUsed === 'OCR_EXTRACTED' ||
@@ -466,7 +571,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                   return (
                     <tr
                       key={doc.id}
-                      className={`transition-colors group ${isPending ? 'opacity-60' : 'hover:bg-neutral-50/70'}`}
+                      className={`transition-colors group ${isPending || isExcluded ? 'opacity-60' : 'hover:bg-neutral-50/70'}`}
                     >
                       {/* Status Icon */}
                       <td className="py-2.5 px-3 text-center">
@@ -485,6 +590,13 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                                 : 'border-neutral-200'
                                 }`}
                             />
+                          </span>
+                        ) : isExcluded ? (
+                          <span
+                            title="Excluded from processing by the user"
+                            className="inline-flex items-center justify-center"
+                          >
+                            <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-dashed border-neutral-400" />
                           </span>
                         ) : hasProcessingWarning ? (
                           <span
@@ -526,6 +638,21 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         )}
                       </td>
 
+                      {/* Profile Column */}
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <span
+                          className="inline-flex items-center gap-1.5 text-xs font-medium"
+                        >
+                          <span className="w-2 h-2 rounded-full shrink-0 bg-neutral-200" />
+                          <span
+                            className={`truncate max-w-[120px] ${docProfile ? 'text-neutral-700' : 'text-rose-600'}`}
+                            title={doc.assignmentReason || undefined}
+                          >
+                            {docProfile?.name || doc.profileName || 'Unassigned'}
+                          </span>
+                        </span>
+                      </td>
+
                       {/* Filename */}
                       <td className="py-2.5 px-3 font-medium text-neutral-900 whitespace-nowrap max-w-xs truncate">
                         <button
@@ -543,7 +670,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                       </td>
 
                       {/* Field Value Cells with Status Tinting & Inline Edit */}
-                      {profile.fields.map((field) => {
+                      {activeFields.map((field) => {
                         const diag = doc.diagnostics[field.id];
                         const val = doc.finalValues[field.id] || diag?.finalValue || '';
                         const isConflictCell = diag?.isConflict;
@@ -555,8 +682,27 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         const isAiCell = diag?.source === 'ai';
                         const isFormCell = diag?.source === 'form_field';
 
+                        // Check if this field belongs to the document's assigned profile
+                        const docFields = getDocFields(doc);
+                        const fieldAppliesToDoc = docFields.some((f) => f.id === field.id);
+
                         const isCurrentlyEditing =
                           editingCell?.docId === doc.id && editingCell?.fieldId === field.id;
+
+                        // Excluded documents were never extracted, so there is
+                        // no value to show or edit.
+                        if (isExcluded) {
+                          return (
+                            <td key={field.id} className="py-2.5 px-3 whitespace-nowrap">
+                              <span
+                                className="text-[11px] italic text-neutral-400"
+                                title="Excluded from processing - no extraction was run"
+                              >
+                                —
+                              </span>
+                            </td>
+                          );
+                        }
 
                         if (isCurrentlyEditing) {
                           return (
@@ -598,13 +744,15 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                             <div className="flex items-center gap-1.5">
                               {val ? (
                                 <span
-                                  className={`font-mono text-xs ${isConflictCell
-                                    ? 'text-amber-800 font-semibold bg-amber-50 px-1.5 py-0.5 rounded'
-                                    : isInvalidCell
-                                      ? 'text-rose-800 font-semibold bg-rose-50 px-1.5 py-0.5 rounded'
-                                      : isCorrected
-                                        ? 'text-blue-800 font-medium'
-                                        : 'text-neutral-800'
+                                  className={`font-mono text-xs ${!fieldAppliesToDoc
+                                    ? 'text-neutral-500 opacity-60'
+                                    : isConflictCell
+                                      ? 'text-amber-800 font-semibold bg-amber-50 px-1.5 py-0.5 rounded'
+                                      : isInvalidCell
+                                        ? 'text-rose-800 font-semibold bg-rose-50 px-1.5 py-0.5 rounded'
+                                        : isCorrected
+                                          ? 'text-blue-800 font-medium'
+                                          : 'text-neutral-800'
                                     }`}
                                   title={diag?.explanation || val}
                                 >
@@ -612,10 +760,17 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                                 </span>
                               ) : (
                                 <span
-                                  className={`text-[11px] italic ${field.required ? 'text-rose-500 font-medium' : 'text-neutral-400'
+                                  className={`text-[11px] italic ${!fieldAppliesToDoc
+                                    ? 'text-neutral-400'
+                                    : field.required ? 'text-rose-500 font-medium' : 'text-neutral-400'
                                     }`}
+                                  title={
+                                    !fieldAppliesToDoc
+                                      ? 'Field not in this document\'s assigned profile'
+                                      : diag?.explanation || val
+                                  }
                                 >
-                                  {field.required ? 'Missing' : '—'}
+                                  {!fieldAppliesToDoc ? 'N/A' : field.required ? 'Missing' : '—'}
                                 </span>
                               )}
 

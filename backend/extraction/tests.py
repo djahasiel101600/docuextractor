@@ -462,7 +462,8 @@ class ExtractionApiTests(APITestCase):
 
     def test_batch_upload_aggregates_archives_into_single_job(self):
         self.create_profile()
-        zip_one = create_zip([("a1.pdf", create_pdf()), ("a2.pdf", create_pdf())])
+        zip_one = create_zip(
+            [("a1.pdf", create_pdf()), ("a2.pdf", create_pdf())])
         zip_two = create_zip([("b1.pdf", create_pdf())])
         with patch(
             "extraction.views.launch_job_processing", side_effect=process_job
@@ -581,6 +582,195 @@ class ExtractionApiTests(APITestCase):
         self.assertIn("No archives", started.data["detail"])
         # The empty job is removed instead of lingering as an orphan.
         self.assertFalse(ProcessingJob.objects.filter(pk=job_id).exists())
+
+    def test_job_documents_expose_the_profile_used_for_extraction(self):
+        profile = self.create_profile()
+        upload = create_zip([("application.pdf", create_pdf())])
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            response = self.client.post(
+                "/api/jobs/",
+                {
+                    "profileId": "test-profile",
+                    "file": SimpleUploadedFile(
+                        "documents.zip", upload, "application/zip"),
+                },
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 202, response.data)
+
+        detail = self.client.get(f"/api/jobs/{response.data['id']}/").data
+        document = detail["documents"][0]
+        # The pipeline persists the profile it actually used so every consumer
+        # can resolve it per document instead of guessing from the job default.
+        self.assertEqual(document["profileId"], profile["id"])
+        self.assertEqual(document["profileName"], profile["name"])
+        self.assertEqual(document["assignmentStatus"], "legacy")
+        self.assertEqual(document["assignmentMethod"], "job_default")
+        self.assertEqual(detail["skippedCount"], 0)
+
+    def test_excluded_documents_are_skipped_instead_of_processed(self):
+        self.create_profile()
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            created = self.client.post(
+                "/api/jobs/batch/",
+                {"profileId": "test-profile"},
+                format="json",
+            )
+            job_id = created.data["id"]
+            upload = create_zip(
+                [("keep.pdf", create_pdf()), ("skip.pdf", create_pdf())]
+            )
+            appended = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {"file": SimpleUploadedFile(
+                    "batch.zip", upload, "application/zip")},
+                format="multipart",
+            )
+            self.assertEqual(appended.status_code, 200, appended.data)
+
+            assignments = {
+                item["filename"]: item
+                for item in self.client.get(
+                    f"/api/jobs/{job_id}/assignments/").data
+            }
+            excluded = self.client.patch(
+                f"/api/documents/{assignments['skip.pdf']['id']}/",
+                {"profileId": None},
+                format="json",
+            )
+            self.assertEqual(excluded.status_code, 200, excluded.data)
+            self.assertEqual(excluded.data["assignmentStatus"], "excluded")
+
+            started = self.client.post(
+                f"/api/jobs/{job_id}/start/", {}, format="json")
+            self.assertEqual(started.status_code, 202, started.data)
+
+        detail = self.client.get(f"/api/jobs/{job_id}/").data
+        # An all-skipped or partly-skipped batch is a success, not an error.
+        self.assertEqual(detail["status"], "completed")
+        self.assertEqual(detail["processedCount"], 1)
+        self.assertEqual(detail["failedCount"], 0)
+        self.assertEqual(detail["skippedCount"], 1)
+
+        statuses = {
+            document["filename"]: document["processingStatus"]
+            for document in detail["documents"]
+        }
+        self.assertEqual(statuses["keep.pdf"], "completed")
+        self.assertEqual(statuses["skip.pdf"], "excluded")
+        skipped = next(
+            document for document in detail["documents"]
+            if document["filename"] == "skip.pdf"
+        )
+        self.assertIsNone(skipped["profileId"])
+        self.assertEqual(skipped["finalValues"], {})
+
+        progress = self.client.get(f"/api/jobs/{job_id}/progress/").data
+        self.assertEqual(progress["skippedCount"], 1)
+        self.assertEqual(progress["remainingCount"], 0)
+
+    def test_reanalysis_preserves_manual_assignments_and_exclusions(self):
+        self.create_profile()
+        created = self.client.post(
+            "/api/jobs/batch/", {"profileId": "test-profile"}, format="json"
+        )
+        job_id = created.data["id"]
+        upload = create_zip([("application.pdf", create_pdf())])
+        appended = self.client.post(
+            f"/api/jobs/{job_id}/archives/",
+            {"file": SimpleUploadedFile(
+                "batch.zip", upload, "application/zip")},
+            format="multipart",
+        )
+        self.assertEqual(appended.status_code, 200, appended.data)
+
+        assignment = self.client.get(
+            f"/api/jobs/{job_id}/assignments/").data[0]
+        manual = self.client.patch(
+            f"/api/documents/{assignment['id']}/",
+            {"profileId": None},
+            format="json",
+        )
+        self.assertEqual(manual.status_code, 200, manual.data)
+        self.assertEqual(manual.data["assignmentStatus"], "excluded")
+
+        response = self.client.post(
+            f"/api/jobs/{job_id}/assign/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["preservedManual"], 1)
+        self.assertEqual(response.data["analyzed"], 0)
+
+        document = PDFDocument.objects.get(pk=assignment["id"])
+        self.assertEqual(document.assignment_status, "excluded")
+        self.assertEqual(document.assignment_method, "manual")
+
+    def test_export_covers_every_profile_used_in_a_mixed_batch(self):
+        self.create_profile()
+        secondary = copy.deepcopy(PROFILE)
+        secondary["id"] = "secondary-profile"
+        secondary["name"] = "Secondary Profile"
+        secondary["fields"] = [
+            create_labeled_field("date_of_birth", "Date of Birth:")
+        ]
+        created_profile = self.client.post(
+            "/api/profiles/", secondary, format="json")
+        self.assertEqual(created_profile.status_code,
+                         201, created_profile.data)
+
+        with patch(
+            "extraction.views.launch_job_processing", side_effect=process_job
+        ):
+            created = self.client.post(
+                "/api/jobs/batch/",
+                {"profileId": "test-profile"},
+                format="json",
+            )
+            job_id = created.data["id"]
+            upload = create_zip(
+                [("one.pdf", create_pdf()), ("two.pdf", create_pdf())]
+            )
+            appended = self.client.post(
+                f"/api/jobs/{job_id}/archives/",
+                {"file": SimpleUploadedFile(
+                    "batch.zip", upload, "application/zip")},
+                format="multipart",
+            )
+            self.assertEqual(appended.status_code, 200, appended.data)
+
+            assignments = {
+                item["filename"]: item
+                for item in self.client.get(
+                    f"/api/jobs/{job_id}/assignments/").data
+            }
+            overridden = self.client.patch(
+                f"/api/documents/{assignments['two.pdf']['id']}/",
+                {"profileId": "secondary-profile"},
+                format="json",
+            )
+            self.assertEqual(overridden.status_code, 200, overridden.data)
+
+            started = self.client.post(
+                f"/api/jobs/{job_id}/start/", {}, format="json")
+            self.assertEqual(started.status_code, 202, started.data)
+
+        response = self.client.get(f"/api/jobs/{job_id}/export/")
+        self.assertEqual(response.status_code, 200)
+        lines = b"".join(response.streaming_content).decode(
+            "utf-8-sig").splitlines()
+        header = lines[0]
+        # Columns are the union of the job default and every used profile.
+        self.assertIn("Extraction Profile", header)
+        self.assertIn("Full Name", header)
+        self.assertIn("Date Of Birth", header)
+        rows = {
+            line.split(",")[0].strip('"'): line for line in lines[1:]
+        }
+        self.assertIn("Test Profile", rows["one.pdf"])
+        self.assertIn("Secondary Profile", rows["two.pdf"])
 
     def test_documents_are_processed_with_configured_bounded_concurrency(self):
         self.create_profile()

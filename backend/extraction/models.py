@@ -33,17 +33,20 @@ class ProcessingJob(models.Model):
         ("error", "Error"),
     ]
 
-    id = models.CharField(max_length=100, primary_key=True, default=create_job_id)
+    id = models.CharField(
+        max_length=100, primary_key=True, default=create_job_id)
     name = models.CharField(max_length=255)
     zip_filename = models.CharField(max_length=255)
     zip_size_bytes = models.PositiveBigIntegerField(default=0)
     profile = models.ForeignKey(
         ExtractionProfile, on_delete=models.PROTECT, related_name="jobs"
     )
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="running")
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default="running")
     total_discovered = models.PositiveIntegerField(default=0)
     processed_count = models.PositiveIntegerField(default=0)
     failed_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
     review_required_count = models.PositiveIntegerField(default=0)
     conflict_count = models.PositiveIntegerField(default=0)
     missing_count = models.PositiveIntegerField(default=0)
@@ -67,6 +70,7 @@ class PDFDocument(models.Model):
         ("processing", "Processing"),
         ("completed", "Completed"),
         ("failed", "Failed"),
+        ("excluded", "Excluded by user"),
     ]
     EXTRACTION_CHOICES = [
         ("NATIVE_PDF_TEXT", "Native PDF text"),
@@ -74,16 +78,33 @@ class PDFDocument(models.Model):
         ("AI_EXTRACTED", "Local AI extracted"),
         ("FAILED", "Failed"),
     ]
+    ASSIGNMENT_CHOICES = [
+        ("legacy", "Legacy job profile"),
+        ("assigned", "Assigned by rule"),
+        ("manual", "Manually overridden"),
+        ("ambiguous", "Ambiguous profile match"),
+        ("unassigned", "No profile assignment"),
+        ("excluded", "Excluded from processing"),
+    ]
 
     id = models.CharField(max_length=150, primary_key=True)
-    job = models.ForeignKey(ProcessingJob, on_delete=models.CASCADE, related_name="documents")
+    job = models.ForeignKey(
+        ProcessingJob, on_delete=models.CASCADE, related_name="documents")
+    profile = models.ForeignKey(
+        ExtractionProfile,
+        on_delete=models.SET_NULL,
+        related_name="documents",
+        null=True,
+        blank=True,
+    )
     filename = models.CharField(max_length=255)
     relative_path = models.TextField()
     file_size_bytes = models.PositiveBigIntegerField(default=0)
     file = models.FileField(upload_to=document_upload_path)
     page_count = models.PositiveIntegerField(default=0)
     file_hash = models.CharField(max_length=64, blank=True)
-    processing_duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    processing_duration_ms = models.PositiveBigIntegerField(
+        null=True, blank=True)
     processing_metrics = models.JSONField(default=dict, blank=True)
     processing_status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default="pending"
@@ -93,6 +114,15 @@ class PDFDocument(models.Model):
     extraction_method_used = models.CharField(
         max_length=30, choices=EXTRACTION_CHOICES, default="NATIVE_PDF_TEXT"
     )
+    assignment_status = models.CharField(
+        max_length=20,
+        choices=ASSIGNMENT_CHOICES,
+        default="legacy",
+    )
+    assignment_method = models.CharField(max_length=50, blank=True)
+    assignment_rule = models.CharField(max_length=255, blank=True)
+    assignment_confidence = models.FloatField(default=0.0)
+    assignment_reason = models.TextField(blank=True)
     raw_filename_text = models.TextField(blank=True)
     raw_extracted_pdf_text = models.TextField(blank=True)
     pdf_text_length = models.PositiveIntegerField(default=0)

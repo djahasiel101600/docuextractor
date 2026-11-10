@@ -17,10 +17,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, inline_serializer
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 
 from .api_serializers import (
     DocumentPatchRequestSerializer,
     DocumentResponseSerializer,
+    DocumentAssignmentSerializer,
+    DocumentAssignmentUpdateSerializer,
     JobUploadRequestSerializer,
     ProcessingJobProgressSerializer,
     ProcessingJobResponseSerializer,
@@ -42,8 +46,10 @@ from .services.job_processing import launch_job_processing
 from .services.ollama import test_ollama_connection
 from .services.form_layout import analyze_blank_form, validate_profile_config
 from .services.zip_processing import discover_pdf_files
+from .services.document_assignment import classify_document_assignment
 
 
+@method_decorator(ensure_csrf_cookie, name="dispatch")
 class APIRootView(APIView):
     @extend_schema(
         operation_id="api_health",
@@ -301,6 +307,7 @@ class JobListCreateView(APIView):
         return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
 
 
+@method_decorator(csrf_exempt, name="dispatch")
 class JobBatchCreateView(APIView):
     """Create an empty job that archives are appended into before it starts.
 
@@ -339,6 +346,7 @@ class JobBatchCreateView(APIView):
         return Response(job_data(job), status=status.HTTP_202_ACCEPTED)
 
 
+@method_decorator(csrf_exempt, name="dispatch")
 class JobArchiveAppendView(APIView):
     """Add one ZIP archive to an assembling job, aggregating its PDFs.
 
@@ -438,6 +446,100 @@ class JobArchiveAppendView(APIView):
         )
 
 
+@method_decorator(csrf_exempt, name="dispatch")
+class JobAssignmentView(APIView):
+    """Analyze all pending documents in a job and assign profiles based on rules."""
+    parser_classes = [JSONParser]
+
+    @extend_schema(
+        operation_id="jobs_assign_profiles",
+        request=None,
+        responses={
+            200: inline_serializer(
+                name="JobAssignProfilesResponse",
+                fields={
+                    "detail": serializers.CharField(),
+                    "analyzed": serializers.IntegerField(),
+                    "preservedManual": serializers.IntegerField(),
+                },
+            )
+        },
+    )
+    def post(self, request, job_id):
+        try:
+            job = ProcessingJob.objects.get(pk=job_id)
+        except ProcessingJob.DoesNotExist as exc:
+            raise Http404("Processing job not found.") from exc
+
+        profiles = list(ExtractionProfile.objects.all())
+        profile_map = {profile.id: profile for profile in profiles}
+        pending_documents = job.documents.filter(processing_status="pending")
+        # Manual overrides and manual exclusions are user decisions, so a
+        # re-analysis must never overwrite them.
+        documents = list(pending_documents.exclude(assignment_method="manual"))
+        preserved_manual = pending_documents.filter(
+            assignment_method="manual"
+        ).count()
+
+        with transaction.atomic():
+            for doc in documents:
+                assignment = classify_document_assignment(
+                    doc, profiles, fallback_profile=job.profile)
+                doc.profile = profile_map.get(assignment["profile_id"])
+                doc.assignment_status = assignment["status"]
+                doc.assignment_method = assignment["method"]
+                doc.assignment_rule = assignment["rule"]
+                doc.assignment_confidence = assignment["confidence"]
+                doc.assignment_reason = assignment["reason"]
+                doc.save(
+                    update_fields=[
+                        "profile",
+                        "assignment_status",
+                        "assignment_method",
+                        "assignment_rule",
+                        "assignment_confidence",
+                        "assignment_reason",
+                    ]
+                )
+
+        return Response(
+            {
+                "detail": "Profiles assigned based on rules.",
+                "analyzed": len(documents),
+                "preservedManual": preserved_manual,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class JobAssignmentDetailView(APIView):
+    """Retrieve the current profile assignments for a job's documents."""
+
+    @extend_schema(
+        operation_id="jobs_assignments_list",
+        responses=DocumentAssignmentSerializer(many=True),
+    )
+    def get(self, request, job_id):
+        try:
+            job = ProcessingJob.objects.get(pk=job_id)
+        except ProcessingJob.DoesNotExist as exc:
+            raise Http404("Processing job not found.") from exc
+
+        documents = job.documents.select_related("profile").all()
+        results = []
+        for doc in documents:
+            results.append({
+                "id": doc.id,
+                "filename": doc.filename,
+                "profileId": doc.profile_id,
+                "profileName": doc.profile.name if doc.profile else None,
+                "assignmentStatus": doc.assignment_status,
+                "assignmentConfidence": doc.assignment_confidence,
+                "assignmentReason": doc.assignment_reason,
+            })
+        return Response(results, status=status.HTTP_200_OK)
+
+
 class JobStartView(APIView):
     """Launch processing for an assembled batch job.
 
@@ -523,7 +625,10 @@ class JobProgressView(APIView):
             processing_duration_ms__isnull=False,
         ).aggregate(average=Avg("processing_duration_ms"))["average"]
         remaining_count = max(
-            job.total_discovered - job.processed_count - job.failed_count,
+            job.total_discovered
+            - job.processed_count
+            - job.failed_count
+            - job.skipped_count,
             0,
         )
         average_seconds = (
@@ -540,6 +645,7 @@ class JobProgressView(APIView):
                 "totalDiscovered": job.total_discovered,
                 "processedCount": job.processed_count,
                 "failedCount": job.failed_count,
+                "skippedCount": job.skipped_count,
                 "currentProcessingFile": current_files[0] if current_files else "",
                 "currentProcessingFiles": current_files,
                 "remainingCount": remaining_count,
@@ -592,6 +698,11 @@ class DocumentDetailView(APIView):
             document = PDFDocument.objects.get(pk=document_id)
         except PDFDocument.DoesNotExist as exc:
             raise Http404("PDF document not found.") from exc
+
+        # ------------------------------------------------------------------
+        # Shape 1: review toggle.
+        #   { "reviewed": true | false }
+        # ------------------------------------------------------------------
         if "reviewed" in request.data:
             reviewed = request.data["reviewed"]
             if not isinstance(reviewed, bool):
@@ -601,6 +712,67 @@ class DocumentDetailView(APIView):
             document.save(update_fields=["is_reviewed", "reviewed_at"])
             return Response(document_data(document))
 
+        # ------------------------------------------------------------------
+        # Shape 2: manual assignment override.
+        #   { "profileId": "<id>" | null, "assignmentStatus"?: "<status>" }
+        #
+        # Must be checked BEFORE the field-edit branch below, otherwise a body
+        # like { "profileId": null } falls through and returns a confusing
+        # "fieldId is required" error.
+        # ------------------------------------------------------------------
+        if "profileId" in request.data or "assignmentStatus" in request.data:
+            serializer = DocumentAssignmentUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            validated = serializer.validated_data
+
+            update_fields = []
+
+            if "profileId" in validated:
+                profile_id = validated["profileId"]
+                if profile_id is None:
+                    document.profile = None
+                    document.assignment_status = "excluded"
+                    document.assignment_method = "manual"
+                    document.assignment_rule = "manual_exclude"
+                    document.assignment_confidence = 0.0
+                    document.assignment_reason = "Manually excluded by user."
+                else:
+                    try:
+                        profile = ExtractionProfile.objects.get(pk=profile_id)
+                    except ExtractionProfile.DoesNotExist:
+                        return Response(
+                            {"profileId": ["Choose a valid profile."]},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    document.profile = profile
+                    document.assignment_status = "assigned"
+                    document.assignment_method = "manual"
+                    document.assignment_rule = "manual_override"
+                    document.assignment_confidence = 1.0
+                    document.assignment_reason = "Manually assigned by user."
+                update_fields.extend([
+                    "profile",
+                    "assignment_status",
+                    "assignment_method",
+                    "assignment_rule",
+                    "assignment_confidence",
+                    "assignment_reason",
+                ])
+
+            if "assignmentStatus" in validated:
+                document.assignment_status = validated["assignmentStatus"]
+                if "assignment_status" not in update_fields:
+                    update_fields.append("assignment_status")
+
+            if update_fields:
+                document.save(update_fields=update_fields)
+
+            return Response(document_data(document))
+
+        # ------------------------------------------------------------------
+        # Shape 3: single field value edit.
+        #   { "fieldId": "<id>", "value": "<new value>" }
+        # ------------------------------------------------------------------
         field_id = request.data.get("fieldId")
         if not isinstance(field_id, str) or not field_id:
             return Response({"fieldId": ["This field is required."]}, status=400)
@@ -640,6 +812,39 @@ class DocumentDetailView(APIView):
         )
         document.save(update_fields=["edit_history"])
         return Response(document_data(document))
+
+
+def _collect_export_fields(job):
+    """Union of field definitions across every profile used by the job.
+
+    A batch can mix profiles, so exporting only the job's default fields would
+    silently drop the columns produced by the other profiles.
+    """
+    ordered_profiles = [job.profile]
+    seen_profile_ids = {job.profile_id}
+    used_profile_ids = (
+        job.documents.exclude(profile__isnull=True)
+        .values_list("profile_id", flat=True)
+        .distinct()
+    )
+    for profile_id in used_profile_ids:
+        if profile_id in seen_profile_ids:
+            continue
+        seen_profile_ids.add(profile_id)
+        profile = ExtractionProfile.objects.filter(pk=profile_id).first()
+        if profile is not None:
+            ordered_profiles.append(profile)
+
+    fields = []
+    seen_field_ids = set()
+    for profile in ordered_profiles:
+        for field in profile.configuration.get("fields", []):
+            field_id = field.get("id")
+            if not field_id or field_id in seen_field_ids:
+                continue
+            seen_field_ids.add(field_id)
+            fields.append(field)
+    return fields
 
 
 class JobExportView(APIView):
@@ -691,7 +896,7 @@ class JobExportView(APIView):
             ).get(pk=job_id)
         except ProcessingJob.DoesNotExist as exc:
             raise Http404("Processing job not found.") from exc
-        profile_fields = job.profile.configuration.get("fields", [])
+        profile_fields = _collect_export_fields(job)
         diagnostics_only = request.query_params.get("type") == "diagnostics"
         selected_ids = request.query_params.get("fields")
         selected_ids = set(selected_ids.split(",")) if selected_ids else None
@@ -707,9 +912,10 @@ class JobExportView(APIView):
         if delimiter is None:
             return Response({"delimiter": ["Choose comma, semicolon, or tab."]}, status=400)
         if only_reviewed:
-            job_documents = job.documents.filter(is_reviewed=True)
+            job_documents = job.documents.select_related(
+                "profile").filter(is_reviewed=True)
         else:
-            job_documents = job.documents.all()
+            job_documents = job.documents.select_related("profile").all()
         if selected_ids is not None:
             profile_fields = [
                 field for field in profile_fields if field.get("id") in selected_ids
@@ -723,7 +929,8 @@ class JobExportView(APIView):
         if diagnostics_only:
             rows = [
                 writer.writerow([
-                    "Document Filename", "Relative Path", "Field ID", "Field Name",
+                    "Document Filename", "Relative Path", "Extraction Profile",
+                    "Field ID", "Field Name",
                     "Match Status", "Final Value", "Filename Extracted Value",
                     "PDF Extracted Value", "Form Field Extracted Value", "OCR Extracted Value", "Extraction Source",
                     "Extraction Method", "Matched Pattern or Label", "Validation Passed",
@@ -740,6 +947,7 @@ class JobExportView(APIView):
                     rows.append(writer.writerow([
                         document.filename,
                         document.relative_path,
+                        document.profile.name if document.profile_id else job.profile.name,
                         diagnostic.field_id,
                         details.get("fieldName", diagnostic.field_name),
                         details.get("status", ""),
@@ -766,6 +974,7 @@ class JobExportView(APIView):
             rows = [writer.writerow([
                 "Document Filename",
                 "Relative Directory Path",
+                "Extraction Profile",
                 "Processing Status",
                 "Extraction Method Used",
                 "Review Status",
@@ -785,6 +994,7 @@ class JobExportView(APIView):
                 rows.append(writer.writerow([
                     document.filename,
                     document.relative_path,
+                    document.profile.name if document.profile_id else job.profile.name,
                     document.processing_status,
                     document.extraction_method_used,
                     "Reviewed" if document.is_reviewed else "Pending Review",
