@@ -723,6 +723,36 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                   Higher values reduce false label matches; lower values tolerate OCR errors but may match the wrong label. Exact matches are unaffected.
                 </p>
               </div>
+
+              <div className="pt-2 border-t border-neutral-200 space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={
+                      currentProfile.extractionSettings?.firstPageOnly === true
+                    }
+                    onChange={(e) =>
+                      setCurrentProfile({
+                        ...currentProfile,
+                        extractionSettings: {
+                          labelSimilarityThreshold:
+                            currentProfile.extractionSettings
+                              ?.labelSimilarityThreshold ?? 0.82,
+                          ...currentProfile.extractionSettings,
+                          firstPageOnly: e.target.checked,
+                        },
+                      })
+                    }
+                    className="rounded text-neutral-900 border-neutral-300"
+                  />
+                  <span className="font-semibold text-neutral-700">
+                    Read First Page Only
+                  </span>
+                </label>
+                <p className="text-[10px] text-neutral-400">
+                  For multi-page PDFs whose form is page 1 (for example, a W-9 followed by IRS instructions). Later pages are ignored by native text, form fields, OCR, and AI.
+                </p>
+              </div>
             </div>
           </div>
         </div>

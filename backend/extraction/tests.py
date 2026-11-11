@@ -2704,6 +2704,115 @@ class DurableJobExecutionTests(APITestCase):
         self.assertEqual(fresh_doc.processing_status, "processing")
 
 
+def create_multipage_pdf(page_texts):
+    document = fitz.open()
+    for text in page_texts:
+        page = document.new_page()
+        page.insert_text((72, 72), text)
+    content = document.tobytes()
+    document.close()
+    return content
+
+
+class PageScopeTests(SimpleTestCase):
+    """firstPageOnly must restrict every extraction source to page 1."""
+
+    def _profile(self, first_page_only):
+        profile = copy.deepcopy(PROFILE)
+        profile["extractionSettings"] = {"labelSimilarityThreshold": 0.82}
+        if first_page_only:
+            profile["extractionSettings"]["firstPageOnly"] = True
+        return profile
+
+    def test_first_page_only_ignores_later_form_pages(self):
+        pdf_bytes = create_multipage_pdf(
+            ["Full Name: Jane Doe", "Full Name: Wrong Person"]
+        )
+
+        extracted = process_pdf(
+            pdf_bytes,
+            "application.pdf",
+            self._profile(first_page_only=True),
+        )
+
+        self.assertEqual(extracted["finalValues"]["full_name"], "Jane Doe")
+        self.assertEqual(extracted["pageCount"], 2)
+        self.assertNotIn("Wrong Person", extracted["rawPdfText"])
+        self.assertEqual(
+            extracted["processingMetrics"]["page_scope"], "first"
+        )
+        self.assertEqual(extracted["processingMetrics"]["pages_extracted"], 1)
+
+    def test_default_scope_still_reads_every_page(self):
+        pdf_bytes = create_multipage_pdf(
+            ["Full Name: Jane Doe", "Administrative note"]
+        )
+
+        extracted = process_pdf(
+            pdf_bytes,
+            "application.pdf",
+            self._profile(first_page_only=False),
+        )
+
+        self.assertIn("Administrative note", extracted["rawPdfText"])
+        self.assertEqual(extracted["pageCount"], 2)
+        self.assertEqual(extracted["processingMetrics"]["page_scope"], "all")
+        self.assertEqual(extracted["processingMetrics"]["pages_extracted"], 2)
+
+    def test_first_page_only_skips_widgets_on_later_pages(self):
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "Full Name:")
+        instruction_page = document.new_page()
+        widget = fitz.Widget()
+        widget.field_name = "full_name"
+        widget.field_value = "Wrong Person"
+        widget.rect = fitz.Rect(72, 90, 220, 106)
+        widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        instruction_page.add_widget(widget)
+        pdf_bytes = document.tobytes()
+        document.close()
+
+        extracted = process_pdf(
+            pdf_bytes,
+            "application.pdf",
+            self._profile(first_page_only=True),
+        )
+
+        self.assertEqual(extracted["processingMetrics"]["form_field_count"], 0)
+        self.assertIsNone(
+            extracted["diagnostics"]["full_name"]["formValue"]
+        )
+
+    def test_first_page_only_restricts_ocr_to_page_one(self):
+        profile = self._profile(first_page_only=True)
+        profile["ocrSettings"]["enabledFallback"] = True
+        profile["ocrSettings"]["autoDetectScanned"] = True
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "Full Name: Jane Doe")
+        document.new_page()
+        document.new_page()
+        pdf_bytes = document.tobytes()
+        document.close()
+
+        with (
+            override_settings(OCR_ENABLED=True),
+            patch(
+                "extraction.services.document_extraction._ocr_pdf",
+                return_value=[],
+            ) as run_ocr,
+        ):
+            extracted = process_pdf(pdf_bytes, "application.pdf", profile)
+
+        self.assertEqual(run_ocr.call_args.kwargs["page_indices"], [0])
+        self.assertEqual(
+            extracted["processingMetrics"]["ocr_pages_considered"], 1
+        )
+        self.assertEqual(extracted["processingMetrics"]
+                         ["ocr_page_numbers"], [1])
+
+
 def create_blank_form_pdf():
     """Template-style form: widgets exist but carry no values."""
     return create_acroform_pdf(

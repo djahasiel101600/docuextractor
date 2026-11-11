@@ -332,9 +332,15 @@ def _validate_value(value, rules):
     return True, None
 
 
-def _pdf_document_pages(document):
+def _pdf_document_pages(document, page_indices=None):
     pages = []
-    for index, page in enumerate(document):
+    indices = (
+        page_indices
+        if page_indices is not None
+        else range(document.page_count)
+    )
+    for index in indices:
+        page = document.load_page(index)
         text = page.get_text("text")
         words = [
             {
@@ -1423,7 +1429,7 @@ def _merge_widget_fragments(collected):
     return merged
 
 
-def _collect_form_fields(document):
+def _collect_form_fields(document, page_indices=None):
     """Read filled AcroForm widget values with their page coordinates.
 
     Text/combo/list widgets contribute their literal string. Check boxes and
@@ -1432,7 +1438,13 @@ def _collect_form_fields(document):
     downstream logic can associate a label with the exact value location.
     """
     collected = []
-    for page_index, page in enumerate(document):
+    indices = (
+        page_indices
+        if page_indices is not None
+        else range(document.page_count)
+    )
+    for page_index in indices:
+        page = document.load_page(page_index)
         for widget in page.widgets() or []:
             try:
                 kind = widget.field_type_string
@@ -2115,8 +2127,22 @@ def process_pdf(pdf_bytes, filename, profile):
         if document.page_count > settings.MAX_PDF_PAGES:
             raise ValidationError("The PDF exceeds the configured page limit.")
 
+        extraction_settings = profile.get("extractionSettings", {})
+        if not isinstance(extraction_settings, dict):
+            extraction_settings = {}
+        # Multi-page government forms (e.g. a W-9 followed by IRS instruction
+        # pages) keep all answers on page 1; later pages otherwise supply
+        # instruction prose that label matching can mistake for values.
+        first_page_only = extraction_settings.get("firstPageOnly") is True
+        selected_page_indices = (
+            [0]
+            if first_page_only and document.page_count
+            else list(range(document.page_count))
+        )
+
         native_started = time.perf_counter()
-        page_count, pages = _pdf_document_pages(document)
+        page_count, pages = _pdf_document_pages(
+            document, selected_page_indices)
         native_text = "\n\n".join(page["rawText"] for page in pages)
         native_length = len(re.sub(r"\s+", "", native_text))
         timings["native_text_extraction_ms"] = round(
@@ -2127,9 +2153,6 @@ def process_pdf(pdf_bytes, filename, profile):
             _normalize_field_config(field)
             for field in profile.get("fields", [])
         ]
-        extraction_settings = profile.get("extractionSettings", {})
-        if not isinstance(extraction_settings, dict):
-            extraction_settings = {}
         label_similarity_threshold = _label_similarity_threshold(
             extraction_settings
         )
@@ -2151,7 +2174,7 @@ def process_pdf(pdf_bytes, filename, profile):
         # government/HR forms; read them before the layout heuristics so they
         # can dominate reconciliation.
         form_started = time.perf_counter()
-        form_fields = _collect_form_fields(document)
+        form_fields = _collect_form_fields(document, selected_page_indices)
         form_results = {}
         if form_fields:
             for field in fields:
@@ -2213,7 +2236,10 @@ def process_pdf(pdf_bytes, filename, profile):
         )
         timings.update(
             {
-                "ocr_pages_considered": page_count,
+                "page_count": page_count,
+                "pages_extracted": len(pages),
+                "page_scope": "first" if first_page_only else "all",
+                "ocr_pages_considered": len(pages),
                 "ocr_pages_selected": len(ocr_page_indices) if should_ocr else 0,
                 "ocr_page_numbers": (
                     [index + 1 for index in ocr_page_indices] if should_ocr else []

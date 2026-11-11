@@ -80,6 +80,12 @@ export interface ExtractionProfile {
   };
   extractionSettings?: {
     labelSimilarityThreshold: number;
+    /**
+     * When true, only page 1 is read: native text, AcroForm widgets, OCR and
+     * the AI context all ignore later pages. For multi-page forms whose
+     * answers live on page 1 (e.g. a W-9 followed by IRS instructions).
+     */
+    firstPageOnly?: boolean;
   };
   ocrSettings: {
     enabledFallback: boolean;
