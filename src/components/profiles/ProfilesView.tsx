@@ -91,6 +91,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     message: string;
     models: string[];
   }>({ loading: false, message: '', models: [] });
+  // Why a requested extraction-method switch was refused.
+  const [methodWarning, setMethodWarning] = useState('');
 
   const aiSettings = currentProfile.aiSettings || {
     enabled: false,
@@ -752,6 +754,54 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                 <p className="text-[10px] text-neutral-400">
                   For multi-page PDFs whose form is page 1 (for example, a W-9 followed by IRS instructions). Later pages are ignored by native text, form fields, OCR, and AI.
                 </p>
+              </div>
+
+              <div className="pt-2 border-t border-neutral-200 space-y-2">
+                <label
+                  htmlFor="extraction-method"
+                  className="text-[11px] text-neutral-500"
+                >
+                  Extraction Method
+                </label>
+                <select
+                  id="extraction-method"
+                  value={currentProfile.extractionSettings?.method ?? 'label'}
+                  onChange={(e) => {
+                    const method = e.target.value === 'roi' ? 'roi' : 'label';
+                    const schema = currentProfile.extractionSettings?.annotationSchema;
+                    if (method === 'roi' && !(schema?.pages?.length)) {
+                      // Refuse the switch rather than saving 'roi' with nothing
+                      // to read: an empty schema returns blank values for every
+                      // field, which reads as an extraction bug instead of the
+                      // configuration error it is.
+                      setMethodWarning(
+                        'ROI extraction needs an annotation schema for this form. Annotate the blank form first; the profile stays on label matching.'
+                      );
+                      return;
+                    }
+                    setMethodWarning('');
+                    setCurrentProfile({
+                      ...currentProfile,
+                      extractionSettings: {
+                        ...currentProfile.extractionSettings,
+                        labelSimilarityThreshold:
+                          currentProfile.extractionSettings
+                            ?.labelSimilarityThreshold ?? 0.82,
+                        method,
+                      },
+                    });
+                  }}
+                  className="w-full rounded border border-neutral-300 px-2 py-1 text-xs"
+                >
+                  <option value="label">Label matching (default)</option>
+                  <option value="roi">Annotated regions (ROI)</option>
+                </select>
+                <p className="text-[10px] text-neutral-400">
+                  Label matching finds each value next to its printed label. ROI reads only the boxes drawn on the blank form and records which source supplied each value.
+                </p>
+                {methodWarning && (
+                  <p className="text-[10px] text-rose-600">{methodWarning}</p>
+                )}
               </div>
             </div>
           </div>

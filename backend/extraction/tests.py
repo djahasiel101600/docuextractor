@@ -40,12 +40,14 @@ from .services.document_extraction import (
 )
 from .services.country_data import is_country_value
 from .services.job_processing import (
+    _extractor_for,
     _finalize_job,
     _job_should_stop,
     process_job,
     recover_stale_jobs,
 )
 from .services.form_layout import analyze_blank_form, validate_profile_config
+from .services.roi_extraction import process_pdf_roi
 from .services.ollama import (
     _request_json,
     extract_with_ollama,
@@ -2928,6 +2930,264 @@ class PageScopeTests(SimpleTestCase):
         )
         self.assertEqual(extracted["processingMetrics"]
                          ["ocr_page_numbers"], [1])
+
+
+class RoiExtractionTests(SimpleTestCase):
+    """ROI extraction reads annotated boxes and records which tier won."""
+
+    def _profile(self, fields, annotation_schema, **settings):
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"] = fields
+        profile["extractionSettings"] = {
+            "labelSimilarityThreshold": 0.82,
+            "method": "roi",
+            **settings,
+        }
+        if annotation_schema is not None:
+            profile["extractionSettings"]["annotationSchema"] = (
+                annotation_schema
+            )
+        return profile
+
+    @staticmethod
+    def _schema(boxes):
+        """boxes: (field_id, page_number, rect) tuples -> wire schema."""
+        pages = {}
+        for field_id, page_number, rect in boxes:
+            pages.setdefault(page_number, []).append(
+                {"fieldId": field_id, "rect": list(rect)}
+            )
+        return {
+            "pages": [
+                {"pageNumber": page_number, "fields": fields}
+                for page_number, fields in sorted(pages.items())
+            ]
+        }
+
+    def test_roi_reads_value_from_annotated_box(self):
+        pdf_bytes = create_layout_pdf(
+            [("Full Name:", 72, 72), ("Jane Doe", 150, 72)]
+        )
+        profile = self._profile(
+            [create_labeled_field("full_name", "Full Name:")],
+            self._schema([("full_name", 1, (145, 62, 210, 78))]),
+        )
+
+        diagnostic = process_pdf_roi(
+            pdf_bytes, "application.pdf", profile
+        )["diagnostics"]["full_name"]
+
+        self.assertEqual(diagnostic["finalValue"], "Jane Doe")
+        self.assertEqual(diagnostic["status"], "MATCHED")
+        self.assertEqual(diagnostic["source"], "pdf_text")
+        self.assertEqual(diagnostic["method"], "roi_textbox")
+        self.assertEqual(diagnostic["roiTier"], "textbox")
+        self.assertEqual(diagnostic["pageNumber"], 1)
+
+    def test_roi_strips_the_printed_label_from_the_capture(self):
+        pdf_bytes = create_layout_pdf(
+            [("Date (MM-DD-YYYY) 04-22-2026", 72, 72)]
+        )
+        profile = self._profile(
+            [create_labeled_field("filing_date", "Date (MM-DD-YYYY)")],
+            self._schema([("filing_date", 1, (65, 60, 260, 80))]),
+        )
+
+        diagnostic = process_pdf_roi(
+            pdf_bytes, "application.pdf", profile
+        )["diagnostics"]["filing_date"]
+
+        self.assertEqual(diagnostic["finalValue"], "04-22-2026")
+
+    def test_roi_prefers_the_widget_inside_the_box(self):
+        pdf_bytes = create_acroform_pdf(
+            [], [("f1_01", "Jane Doe", (140, 60, 220, 80))]
+        )
+        profile = self._profile(
+            [create_labeled_field("full_name", "Full Name:")],
+            self._schema([("full_name", 1, (135, 58, 225, 82))]),
+        )
+
+        diagnostic = process_pdf_roi(
+            pdf_bytes, "application.pdf", profile
+        )["diagnostics"]["full_name"]
+
+        self.assertEqual(diagnostic["finalValue"], "Jane Doe")
+        self.assertEqual(diagnostic["roiTier"], "widget")
+        self.assertEqual(diagnostic["method"], "roi_widget")
+        self.assertEqual(diagnostic["source"], "form_field")
+
+    def test_field_without_an_annotated_box_is_reported(self):
+        pdf_bytes = create_layout_pdf([("Full Name: Jane Doe", 72, 72)])
+        profile = self._profile(
+            [
+                create_labeled_field("full_name", "Full Name:"),
+                create_labeled_field("account_number", "Account Number:"),
+            ],
+            self._schema([("full_name", 1, (130, 62, 220, 78))]),
+        )
+
+        result = process_pdf_roi(pdf_bytes, "application.pdf", profile)
+        diagnostic = result["diagnostics"]["account_number"]
+
+        self.assertEqual(diagnostic["status"], "NOT_FOUND")
+        self.assertEqual(diagnostic["finalValue"], "")
+        self.assertIn("No region is annotated", diagnostic["explanation"])
+
+    def test_roi_without_a_schema_is_refused(self):
+        profile = self._profile(
+            [create_labeled_field("full_name", "Full Name:")], None
+        )
+
+        with self.assertRaises(ValidationError):
+            process_pdf_roi(create_pdf(), "application.pdf", profile)
+
+    def test_profile_validation_refuses_roi_without_a_schema(self):
+        errors = validate_profile_config(
+            {
+                "fields": [create_labeled_field("full_name", "Full Name:")],
+                "extractionSettings": {"method": "roi"},
+            }
+        )
+
+        self.assertTrue(
+            any("annotation schema" in error.casefold() for error in errors)
+        )
+
+    def test_profile_validation_rejects_unknown_schema_fields(self):
+        errors = validate_profile_config(
+            {
+                "fields": [create_labeled_field("full_name", "Full Name:")],
+                "extractionSettings": {
+                    "method": "roi",
+                    "annotationSchema": self._schema(
+                        [("ghost_field", 1, (1, 2, 3, 4))]
+                    ),
+                },
+            }
+        )
+
+        self.assertTrue(
+            any("unknown field" in error for error in errors)
+        )
+
+    def test_checkbox_on_states_become_booleans(self):
+        for raw in ("\x14", "3", "1", "x", "\u2713", "[x]", "yes", "Yes"):
+            self.assertEqual(
+                normalize_value(raw, {"checkbox": True}), "true", raw
+            )
+        for raw in ("0", "[]", "no", "Off"):
+            self.assertEqual(
+                normalize_value(raw, {"checkbox": True}), "false", raw
+            )
+        # Without a boolean value type the token is left untouched.
+        self.assertEqual(normalize_value("3", {}), "3")
+
+    def test_mojibake_check_glyphs_map_to_booleans(self):
+        # Flattened forms embed the check glyph as UTF-8 bytes, which arrive
+        # decode-mangled; the spelling depends on the code page used to read
+        # them. All are the same on-state.
+        for raw in (
+            "\u0393\u00a3\u00f4",
+            "\u0393\u00a3\u00f6",
+            "\u00e2\u0153\u201c",
+            "\u00e2\u0153\u201d",
+            "\u221a",
+        ):
+            self.assertEqual(
+                normalize_value(raw, {"checkbox": True}), "true", raw
+            )
+
+    def test_batch_selects_the_roi_extractor_per_profile(self):
+        self.assertIs(
+            _extractor_for({"extractionSettings": {"method": "roi"}}),
+            process_pdf_roi,
+        )
+        self.assertIs(
+            _extractor_for({"extractionSettings": {"method": "label"}}),
+            process_pdf,
+        )
+        self.assertIs(_extractor_for({}), process_pdf)
+
+
+class RoiBatchTests(APITestCase):
+    """A finished ROI job persists results the existing review UI renders."""
+
+    def setUp(self):
+        self.media_dir = tempfile.TemporaryDirectory()
+        self.settings_override = override_settings(
+            MEDIA_ROOT=self.media_dir.name)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(self.media_dir.cleanup)
+
+    @override_settings(PDF_PROCESSING_WORKERS=1)
+    def test_process_job_reads_the_annotated_box_and_saves_diagnostics(self):
+        profile = ExtractionProfile.objects.create(
+            id="roi-profile",
+            name="ROI Profile",
+            configuration={
+                "fields": [create_labeled_field("full_name", "Full Name:")],
+                "extractionSettings": {
+                    "labelSimilarityThreshold": 0.82,
+                    "method": "roi",
+                    "annotationSchema": {
+                        "pages": [
+                            {
+                                "pageNumber": 1,
+                                "fields": [
+                                    {
+                                        "fieldId": "full_name",
+                                        "rect": [145, 62, 210, 78],
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                },
+            },
+        )
+        job = ProcessingJob.objects.create(
+            id="job-roi",
+            name="ROI job",
+            zip_filename="batch.zip",
+            profile=profile,
+            status="running",
+        )
+        document = PDFDocument.objects.create(
+            id="doc-roi",
+            job=job,
+            filename="roi.pdf",
+            relative_path="roi.pdf",
+            file_size_bytes=1,
+            file=SimpleUploadedFile(
+                "roi.pdf",
+                create_layout_pdf(
+                    [("Full Name:", 72, 72), ("Jane Doe", 150, 72)]
+                ),
+                "application/pdf",
+            ),
+            processing_status="pending",
+            assignment_status="legacy",
+        )
+
+        process_job(job.id)
+
+        document.refresh_from_db()
+        self.assertEqual(document.processing_status, "completed")
+        self.assertEqual(
+            document.extracted_fields.get(field_id="full_name").final_value,
+            "Jane Doe",
+        )
+        details = document.field_diagnostics.get(
+            field_id="full_name").details
+        self.assertEqual(details["status"], "MATCHED")
+        self.assertEqual(details["finalValue"], "Jane Doe")
+        self.assertEqual(details["roiTier"], "textbox")
+        self.assertEqual(details["method"], "roi_textbox")
+        job.refresh_from_db()
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.processed_count, 1)
 
 
 def create_blank_form_pdf():
