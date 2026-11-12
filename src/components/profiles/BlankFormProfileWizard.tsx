@@ -47,7 +47,9 @@ import {
     assignmentIssues,
     buildProfileFromBlankForm,
     PointRect,
+    ProfileMethod,
     TargetAssignment,
+    TargetBox,
     widgetsInAnnotation,
 } from '../../services/blankFormProfileGenerator';
 import { renderPdfPageToCanvas } from '../../services/pdfService';
@@ -160,6 +162,7 @@ function seedTargets(analysis: BlankFormAnalysis): TargetAssignment[] {
             byName.set(key, {
                 targetName: suggestion.name,
                 widgetIds: [widget.id],
+                boxes: [],
                 required: false,
                 fieldType: suggestion.fieldType as FieldDefinition['type'],
             });
@@ -195,11 +198,18 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
     const [renderFailed, setRenderFailed] = useState(false);
     // Live in-progress draw, in CSS pixels relative to the overlay.
     const [drawPx, setDrawPx] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
-    // Finalized annotation (points) plus the widget ids it captured, awaiting a
-    // target name before it becomes a TargetAssignment.
-    const [pending, setPending] = useState<{ rect: PointRect; widgetIds: string[] } | null>(null);
+    // Finalized annotation (points, with the page it was drawn on) plus the
+    // widget ids it captured, awaiting a target before it becomes one - or
+    // extends an existing one with an extra region.
+    const [pending, setPending] = useState<{
+        rect: PointRect;
+        pageNumber: number;
+        widgetIds: string[];
+    } | null>(null);
     const [pendingName, setPendingName] = useState('');
     const [pendingType, setPendingType] = useState<FieldDefinition['type']>('text');
+    // Target the pending box joins; null means "create a new target".
+    const [pendingTarget, setPendingTarget] = useState<number | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const overlayRef = useRef<HTMLDivElement | null>(null);
     const drawingRef = useRef(false);
@@ -212,7 +222,21 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
         ? analysis.widgets.length - assignedWidgetIds.size
         : 0;
 
-    const mappingIssues = useMemo(() => assignmentIssues(assignments), [assignments]);
+    // Extraction method. Label matching reads the widgets; ROI reads the drawn
+    // regions, so it is the only method that can serve a target annotated
+    // without widgets - which makes it the default as soon as one exists.
+    const [methodOverride, setMethodOverride] = useState<ProfileMethod | null>(null);
+    const defaultMethod: ProfileMethod = assignments.some(
+        (target) => target.boxes.length > 0 && target.widgetIds.length === 0
+    )
+        ? 'roi'
+        : 'label';
+    const method: ProfileMethod = methodOverride ?? defaultMethod;
+
+    const mappingIssues = useMemo(
+        () => assignmentIssues(assignments, method),
+        [assignments, method]
+    );
 
     const handleFile = async (file: File | null | undefined) => {
         setError('');
@@ -231,28 +255,22 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
             setProfileName(
                 `${file.name.replace(/\.pdf$/i, '')} Profile`.slice(0, 200)
             );
-            if (result.widgets.length > 0) {
-                // Keep the bytes in memory so the Annotate step can render pages
-                // and map drawn boxes onto widget coordinates. Never stored.
-                try {
-                    setPdfBuffer(await file.arrayBuffer());
-                } catch {
-                    setPdfBuffer(null);
-                    setRenderFailed(true);
-                }
-                setCurrentPage(1);
-                setRenderedSize(null);
-                setPending(null);
-                setDrawPx(null);
-                setStep('annotate');
-            } else {
+            // Keep the bytes in memory so the Annotate step can render pages
+            // and map drawn boxes onto widget coordinates. Never stored. A flat
+            // template has no widgets but still has pages to render, and there
+            // the drawn regions are the whole authoring surface, so the wizard
+            // continues instead of stopping on the upload step.
+            try {
+                setPdfBuffer(await file.arrayBuffer());
+            } catch {
                 setPdfBuffer(null);
-                setStep('upload');
-                setError(
-                    result.warnings[0] ||
-                    'No fillable form fields were discovered in this PDF.'
-                );
+                setRenderFailed(true);
             }
+            setCurrentPage(1);
+            setRenderedSize(null);
+            setPending(null);
+            setDrawPx(null);
+            setStep('annotate');
         } catch (analyzeError) {
             setError(getApiErrorMessage(analyzeError));
         } finally {
@@ -296,10 +314,22 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
             {
                 targetName: `Target ${current.length + 1}`,
                 widgetIds: [],
+                boxes: [],
                 required: false,
                 fieldType: 'text',
             },
         ]);
+    };
+
+    /** Drop one drawn region; the target survives with its remaining boxes. */
+    const removeBox = (targetIndex: number, boxIndex: number) => {
+        setAssignments((current) =>
+            current.map((target, index) =>
+                index === targetIndex
+                    ? { ...target, boxes: target.boxes.filter((_, i) => i !== boxIndex) }
+                    : target
+            )
+        );
     };
 
     const resetWizard = () => {
@@ -316,26 +346,65 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
         setRenderFailed(false);
         setDrawPx(null);
         setPending(null);
+        setPendingTarget(null);
         setPendingName('');
+        setMethodOverride(null);
         setStep('upload');
     };
 
-    const generatePreview = () => {
+    /** Build the candidate profile for one method, or null without analysis. */
+    const buildPreview = (targetMethod: ProfileMethod) => {
         if (!analysis) {
+            return null;
+        }
+        return buildProfileFromBlankForm(
+            analysis,
+            assignments.filter((assignment) =>
+                targetMethod === 'roi'
+                    ? assignment.boxes.length > 0
+                    : assignment.widgetIds.length > 0
+            ),
+            { name: profileName, description },
+            { method: targetMethod }
+        );
+    };
+
+    const generatePreview = () => {
+        const profile = buildPreview(method);
+        if (!profile) {
             return;
         }
-        const profile = buildProfileFromBlankForm(
-            analysis,
-            assignments.filter((assignment) => assignment.widgetIds.length > 0),
-            { name: profileName, description }
-        );
         setPreviewProfile(profile);
         setStep('review');
+    };
+
+    /** Rebuild the preview in place so the toggle shows the real output. */
+    const changeMethod = (next: ProfileMethod) => {
+        setMethodOverride(next);
+        setValidationErrors([]);
+        const profile = buildPreview(next);
+        if (profile) {
+            setPreviewProfile(profile);
+        }
     };
 
     const [previewProfile, setPreviewProfile] = useState<ExtractionProfile | null>(
         null
     );
+
+    // Regions per field in the generated schema, for the review summary: a
+    // ROI field with zero regions would extract nothing, so the count is the
+    // operator's last chance to notice a gap before saving.
+    const previewBoxCounts = useMemo(() => {
+        const counts = new Map<string, number>();
+        previewProfile?.extractionSettings?.annotationSchema?.pages.forEach(
+            (page) =>
+                page.fields.forEach((entry) =>
+                    counts.set(entry.fieldId, (counts.get(entry.fieldId) || 0) + 1)
+                )
+        );
+        return counts;
+    }, [previewProfile]);
 
     const handleCreate = async () => {
         if (!previewProfile) {
@@ -459,6 +528,7 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
         drawingRef.current = true;
         startRef.current = point;
         setPending(null);
+        setPendingTarget(null);
         setDrawPx({ x0: point.x, y0: point.y, x1: point.x, y1: point.y });
     };
 
@@ -500,13 +570,18 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
         setPendingName(
             suggestion?.name || `Target ${assignments.length + 1}`
         );
-        setPending({ rect, widgetIds: matched });
+        setPending({ rect, pageNumber: currentPage, widgetIds: matched });
     };
 
-    const commitPending = () => {
-        if (!pending || pending.widgetIds.length === 0) return;
+    /** Turn the pending box into a new target, or add it to an existing one.
+     *  A box that captured no widget is still kept: it is a valid ROI region,
+     *  and box-only targets are what a flat template is made of. */
+    const commitPending = (targetIndex: number | null = null) => {
+        if (!pending) return;
+        const box: TargetBox = { pageNumber: pending.pageNumber, rect: pending.rect };
+        const claimedWidgetIds = pending.widgetIds;
+        const claimed = new Set(claimedWidgetIds);
         const name = pendingName.trim() || `Target ${assignments.length + 1}`;
-        const claimed = new Set(pending.widgetIds);
         setAssignments((current) => {
             // Claiming a widget releases it from any previous target so the
             // one-widget-one-target invariant (mirrored by toggleWidget) holds.
@@ -514,17 +589,33 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                 ...target,
                 widgetIds: target.widgetIds.filter((id) => !claimed.has(id)),
             }));
+            if (targetIndex !== null && stripped[targetIndex]) {
+                // Extra region on an existing target: the reader tries a
+                // field's boxes in order, so a value split across two areas
+                // still lands in one field.
+                return stripped.map((target, index) =>
+                    index === targetIndex
+                        ? {
+                            ...target,
+                            widgetIds: [...target.widgetIds, ...claimedWidgetIds],
+                            boxes: [...target.boxes, box],
+                        }
+                        : target
+                );
+            }
             return [
                 ...stripped,
                 {
                     targetName: name,
-                    widgetIds: pending.widgetIds,
+                    widgetIds: claimedWidgetIds,
+                    boxes: [box],
                     required: false,
                     fieldType: pendingType,
                 },
             ];
         });
         setPending(null);
+        setPendingTarget(null);
         setPendingName('');
     };
 
@@ -633,15 +724,24 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
 
                     {step === 'annotate' && analysis && (
                         <div className="space-y-3">
-                            <p className="text-xs text-neutral-600 leading-relaxed">
-                                <strong className="text-neutral-800">Optional but most accurate.</strong>{' '}
-                                Detected fields often have generic names (e.g.{' '}
-                                <code className="px-1 bg-neutral-100 rounded font-mono">f_2</code>).
-                                Click-and-drag a box around each value on the page to map it to a named
-                                target: DocuExtractor records the box, finds the detected field(s) inside
-                                it, and assigns them to that target. Or skip ahead to fine-tune the
-                                auto-suggestions in the next screen.
-                            </p>
+                            {analysis.widgets.length === 0 ? (
+                                <p className="text-xs text-neutral-600 leading-relaxed">
+                                    <strong className="text-neutral-800">This template has no fillable fields.</strong>{' '}
+                                    Draw a box around each value you want to export and name it; the
+                                    generated profile reads values from exactly those regions (OCR is
+                                    used where the page has no text layer).
+                                </p>
+                            ) : (
+                                <p className="text-xs text-neutral-600 leading-relaxed">
+                                    <strong className="text-neutral-800">Optional but most accurate.</strong>{' '}
+                                    Detected fields often have generic names (e.g.{' '}
+                                    <code className="px-1 bg-neutral-100 rounded font-mono">f_2</code>).
+                                    Click-and-drag a box around each value on the page to map it to a named
+                                    target: DocuExtractor records the box, finds the detected field(s) inside
+                                    it, and assigns them to that target. Or skip ahead to fine-tune the
+                                    auto-suggestions in the next screen.
+                                </p>
+                            )}
 
                             {/* Toolbar: page nav + zoom + legend */}
                             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -705,6 +805,10 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                     <span className="flex items-center gap-1">
                                         <span className="inline-block w-3 h-2 border border-emerald-600 bg-emerald-500/25" />
                                         captured by box
+                                    </span>
+                                    <span className="flex items-center gap-1">
+                                        <span className="inline-block w-3 h-2 border border-violet-600 bg-violet-500/10" />
+                                        saved region
                                     </span>
                                 </div>
                             </div>
@@ -776,6 +880,25 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                                             </rect>
                                                         );
                                                     })}
+                                                    {assignments
+                                                        .flatMap((target, targetIndex) =>
+                                                            target.boxes
+                                                                .map((box, boxIndex) => ({ box, target, targetIndex, boxIndex }))
+                                                                .filter((entry) => entry.box.pageNumber === currentPage)
+                                                        )
+                                                        .map(({ box, target, targetIndex, boxIndex }) => (
+                                                            <rect
+                                                                key={`region-${targetIndex}-${boxIndex}`}
+                                                                x={box.rect[0] * ppp.x}
+                                                                y={box.rect[1] * ppp.y}
+                                                                width={Math.max(2, (box.rect[2] - box.rect[0]) * ppp.x)}
+                                                                height={Math.max(2, (box.rect[3] - box.rect[1]) * ppp.y)}
+                                                                className="fill-violet-500/10 stroke-violet-600"
+                                                                strokeWidth={1.5}
+                                                            >
+                                                                <title>{`${target.targetName || `Target ${targetIndex + 1}`} · region ${boxIndex + 1}`}</title>
+                                                            </rect>
+                                                        ))}
                                                     {drawPx && (
                                                         <rect
                                                             x={Math.min(drawPx.x0, drawPx.x1)}
@@ -822,10 +945,13 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                             {pending && (
                                 <div className="rounded-lg border border-indigo-200 bg-indigo-50/60 p-3 space-y-2">
                                     {pending.widgetIds.length === 0 ? (
-                                        <p className="text-[11px] text-amber-800 flex items-start gap-1.5">
-                                            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                                            This box didn't overlap any detected field. Adjust it to
-                                            cover a field (the dashed outlines), or draw again.
+                                        <p className="text-[11px] text-neutral-700 flex items-start gap-1.5">
+                                            <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-neutral-500" />
+                                            <span>
+                                                This box does not overlap a detected form field. It is still
+                                                saved as an annotated region — reading it needs the{' '}
+                                                <strong>Annotated regions (ROI)</strong> method.
+                                            </span>
                                         </p>
                                     ) : (
                                         <>
@@ -847,7 +973,31 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                                     ) : null;
                                                 })}
                                             </div>
-                                            <div className="flex flex-wrap items-end gap-2 pt-1">
+                                        </>
+                                    )}
+                                    <div className="flex flex-wrap items-end gap-2 pt-1">
+                                        <div className="flex-1 min-w-40 space-y-1">
+                                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                                                Save region under
+                                            </label>
+                                            <select
+                                                value={pendingTarget === null ? '' : String(pendingTarget)}
+                                                onChange={(e) =>
+                                                    setPendingTarget(e.target.value === '' ? null : Number(e.target.value))
+                                                }
+                                                className="w-full px-2 py-1.5 border border-neutral-300 rounded text-xs bg-white"
+                                                title="Create a new target, or add this region to an existing one"
+                                            >
+                                                <option value="">New target…</option>
+                                                {assignments.map((target, index) => (
+                                                    <option key={index} value={index}>
+                                                        {target.targetName || `Target ${index + 1}`}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        {pendingTarget === null && (
+                                            <>
                                                 <div className="flex-1 min-w-48 space-y-1">
                                                     <label className="block text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
                                                         Target name
@@ -878,21 +1028,61 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                                         ))}
                                                     </select>
                                                 </div>
-                                                <div className="flex items-center gap-2">
-                                                    <Button size="sm" onClick={commitPending}>
-                                                        <Plus className="w-3.5 h-3.5" />
-                                                        <span>Add Target</span>
-                                                    </Button>
-                                                    <Button
-                                                        variant="outline"
-                                                        size="sm"
-                                                        onClick={() => setPending(null)}
+                                            </>
+                                        )}
+                                        <div className="flex items-center gap-2">
+                                            <Button size="sm" onClick={() => commitPending(pendingTarget)}>
+                                                <Plus className="w-3.5 h-3.5" />
+                                                <span>{pendingTarget === null ? 'Add Target' : 'Add Region'}</span>
+                                            </Button>
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                onClick={() => {
+                                                    setPending(null);
+                                                    setPendingTarget(null);
+                                                }}
+                                            >
+                                                Cancel
+                                            </Button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Committed regions: exactly what becomes the ROI schema. */}
+                            {assignments.some((target) => target.boxes.length > 0) && (
+                                <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-3 space-y-1.5">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                                        Annotated regions
+                                    </span>
+                                    {assignments.map((target, index) =>
+                                        target.boxes.length === 0 ? null : (
+                                            <div
+                                                key={index}
+                                                className="flex flex-wrap items-center gap-1.5 text-[10px]"
+                                            >
+                                                <span className="font-semibold text-neutral-800">
+                                                    {target.targetName || `Target ${index + 1}`}:
+                                                </span>
+                                                {target.boxes.map((box, boxIndex) => (
+                                                    <span
+                                                        key={boxIndex}
+                                                        className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-50 text-violet-900 px-2 py-0.5"
                                                     >
-                                                        Cancel
-                                                    </Button>
-                                                </div>
+                                                        p{box.pageNumber} ·{' '}
+                                                        {Math.round(box.rect[2] - box.rect[0])}×{Math.round(box.rect[3] - box.rect[1])}pt
+                                                        <button
+                                                            onClick={() => removeBox(index, boxIndex)}
+                                                            className="text-violet-500 hover:text-violet-900"
+                                                            title="Remove region"
+                                                        >
+                                                            ×
+                                                        </button>
+                                                    </span>
+                                                ))}
                                             </div>
-                                        </>
+                                        )
                                     )}
                                 </div>
                             )}
@@ -958,6 +1148,34 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                 </div>
                             )}
 
+                            {/* Method decides what each target must carry: widgets or regions. */}
+                            <div className="rounded-lg border border-neutral-200 bg-white p-3 space-y-2">
+                                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                                    Extraction method
+                                </span>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <div className="inline-flex rounded-md border border-neutral-300 bg-neutral-50 p-0.5 text-[11px] font-semibold">
+                                        {(['label', 'roi'] as ProfileMethod[]).map((value) => (
+                                            <button
+                                                key={value}
+                                                onClick={() => changeMethod(value)}
+                                                className={`px-2.5 py-1 rounded ${method === value
+                                                    ? 'bg-neutral-900 text-white'
+                                                    : 'text-neutral-600 hover:bg-neutral-100'
+                                                    }`}
+                                            >
+                                                {value === 'roi' ? 'Annotated regions (ROI)' : 'Label matching'}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <p className="text-[11px] text-neutral-600">
+                                        {method === 'roi'
+                                            ? 'Values come from the regions drawn on the form; assigned fields only help strip printed labels.'
+                                            : 'Values are found by widget field name and the printed label beside it; drawn regions are ignored.'}
+                                    </p>
+                                </div>
+                            </div>
+
                             <div className="space-y-3">
                                 <span className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
                                     Extraction Targets
@@ -973,14 +1191,16 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                             <strong> on-page label</strong> printed beside
                                             it. Assigning the right widgets is what drives
                                             accuracy; pick a field type to turn on
-                                            automatic validation.
+                                            automatic validation. Regions drawn in the
+                                            Annotate step are listed per target and feed the
+                                            ROI method.
                                         </span>
                                     </p>
                                 </div>
                                 {assignments.length === 0 && (
                                     <p className="text-xs text-neutral-500 italic">
-                                        No confident suggestions were found — add a target
-                                        below and assign its form fields to get started.
+                                        No targets yet — draw a region in the Annotate step,
+                                        or add a target below and assign its form fields.
                                     </p>
                                 )}
                                 {assignments.map((target, index) => {
@@ -1063,6 +1283,41 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
 
                                             <div className="space-y-1.5">
                                                 <label className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                                                    Annotated regions
+                                                    <span
+                                                        title="Regions drawn in the Annotate step. A field's regions are read in order, so a value split across two areas still lands in one field."
+                                                        className="inline-flex cursor-help"
+                                                    >
+                                                        <HelpCircle className="w-3 h-3 text-neutral-400" />
+                                                    </span>
+                                                </label>
+                                                <div className="flex flex-wrap items-center gap-1.5">
+                                                    {target.boxes.map((box, boxIndex) => (
+                                                        <span
+                                                            key={boxIndex}
+                                                            className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-50 text-violet-900 px-2 py-0.5 text-[10px]"
+                                                        >
+                                                            p{box.pageNumber} ·{' '}
+                                                            {Math.round(box.rect[2] - box.rect[0])}×{Math.round(box.rect[3] - box.rect[1])}pt
+                                                            <button
+                                                                onClick={() => removeBox(index, boxIndex)}
+                                                                className="text-violet-500 hover:text-violet-900"
+                                                                title="Remove region"
+                                                            >
+                                                                ×
+                                                            </button>
+                                                        </span>
+                                                    ))}
+                                                    {target.boxes.length === 0 && (
+                                                        <span className="text-[10px] italic text-neutral-500">
+                                                            none drawn
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-1.5">
+                                                <label className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
                                                     Assigned form fields
                                                     <span title={WIDGET_ASSIGN_HINT} className="inline-flex cursor-help">
                                                         <HelpCircle className="w-3 h-3 text-neutral-400" />
@@ -1108,10 +1363,14 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                                                 </option>
                                                             ))}
                                                     </select>
-                                                    {target.widgetIds.length === 0 && (
+                                                    {(method === 'roi'
+                                                        ? target.boxes.length === 0
+                                                        : target.widgetIds.length === 0) && (
                                                         <p className="flex items-start gap-1 text-[10px] text-amber-700">
                                                             <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
-                                                            No form field assigned yet — this target will be skipped during generation.
+                                                            {method === 'roi'
+                                                                ? 'No region drawn for this target — draw one in the Annotate step or it is skipped during generation.'
+                                                                : 'No form field assigned yet — this target will be skipped during generation.'}
                                                         </p>
                                                     )}
                                                 </div>
@@ -1192,6 +1451,34 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                 </div>
                             </div>
 
+                            {/* Method is part of the preview, not the saved profile: switching
+                                rebuilds it so the field list below matches what will be saved. */}
+                            <div className="rounded-lg border border-neutral-200 bg-white p-3 space-y-2">
+                                <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                                    Extraction method
+                                </span>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <div className="inline-flex rounded-md border border-neutral-300 bg-neutral-50 p-0.5 text-[11px] font-semibold">
+                                        {(['label', 'roi'] as ProfileMethod[]).map((value) => (
+                                            <button
+                                                key={value}
+                                                onClick={() => changeMethod(value)}
+                                                className={`px-2.5 py-1 rounded ${method === value
+                                                    ? 'bg-neutral-900 text-white'
+                                                    : 'text-neutral-600 hover:bg-neutral-100'
+                                                    }`}
+                                            >
+                                                {value === 'roi' ? 'Annotated regions (ROI)' : 'Label matching'}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <p className="text-[11px] text-neutral-600">
+                                        Switching rebuilds the preview below; nothing is saved until
+                                        you create the profile.
+                                    </p>
+                                </div>
+                            </div>
+
                             {validationErrors.length > 0 && (
                                 <div className="rounded-md border border-rose-200 bg-rose-50 p-3 space-y-1">
                                     <p className="font-semibold text-rose-800">
@@ -1223,6 +1510,9 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                                             </span>
                                             <span className="text-[10px] text-neutral-500 font-mono">
                                                 {field.type} · {field.priority}
+                                                {previewBoxCounts.has(field.id)
+                                                    ? ` · ${previewBoxCounts.get(field.id)} region(s)`
+                                                    : ''}
                                             </span>
                                         </div>
                                         <p className="text-[10px] text-neutral-500">{field.description}</p>
@@ -1253,9 +1543,10 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
                             </div>
 
                             <p className="text-[10px] text-neutral-500">
-                                Filename rules and AI are disabled in generated profiles —
-                                values come from the form widgets themselves. You can refine
-                                everything later in the profile editor after saving.
+                                {method === 'roi'
+                                    ? 'Values come from the annotated regions; filename rules and AI stay disabled in generated profiles.'
+                                    : 'Filename rules and AI are disabled in generated profiles — values come from the form widgets themselves.'}{' '}
+                                You can refine everything later in the profile editor after saving.
                             </p>
 
                             <div className="flex items-center justify-between pt-2 border-t border-neutral-200">

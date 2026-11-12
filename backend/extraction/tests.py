@@ -3797,6 +3797,174 @@ class BlankFormAuthoringTests(APITestCase):
         self.assertIn("Name:", saved["contentRules"]["labels"])
         self.assertIn("applicant_name", saved["contentRules"]["labels"])
 
+    @staticmethod
+    def _wizard_roi_profile():
+        """The shape the wizard generator emits for method='roi'.
+
+        One field keeps its widget labels (they strip the printed label) and
+        one is drawn-only on a flat page, so its content rules are disabled
+        with an empty label list - the case that would be rejected if the
+        generator left them enabled.
+        """
+        return {
+            "id": "profile-wizard-roi",
+            "name": "Wizard ROI Profile",
+            "description": (
+                "Auto-generated from a blank AcroForm template upload."
+            ),
+            "version": "1.0.0",
+            "fields": [
+                {
+                    "id": "applicant_name",
+                    "name": "Applicant Name",
+                    "label": "Name:",
+                    "description": (
+                        "Generated from 1 annotated region(s) on page(s) 1."
+                    ),
+                    "type": "text",
+                    "required": False,
+                    "filenameRules": {
+                        "enabled": False, "patterns": [],
+                        "captureGroup": 1, "caseInsensitive": True,
+                    },
+                    "contentRules": {
+                        "enabled": True,
+                        "labels": ["Name:", "applicant_name"],
+                        "regexPatterns": [],
+                        "positionHint": "after_label",
+                    },
+                    "priority": "pdf_first",
+                    "normalization": {
+                        "trim": True, "caseTransform": "none",
+                        "removeExtraSpaces": True,
+                    },
+                    "validation": {},
+                },
+                {
+                    "id": "date_signed",
+                    "name": "Date Signed",
+                    "label": "Date Signed",
+                    "description": (
+                        "Generated from 2 annotated region(s) on page(s) 2."
+                    ),
+                    "type": "date",
+                    "required": True,
+                    "filenameRules": {
+                        "enabled": False, "patterns": [],
+                        "captureGroup": 1, "caseInsensitive": True,
+                    },
+                    "contentRules": {
+                        "enabled": False,
+                        "labels": [],
+                        "regexPatterns": [],
+                        "positionHint": "after_label",
+                    },
+                    "priority": "pdf_first",
+                    "normalization": {
+                        "trim": True, "caseTransform": "none",
+                        "removeExtraSpaces": True,
+                        "dateFormat": "YYYY-MM-DD",
+                    },
+                    "validation": {},
+                },
+            ],
+            "aiSettings": {
+                "enabled": False,
+                "baseUrl": "http://127.0.0.1:11434",
+                "model": "",
+                "timeoutSeconds": 120,
+                "contextSize": 16384,
+                "strategy": "review",
+                "allowCloudModels": False,
+            },
+            "extractionSettings": {
+                "labelSimilarityThreshold": 0.82,
+                "method": "roi",
+                "annotationSchema": {
+                    "coordinateSystem": "pdf-points-display-top-left",
+                    "pages": [
+                        {
+                            "pageNumber": 1,
+                            "fields": [
+                                {
+                                    "fieldId": "applicant_name",
+                                    "rect": [70, 92, 220, 108],
+                                }
+                            ],
+                        },
+                        {
+                            "pageNumber": 2,
+                            "fields": [
+                                {
+                                    "fieldId": "date_signed",
+                                    "rect": [70, 120, 200, 136],
+                                },
+                                {
+                                    "fieldId": "date_signed",
+                                    "rect": [210, 120, 260, 136],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+            "ocrSettings": {
+                "enabledFallback": True,
+                "autoDetectScanned": True,
+                "minTextLengthThreshold": 50,
+                "language": "eng",
+                "quality": "standard",
+            },
+        }
+
+    def test_wizard_roi_profile_saves_through_regular_endpoint(self):
+        """A wizard-generated ROI profile round-trips through POST /profiles/."""
+        response = self.client.post(
+            "/api/profiles/", self._wizard_roi_profile(), format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        settings = response.data["extractionSettings"]
+        self.assertEqual(settings["method"], "roi")
+        schema = settings["annotationSchema"]
+        self.assertEqual(
+            [page["pageNumber"] for page in schema["pages"]], [1, 2]
+        )
+        # Both boxes of the page-2 field survive in order: the reader tries
+        # them in sequence.
+        self.assertEqual(
+            [entry["fieldId"] for entry in schema["pages"][1]["fields"]],
+            ["date_signed", "date_signed"],
+        )
+        saved_field = next(
+            field for field in response.data["fields"]
+            if field["id"] == "date_signed"
+        )
+        self.assertFalse(saved_field["contentRules"]["enabled"])
+
+    def test_validate_endpoint_gates_wizard_roi_profiles(self):
+        """The wizard's dry run is the structural gate before saving."""
+        candidate = self._wizard_roi_profile()
+
+        accepted = self.client.post(
+            "/api/forms/validate-profile/", candidate, format="json"
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        self.assertTrue(accepted.data["valid"], accepted.data["errors"])
+
+        del candidate["extractionSettings"]["annotationSchema"]
+        refused = self.client.post(
+            "/api/forms/validate-profile/", candidate, format="json"
+        )
+        self.assertFalse(refused.data["valid"])
+        self.assertTrue(
+            any(
+                "annotation schema" in error.casefold()
+                for error in refused.data["errors"]
+            ),
+            refused.data["errors"],
+        )
+
 
 class FieldSemanticsTests(SimpleTestCase):
     """Normalization and validation rules that were implicit before Phase 1."""

@@ -3,26 +3,43 @@
  * widget-to-target assignments. Pure function: no network, no side effects,
  * so its output can be previewed and structurally validated before saving.
  *
- * Generation strategy (mirrors how the extraction engine finds values):
- * - contentRules.labels receives the verbatim on-page label text discovered
- *   next to each assigned widget (what the spatial matcher will re-find at
- *   extraction time) and the widget's own field name (what the AcroForm
- *   name matcher compares against).
- * - filenameRules stay disabled: a blank form carries no filename evidence.
- * - AI stays disabled by default; OCR fallback stays enabled.
+ * Two generation modes, matching the two extraction methods:
+ * - 'label' (default) keeps the widget-driven profile: contentRules.labels
+ *   receives the verbatim on-page label text discovered next to each assigned
+ *   widget (what the spatial matcher will re-find at extraction time) and the
+ *   widget's own field name (what the AcroForm name matcher compares against).
+ * - 'roi' additionally emits extractionSettings.method='roi' plus an
+ *   annotationSchema holding the regions the operator drew. Those regions are
+ *   the only thing ROI reads; assigned widgets stay in the labels for the
+ *   label-run stripping and as corroboration, but are not required.
+ *
+ * In both modes filenameRules stay disabled (a blank form carries no filename
+ * evidence) and AI stays disabled by default; OCR fallback stays enabled.
  */
 import {
+    AnnotationSchema,
     BlankFormAnalysis,
     ExtractionProfile,
     FieldDefinition,
     FormWidgetLayout,
 } from '../types/extraction';
 
+/** Which pipeline the generated profile will run. */
+export type ProfileMethod = 'label' | 'roi';
+
+/** A region the operator drew on a rendered page, in PDF points. */
+export interface TargetBox {
+    pageNumber: number;
+    rect: PointRect;
+}
+
 export interface TargetAssignment {
     /** User-facing target name, e.g. "Candidate Name". */
     targetName: string;
     /** Widget ids from the analysis assigned to this target (fragment merge). */
     widgetIds: string[];
+    /** Drawn regions; only ROI profiles read these, label profiles ignore them. */
+    boxes: TargetBox[];
     required: boolean;
     fieldType: FieldDefinition['type'];
 }
@@ -113,7 +130,8 @@ function slugifyId(name: string, taken: Set<string>): string {
 function buildField(
     assignment: TargetAssignment,
     widgets: FormWidgetLayout[],
-    takenIds: Set<string>
+    takenIds: Set<string>,
+    method: ProfileMethod
 ): FieldDefinition {
     const assigned = widgets.filter((widget) =>
         assignment.widgetIds.includes(widget.id)
@@ -149,6 +167,7 @@ function buildField(
         'email',
         'phone',
         'address',
+        'checkbox',
     ];
     const type: FieldDefinition['type'] = allowedTypes.includes(assignment.fieldType)
         ? assignment.fieldType
@@ -175,13 +194,23 @@ function buildField(
         normalization.dateFormat = 'YYYY-MM-DD';
     }
 
+    const widgetNames = assigned
+        .map((widget) => widget.fieldName || widget.id)
+        .join(', ');
+    const pages = [
+        ...new Set(assignment.boxes.map((box) => box.pageNumber)),
+    ].sort((a, b) => a - b);
+    const description =
+        method === 'roi'
+            ? `Generated from ${assignment.boxes.length} annotated region(s) on page(s) ${pages.join(', ')}.` +
+              (widgetNames ? ` Widget(s): ${widgetNames}.` : '')
+            : `Generated from blank-form widget(s): ${widgetNames}.`;
+
     return {
         id: slugifyId(assignment.targetName, takenIds),
         name: assignment.targetName.trim() || 'Untitled Field',
         label: assigned[0]?.labels[0]?.text || assignment.targetName,
-        description: `Generated from blank-form widget(s): ${assigned
-            .map((widget) => widget.fieldName || widget.id)
-            .join(', ')}.`,
+        description,
         type,
         required: assignment.required,
         filenameRules: {
@@ -191,7 +220,10 @@ function buildField(
             caseInsensitive: true,
         },
         contentRules: {
-            enabled: true,
+            // A ROI box-only target has no widget, so there is no printed
+            // label to strip or re-find; leaving the rules enabled with an
+            // empty label list would fail structural validation.
+            enabled: labels.length > 0,
             labels,
             regexPatterns: [],
             positionHint: 'after_label',
@@ -202,15 +234,60 @@ function buildField(
     };
 }
 
+/**
+ * Group drawn boxes by page into the annotation schema shape the backend
+ * validates: one entry per box, so a value split across two regions on one
+ * page produces two boxes for the same fieldId (the reader tries them in
+ * order). `fields` is index-aligned with `assignments`.
+ */
+function buildAnnotationSchema(
+    assignments: TargetAssignment[],
+    fields: FieldDefinition[]
+): AnnotationSchema {
+    const byPage = new Map<number, { fieldId: string; rect: PointRect }[]>();
+    assignments.forEach((assignment, index) => {
+        const fieldId = fields[index].id;
+        for (const box of assignment.boxes) {
+            const entries = byPage.get(box.pageNumber) || [];
+            // Normalize so a box dragged up-left still stores x0<x1, y0<y1:
+            // the backend rejects inverted rects.
+            entries.push({ fieldId, rect: normalizeRect(box.rect) });
+            byPage.set(box.pageNumber, entries);
+        }
+    });
+    return {
+        coordinateSystem: 'pdf-points-display-top-left',
+        pages: [...byPage.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([pageNumber, entries]) => ({ pageNumber, fields: entries })),
+    };
+}
+
 export function buildProfileFromBlankForm(
     analysis: BlankFormAnalysis,
     assignments: TargetAssignment[],
-    meta: { name: string; description?: string }
+    meta: { name: string; description?: string },
+    options: { method?: ProfileMethod } = {}
 ): ExtractionProfile {
+    const method: ProfileMethod = options.method === 'roi' ? 'roi' : 'label';
     const takenIds = new Set<string>();
-    const fields = assignments
-        .filter((assignment) => assignment.widgetIds.length > 0)
-        .map((assignment) => buildField(assignment, analysis.widgets, takenIds));
+    // A ROI profile is unusable without boxes and a label profile is unusable
+    // without widgets, so unusable targets are dropped rather than emitted as
+    // fields that can never be filled.
+    const usable = assignments.filter((assignment) =>
+        method === 'roi'
+            ? assignment.boxes.length > 0
+            : assignment.widgetIds.length > 0
+    );
+    const fields = usable.map((assignment) =>
+        buildField(assignment, analysis.widgets, takenIds, method)
+    );
+    const extractionSettings: NonNullable<ExtractionProfile['extractionSettings']> =
+        { labelSimilarityThreshold: 0.82 };
+    if (method === 'roi') {
+        extractionSettings.method = 'roi';
+        extractionSettings.annotationSchema = buildAnnotationSchema(usable, fields);
+    }
     const timestamp = Date.now();
     return {
         id: `profile-blank-form-${timestamp}`,
@@ -229,7 +306,7 @@ export function buildProfileFromBlankForm(
             strategy: 'review',
             allowCloudModels: false,
         },
-        extractionSettings: { labelSimilarityThreshold: 0.82 },
+        extractionSettings,
         ocrSettings: {
             enabledFallback: true,
             autoDetectScanned: true,
@@ -242,9 +319,13 @@ export function buildProfileFromBlankForm(
     };
 }
 
-/** Targets are only usable once they carry a name; ambiguity helper for UI. */
+/** Targets are only usable once they carry a name; ambiguity helper for UI.
+ *  The geometry requirement follows the method: label matching needs at least
+ *  one assigned widget, ROI needs an annotated region on every target (its
+ *  widgets are optional corroboration). */
 export function assignmentIssues(
-    assignments: TargetAssignment[]
+    assignments: TargetAssignment[],
+    method: ProfileMethod = 'label'
 ): string[] {
     const issues: string[] = [];
     const names = assignments.map((a) => a.targetName.trim().toLowerCase());
@@ -255,7 +336,15 @@ export function assignmentIssues(
             issues.push(`Duplicate target name "${assignments[index].targetName}".`);
         }
     });
-    if (!assignments.some((a) => a.widgetIds.length > 0)) {
+    if (method === 'roi') {
+        assignments.forEach((assignment, index) => {
+            if (assignment.boxes.length === 0) {
+                issues.push(
+                    `Target #${index + 1} ("${assignment.targetName.trim() || 'unnamed'}") has no annotated region.`
+                );
+            }
+        });
+    } else if (!assignments.some((a) => a.widgetIds.length > 0)) {
         issues.push('Assign at least one form widget to a target.');
     }
     return issues;
