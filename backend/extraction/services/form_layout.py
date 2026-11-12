@@ -17,6 +17,7 @@ from .document_extraction import (
     _group_words_into_rows,
     _pdf_document_pages,
 )
+from .roi_extraction import validate_roi_schema
 
 # Maximum centerline gap (pt) between a widget and a same-row text run before
 # the run stops being considered its label. generous but bounded so distant
@@ -431,7 +432,57 @@ def validate_profile_config(data):
             and max_length < min_length
         ):
             errors.append(f"Field {label}: maxLength is below minLength.")
+    errors.extend(_extraction_method_errors(data, fields))
     return errors
+
+
+def _extraction_method_errors(data, fields):
+    """Method/schema consistency.
+
+    A profile switched to 'roi' without annotated boxes has no way to find a
+    value, and every field would come back empty - the exact symptom that reads
+    as an extraction bug instead of the configuration error it is. The switch
+    is refused here, at authoring time, rather than degraded silently.
+    """
+    extraction_settings = data.get("extractionSettings") or {}
+    if not isinstance(extraction_settings, dict):
+        return ["extractionSettings must be an object."]
+    method = extraction_settings.get("method")
+    if method not in (None, "label", "roi"):
+        return [f"Unknown extraction method {method!r}."]
+    if method != "roi":
+        return []
+    schema_errors = validate_roi_schema(
+        extraction_settings.get("annotationSchema")
+    )
+    schema = extraction_settings.get("annotationSchema")
+    annotated = {
+        entry.get("fieldId")
+        for page in (
+            schema.get("pages", []) if isinstance(schema, dict) else []
+        )
+        if isinstance(page, dict)
+        for entry in page.get("fields", [])
+        if isinstance(entry, dict)
+    }
+    declared_ids = {
+        field.get("id")
+        for field in fields
+        if isinstance(field.get("id"), str)
+    }
+    schema_errors.extend(
+        f"Annotation schema references unknown field {field_id!r}."
+        for field_id in sorted(
+            item for item in annotated - declared_ids
+            if isinstance(item, str)
+        )
+    )
+    if schema_errors:
+        schema_errors.append(
+            "Switch the profile back to label matching until the form is "
+            "annotated."
+        )
+    return schema_errors
 
 
 def _check_regex(pattern, context, errors):

@@ -18,7 +18,35 @@ export type ExtractionStatus =
   | 'EXTRACTION_ERROR';
 
 export type ExtractionSource = 'filename' | 'form_field' | 'pdf_text' | 'ocr' | 'ocr_space' | 'ai' | 'manual';
-export type ExtractionMethod = 'regex_filename' | 'label_proximity' | 'regex_content' | 'layout_aware' | 'acroform_name' | 'acroform_field' | 'acroform_pattern' | 'ocr_tesseract' | 'ollama_llm' | 'manual_override';
+export type ExtractionMethod = 'regex_filename' | 'label_proximity' | 'regex_content' | 'layout_aware' | 'acroform_name' | 'acroform_field' | 'acroform_pattern' | 'ocr_tesseract' | 'ollama_llm' | 'manual_override' | 'roi_widget' | 'roi_textbox' | 'roi_words' | 'roi_ocr';
+
+/**
+ * One box drawn on the blank form, in PDF points with a top-left origin. The
+ * `rect` tuple matches FormWidgetLayout.rect so both live in one coordinate
+ * system.
+ */
+export interface AnnotationBox {
+  fieldId: string;
+  rect: [number, number, number, number];
+}
+
+export interface AnnotationSchemaPage {
+  pageNumber: number;
+  fields: AnnotationBox[];
+}
+
+/**
+ * Geometry an operator drew on the blank form. ROI extraction reads only these
+ * boxes. A profile set to method 'roi' without a schema is refused at save
+ * time rather than degraded to an empty schema, because empty schema means
+ * every field comes back blank and reads as an extraction bug instead of a
+ * configuration error.
+ */
+export interface AnnotationSchema {
+  /** Descriptive only; stored boxes are always PDF points, top-left origin. */
+  coordinateSystem?: string;
+  pages: AnnotationSchemaPage[];
+}
 
 /**
  * Reconciliation policy. 'strict_match' is the canonical stored value;
@@ -99,6 +127,13 @@ export interface ExtractionProfile {
      * answers live on page 1 (e.g. a W-9 followed by IRS instructions).
      */
     firstPageOnly?: boolean;
+    /**
+     * 'label' (default) runs the label-anchored pipeline. 'roi' reads only the
+     * annotated boxes in `annotationSchema`; switching to it without a schema
+     * is rejected.
+     */
+    method?: 'label' | 'roi';
+    annotationSchema?: AnnotationSchema;
   };
   ocrSettings: {
     enabledFallback: boolean;
@@ -168,6 +203,8 @@ export interface FieldDiagnostic {
   finalValue: string;
   source: ExtractionSource;
   method: ExtractionMethod;
+  /** Which ROI tier supplied the value; only set by region-of-interest runs. */
+  roiTier?: 'widget' | 'textbox' | 'words' | 'ocr' | null;
   matchedPatternOrLabel?: string;
   validationPassed: boolean;
   validationError?: string;

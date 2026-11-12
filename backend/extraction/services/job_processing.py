@@ -22,8 +22,26 @@ from ..models import (
     ProcessingJob,
 )
 from .document_extraction import process_pdf
+from .roi_extraction import process_pdf_roi
 
 logger = logging.getLogger(__name__)
+
+
+def _extractor_for(extraction_profile):
+    """The extraction entry point a profile selects.
+
+    A profile opts into region-of-interest reading by setting
+    `extractionSettings.method = "roi"`; every other profile keeps the
+    label-anchored pipeline. The ROI schema travels inside extractionSettings,
+    so no additional plumbing is needed here.
+    """
+    extraction_settings = extraction_profile.get("extractionSettings") or {}
+    if (
+        isinstance(extraction_settings, dict)
+        and extraction_settings.get("method") == "roi"
+    ):
+        return process_pdf_roi
+    return process_pdf
 
 
 def _document_totals(job_id):
@@ -80,7 +98,8 @@ def _extract_document(job_id, document, extraction_profile, content=None):
         if content is None:
             with document.file.open("rb") as handle:
                 content = handle.read()
-        return process_pdf(content, document.filename, extraction_profile), None
+        extractor = _extractor_for(extraction_profile)
+        return extractor(content, document.filename, extraction_profile), None
     except Exception as exc:
         handled_errors = (
             DRFValidationError,

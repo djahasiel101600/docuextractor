@@ -41,6 +41,45 @@ and the spec disagree, the project decides which wins — do not silently
 adopt the reference's behavior. List divergences and let the maintainer
 choose.
 
+## Schema shape divergence
+
+`pdf_annotator.py` exports `field_schema.json` in its own shape:
+
+```json
+{"source_pdf": "...", "coordinate_system": "...",
+ "pages": [{"page": 1,
+            "fields": [{"name": "Print name of signer",
+                        "bbox_pdf_pt": {"x0": 0, "y0": 0, "x1": 0, "y1": 0},
+                        "bbox_normalized": {"x0": 0, "y0": 0, "x1": 0, "y1": 0}}]}]}
+```
+
+The application persists `extractionSettings.annotationSchema` in a
+different shape for the same concept:
+
+```json
+{"pages": [{"pageNumber": 1,
+            "fields": [{"fieldId": "print_name_of_signer",
+                        "rect": [0, 0, 0, 0]}]}]}
+```
+
+**`field_schema.json` is NOT directly consumable by `process_pdf_roi`.**
+The names differ (`page` vs `pageNumber`, `bbox_pdf_pt` vs `rect`), the
+rect is an object rather than an ordered array, and an annotation name
+is free text while `fieldId` must match a field id in the profile.
+Run the export through `convert_schema.py` before using it as a profile
+schema:
+
+```
+python analysis/reference/convert_schema.py field_schema.json \
+    --field-map names.json --out annotation_schema.json
+```
+
+`names.json` maps annotation names to profile field ids, e.g.
+`{"Print name of signer": "print_name_of_signer"}`. Unmapped names are
+slugified, which is only correct when the annotation was named after
+the field id. `bbox_normalized` is ignored: the application stores PDF
+points only.
+
 ## Lineage
 
 These files were built during an earlier phase of the project and are

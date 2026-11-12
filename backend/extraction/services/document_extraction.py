@@ -82,6 +82,12 @@ PRIORITY_ALIASES = {"strict": "strict_match"}
 # bare "X" is also a legitimate middle initial in a name field.
 _CHECKBOX_TRUE_TOKENS = {"x", "✓", "✔", "yes", "y",
                          "true", "checked", "on", "1"}
+# A check box whose appearance stream embeds the glyph as UTF-8 bytes comes
+# back decode-mangled rather than as U+2713/U+2714, and the mangle depends on
+# the code page used to read the bytes ("Γ£ô" in CP437, "âœ“" in Latin-1).
+# These are data-level spellings of the same on-state; tokens are compared
+# casefolded, so the folded forms are listed.
+_CHECKBOX_MOJIBAKE_CHECKS = {"γ£ô", "γ£ö", "âœ“", "âœ”", "√"}
 _CHECKBOX_FALSE_TOKENS = {"no", "n", "false",
                           "unchecked", "off", "0"}
 
@@ -280,13 +286,23 @@ def _normalize_checkbox(value):
     values are returned untouched so a mis-captured box never becomes a
     boolean, and an empty capture stays empty (a missed box is reported as
     NOT_FOUND instead of being fabricated into "false").
+
+    Filled PDFs store the box's on-state export name, which is arbitrary:
+    Adobe forms use "\x14" (a ZapfDingbats check), others use "1", "3" or
+    "Yes". For a boolean field any digit run is an on-state except all zeroes.
     """
     token = " ".join(value.strip().split()).casefold()
     compact = token.replace(" ", "")
-    if token in _CHECKBOX_TRUE_TOKENS or compact == "[x]":
+    if (
+        token in _CHECKBOX_TRUE_TOKENS
+        or token in _CHECKBOX_MOJIBAKE_CHECKS
+        or compact in ("[x]", "\x14")
+    ):
         return "true"
     if token in _CHECKBOX_FALSE_TOKENS or compact == "[]":
         return "false"
+    if token.isdigit():
+        return "false" if not token.strip("0") else "true"
     return value
 
 
@@ -394,7 +410,7 @@ def _validate_value(value, rules):
     return True, None
 
 
-def _pdf_document_pages(document, page_indices=None):
+def _pdf_document_pages(document, page_indices=None, include_words=True):
     pages = []
     indices = (
         page_indices
@@ -404,18 +420,22 @@ def _pdf_document_pages(document, page_indices=None):
     for index in indices:
         page = document.load_page(index)
         text = page.get_text("text")
-        words = [
-            {
-                "text": item[4],
-                "x0": float(item[0]),
-                "y0": float(item[1]),
-                "x1": float(item[2]),
-                "y1": float(item[3]),
-                "confidence": 1.0,
-            }
-            for item in page.get_text("words", sort=True)
-            if item[4].strip()
-        ]
+        # Word geometry costs a second text pass and is only consumed by label
+        # matching; region extraction reads its own boxes and skips it.
+        words = []
+        if include_words:
+            words = [
+                {
+                    "text": item[4],
+                    "x0": float(item[0]),
+                    "y0": float(item[1]),
+                    "x1": float(item[2]),
+                    "y1": float(item[3]),
+                    "confidence": 1.0,
+                }
+                for item in page.get_text("words", sort=True)
+                if item[4].strip()
+            ]
         pages.append(
             {
                 "pageNumber": index + 1,
