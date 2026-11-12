@@ -93,6 +93,34 @@ Choose **Cross-check every configured field**, **Review uncertain or conflicting
 
 Cloud-tagged models such as `beam:cloud` are supported when **Allow Ollama cloud models** is enabled in the profile. Cloud models send document text, field labels, and extraction context to Ollama's cloud service for processing. This opt-in defaults off; without it, the backend refuses cloud model requests before sending document content. Use a locally installed model if document data must remain on this machine. The app still connects only to a loopback Ollama URL; Ollama itself routes cloud-model requests to its cloud service. AI requests are serialized to limit simultaneous model use.
 
+## Region-of-interest (ROI) extraction
+
+A profile can pin each field to the place on the page where its value is printed instead of searching the document for a label. ROI is opt-in per profile (`extractionSettings.method = "roi"`); a profile without it keeps using label matching, and both methods share the same diagnostics, review UI, and exports. A field may own several regions, on one page or across pages, and they are read in the order they were drawn.
+
+Each field is read from its own rectangle through a tier ladder, and the tier that answered is recorded with the result so review shows how the value was read:
+
+1. an AcroForm widget covering at least 30% of the rectangle,
+2. text contained in the rectangle,
+3. words intersecting the rectangle,
+4. OCR of the rectangle crop, when OCR is enabled.
+
+Rectangles live in `extractionSettings.annotationSchema`, inside the same profile `configuration` JSON as every other setting, so no migration is involved. Schema coordinates are rendered (display) space, in PDF points with a top-left origin.
+
+### Authoring an ROI profile
+
+Use the blank-form wizard in the Profiles view:
+
+1. Choose **From Blank Form** and upload one copy of the template. Fillable and flattened PDFs both work; a template with no form fields still reaches the annotate step, where the drawn regions are the whole mapping surface.
+2. In **Annotate**, drag a rectangle around each value. A rectangle that overlaps a form field is bound to that widget automatically; drawing over no field is also allowed, and the target is then identified by name alone. Draw further rectangles for a value split across lines or pages, or choose an existing target under **Save region under** to attach the new rectangle to it. Saved regions are overlaid on the page and can be deleted from the **Annotated regions** list.
+3. In **Map**, confirm each target's field name, type, priority, and required flag, then choose **Annotated regions (ROI)** under Extraction method. Choosing **Label matching** instead emits a label-mode profile from the same widgets.
+4. In **Review**, save. The generated profile is dry-run against `POST /api/forms/validate-profile/` before it is stored, so a target without a region, or a field id the validator does not know, is reported in the wizard instead of at extraction time.
+
+Rotated pages are handled: rectangles are stored as drawn and de-rotated per page before the widget and word tiers compare them, so a `/Rotate 90`, `180`, or `270` form reads correctly. Only the pages the schema references are read, regardless of `firstPageOnly`.
+
+When the profile also has filename rules, the two conventional sources are reconciled the same way as in label mode. `pdf_first` (the default) keeps the region value when one was read and lets the filename fill only an empty read, which is reported as `FILENAME_ONLY`. `filename_first` prefers a non-empty filename value and keeps the region read as corroboration in the diagnostic. `strict_match`, `strict`, and `consensus` report a disagreement as `isConflict` with a `MISMATCH` status and a blank value for review; `consensus` is identical to `strict_match` here until a third source exists.
+
+For environments without the wizard, the desktop annotator under `analysis/reference/` can still draw a schema, and `convert_schema.py` converts its export into `annotationSchema`; see [analysis/reference/README.md](analysis/reference/README.md).
+
 ## Run locally
 
 Activate `.venv` and make sure `.env` has a non-placeholder `DJANGO_SECRET_KEY`. The standard development command starts both the backend and frontend:
