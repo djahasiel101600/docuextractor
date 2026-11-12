@@ -3098,6 +3098,168 @@ class RoiExtractionTests(SimpleTestCase):
                 normalize_value(raw, {"checkbox": True}), "true", raw
             )
 
+    @staticmethod
+    def _rotated_text_pdf(rotation):
+        """One text line at a known unrotated point, page rotated afterwards.
+
+        Returns (bytes, display_rect): the rectangle the line occupies on the
+        rendered (rotated) page, which is the space annotations are drawn in.
+        """
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((100, 400), "Rotated", fontsize=10)
+        word_rect = fitz.Rect(page.get_text("words")[0][:4])
+        page.set_rotation(rotation)
+        display_rect = word_rect * page.rotation_matrix
+        pdf_bytes = document.tobytes()
+        document.close()
+        return pdf_bytes, display_rect
+
+    @staticmethod
+    def _rotated_widget_pdf(rotation):
+        document = fitz.open()
+        page = document.new_page()
+        widget = fitz.Widget()
+        widget.field_name = "f1_01"
+        widget.field_value = "Jane Doe"
+        widget.rect = fitz.Rect(140, 60, 220, 80)
+        widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        page.add_widget(widget)
+        page.set_rotation(rotation)
+        display_rect = fitz.Rect(140, 60, 220, 80) * page.rotation_matrix
+        pdf_bytes = document.tobytes()
+        document.close()
+        return pdf_bytes, display_rect
+
+    def test_roi_reads_text_on_rotated_pages(self):
+        for rotation in (90, 180):
+            pdf_bytes, display_rect = self._rotated_text_pdf(rotation)
+            profile = self._profile(
+                [create_labeled_field("full_name", "Full Name:")],
+                self._schema([("full_name", 1, tuple(display_rect))]),
+            )
+
+            diagnostic = process_pdf_roi(
+                pdf_bytes, "application.pdf", profile
+            )["diagnostics"]["full_name"]
+
+            self.assertEqual(diagnostic["finalValue"], "Rotated", rotation)
+            self.assertEqual(diagnostic["roiTier"], "textbox", rotation)
+
+    def test_roi_reads_a_widget_on_a_rotated_page(self):
+        pdf_bytes, display_rect = self._rotated_widget_pdf(270)
+        profile = self._profile(
+            [create_labeled_field("full_name", "Full Name:")],
+            self._schema([("full_name", 1, tuple(display_rect))]),
+        )
+
+        diagnostic = process_pdf_roi(
+            pdf_bytes, "application.pdf", profile
+        )["diagnostics"]["full_name"]
+
+        self.assertEqual(diagnostic["finalValue"], "Jane Doe")
+        self.assertEqual(diagnostic["roiTier"], "widget")
+
+    def _filename_field(self, field_id, label, pattern, priority):
+        field = create_labeled_field(field_id, label)
+        field["filenameRules"] = {
+            "enabled": True,
+            "patterns": [pattern],
+            "captureGroup": 1,
+            "caseInsensitive": True,
+        }
+        field["priority"] = priority
+        return field
+
+    def _filename_diagnostic(self, priority, filename):
+        pdf_bytes = create_layout_pdf(
+            [("Full Name:", 72, 72), ("Jane Doe", 150, 72)]
+        )
+        profile = self._profile(
+            [
+                self._filename_field(
+                    "full_name", "Full Name:", r"APP-\d+_(.+)", priority
+                )
+            ],
+            self._schema([("full_name", 1, (145, 62, 210, 78))]),
+        )
+        return process_pdf_roi(
+            pdf_bytes, filename, profile
+        )["diagnostics"]["full_name"]
+
+    def test_filename_first_selects_the_filename_and_flags_the_disagreement(self):
+        diagnostic = self._filename_diagnostic(
+            "filename_first", "APP-777_Robert Smith.pdf"
+        )
+
+        self.assertEqual(diagnostic["finalValue"], "Robert Smith")
+        self.assertEqual(diagnostic["filenameValue"], "Robert Smith")
+        self.assertEqual(diagnostic["source"], "filename")
+        self.assertEqual(diagnostic["method"], "regex_filename")
+        self.assertEqual(diagnostic["status"], "MISMATCH")
+        self.assertTrue(diagnostic["isConflict"])
+        self.assertEqual(diagnostic["roiTier"], "textbox")
+        self.assertIn("priority", diagnostic["explanation"])
+
+    def test_filename_first_agreement_is_still_filename_only(self):
+        diagnostic = self._filename_diagnostic(
+            "filename_first", "APP-777_Jane Doe.pdf"
+        )
+
+        self.assertEqual(diagnostic["finalValue"], "Jane Doe")
+        self.assertFalse(diagnostic["isConflict"])
+        self.assertEqual(diagnostic["status"], "FILENAME_ONLY")
+        self.assertIn("agrees", diagnostic["explanation"])
+
+    def test_strict_match_priority_blanks_conflicting_values(self):
+        # 'strict' is the specification's alias for the stored 'strict_match'.
+        for priority in ("strict_match", "strict", "consensus"):
+            diagnostic = self._filename_diagnostic(
+                priority, "APP-777_Robert Smith.pdf"
+            )
+
+            self.assertEqual(diagnostic["finalValue"], "", priority)
+            self.assertEqual(diagnostic["status"], "MISMATCH", priority)
+            self.assertTrue(diagnostic["isConflict"], priority)
+            self.assertTrue(diagnostic["reviewRequired"], priority)
+
+    def test_strict_match_agreement_keeps_the_roi_value(self):
+        diagnostic = self._filename_diagnostic(
+            "strict_match", "APP-777_Jane Doe.pdf"
+        )
+
+        self.assertEqual(diagnostic["finalValue"], "Jane Doe")
+        self.assertEqual(diagnostic["source"], "pdf_text")
+        self.assertEqual(diagnostic["method"], "roi_textbox")
+        self.assertEqual(diagnostic["status"], "MATCHED")
+        self.assertFalse(diagnostic["isConflict"])
+
+    def test_filename_fills_a_field_when_the_box_reads_nothing(self):
+        # With no document-side candidate, strict_match also falls back to the
+        # filename; only a *disagreement* is blanked.
+        for priority in ("pdf_first", "strict_match"):
+            pdf_bytes = create_layout_pdf([("Full Name:", 72, 72)])
+            profile = self._profile(
+                [
+                    self._filename_field(
+                        "full_name", "Full Name:", r"APP-\d+_(.+)", priority
+                    )
+                ],
+                self._schema([("full_name", 1, (145, 62, 210, 78))]),
+            )
+
+            diagnostic = process_pdf_roi(
+                pdf_bytes, "APP-777_Robert Smith.pdf", profile
+            )["diagnostics"]["full_name"]
+
+            self.assertEqual(diagnostic["finalValue"], "Robert Smith", priority)
+            self.assertEqual(diagnostic["source"], "filename", priority)
+            self.assertEqual(diagnostic["status"], "FILENAME_ONLY", priority)
+            self.assertIsNone(diagnostic["roiTier"], priority)
+            self.assertIn(
+                "Filename rule supplied", diagnostic["explanation"], priority
+            )
+
     def test_batch_selects_the_roi_extractor_per_profile(self):
         self.assertIs(
             _extractor_for({"extractionSettings": {"method": "roi"}}),

@@ -25,7 +25,9 @@ from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 from .document_extraction import (
+    PRIORITY_ALIASES,
     _collect_form_fields,
+    _extract_from_filename,
     _group_words_into_rows,
     _label_similarity_threshold,
     _match_label_in_row,
@@ -143,11 +145,11 @@ def roi_schema_entries(schema):
     to "no boxes" would fill every field with nothing and read as an extraction
     bug instead of the configuration error it is.
 
-    Schema coordinates assume `/Rotate 0`. A page with a non-zero rotation
-    displays its content rotated while word geometry stays in unrotated user
-    space, so boxes drawn on the displayed page will offset on such a form.
-    The planned fix is to apply the page's rotation matrix here, at the point
-    where schema coordinates become page coordinates.
+    Rectangles stay exactly as authored: schema coordinates are display
+    (rendered) space, which is where an operator draws them. The reader
+    de-rotates each box per page for the tiers whose geometry lives in
+    unrotated user space (widgets and words) and leaves it untouched for the
+    display-space pixmap clip, so this mapping does not need the document.
     """
     errors = validate_roi_schema(schema)
     if errors:
@@ -312,48 +314,109 @@ def _ocr_fallback_enabled(ocr_settings):
 def _read_roi(page, rect, widgets, labels, minimum_similarity, ocr_settings, timings):
     """Read one annotated box through the tier ladder.
 
-    Returns (raw_text, tier, confidence). `rect` is the box; the text tiers run
-    on the safety-expanded copy so ink that touches the border is still read.
+    Returns (raw_text, tier, confidence). `rect` is the box in display space,
+    which is how it was drawn. Widget and word geometry live in unrotated user
+    space, so those tiers compare against the de-rotated box; a pixmap clip is
+    display-space and uses the box unchanged. The text tiers run on a
+    safety-expanded copy so ink that touches the border is still read.
     """
-    widget = _widget_for_rect(rect, widgets)
+    unrotated = rect * page.derotation_matrix
+    widget = _widget_for_rect(unrotated, widgets)
     if widget is not None:
         return str(widget.get("value") or "").strip(), "widget", 1.0
-    expanded = fitz.Rect(
+    expanded_display = fitz.Rect(
         rect.x0 - ROI_PADDING_X,
         rect.y0 - ROI_PADDING_Y,
         rect.x1 + ROI_PADDING_X,
         rect.y1 + ROI_PADDING_Y,
     ) & page.rect
-    text, tier = _capture_text(page, expanded, labels, minimum_similarity)
+    expanded_unrotated = fitz.Rect(
+        unrotated.x0 - ROI_PADDING_X,
+        unrotated.y0 - ROI_PADDING_Y,
+        unrotated.x1 + ROI_PADDING_X,
+        unrotated.y1 + ROI_PADDING_Y,
+    ) & page.mediabox
+    text, tier = _capture_text(
+        page, expanded_unrotated, labels, minimum_similarity
+    )
     if text:
         return text, tier, _TIER_CONFIDENCE[tier]
     if _ocr_fallback_enabled(ocr_settings):
         text, confidence = _ocr_rect(
-            page, expanded, ocr_settings.get("language", "eng"), timings
+            page, expanded_display, ocr_settings.get("language", "eng"), timings
         )
         if text:
             return text, "ocr", confidence
     return "", None, 0.0
 
 
-def _build_roi_diagnostic(field, raw, tier, page_number, confidence):
-    """One FieldDiagnostic payload per field, shaped like process_pdf's."""
-    value = normalize_value(raw, field.get("normalization", {}))
+def _build_roi_diagnostic(
+    field,
+    raw,
+    tier,
+    page_number,
+    confidence,
+    filename_value=None,
+    matched_pattern=None,
+):
+    """One FieldDiagnostic payload per field, shaped like process_pdf's.
+
+    The annotated read is the document-side candidate; the field's filename
+    rule is the only other conventional source this mode has, so priority is
+    resolved between exactly those two. The rules mirror `process_pdf`:
+    `filename_first` lets the filename answer even when the box disagrees (the
+    disagreement still flags the field), `strict_match` blanks a disagreement,
+    an uncorroborated filename value is `FILENAME_ONLY` rather than `MATCHED`,
+    and `consensus` behaves exactly like `strict_match` until a third source
+    exists.
+    """
+    normalization = field.get("normalization", {})
+    priority = field.get("priority", "pdf_first")
+    priority = PRIORITY_ALIASES.get(priority, priority)
+    roi_value = normalize_value(raw or "", normalization)
+    filename_normalized = normalize_value(filename_value or "", normalization)
+    conflict = bool(
+        roi_value
+        and filename_normalized
+        and roi_value.casefold() != filename_normalized.casefold()
+    )
+    priority_conflict = bool(
+        conflict and priority in ("strict_match", "consensus")
+    )
+    filename_wins = bool(filename_normalized) and (
+        priority == "filename_first" or not roi_value
+    )
+    if priority_conflict:
+        value = ""
+    elif filename_wins:
+        value = filename_normalized
+    else:
+        value = roi_value
+
     passed, validation_error = _validate_value(
         value, field.get("validation", {})
     )
     if not value:
-        status = "NOT_FOUND"
-    elif not passed:
-        status = "INVALID"
-    elif tier == "ocr":
+        status = "MISMATCH" if priority_conflict else "NOT_FOUND"
+    elif conflict:
+        status = "MISMATCH"
+    elif tier == "ocr" and not filename_wins:
         status = "OCR_EXTRACTED"
     else:
         status = "MATCHED"
+    if value and filename_wins and status == "MATCHED":
+        # Mirrors process_pdf: a filename-supplied value never wears the
+        # document-corroborated badge, even when the box agrees with it.
+        status = "FILENAME_ONLY"
+    status_before_validation = status
+    if value and not passed:
+        status = "INVALID"
     review_required = bool(
         (field.get("required", False) and not value)
         or (value and not passed)
-        or tier == "ocr"
+        or conflict
+        or priority_conflict
+        or (tier == "ocr" and not filename_wins and bool(value))
     )
     explanation_parts = []
     if tier:
@@ -366,19 +429,67 @@ def _build_roi_diagnostic(field, raw, tier, page_number, confidence):
         )
     if value and not passed and validation_error:
         explanation_parts.append(validation_error)
-    if tier == "ocr":
+    if tier == "ocr" and not filename_wins and value:
         explanation_parts.append(
             "OCR output is a best-effort read of the region; verify this value."
         )
-    source = _TIER_SOURCES[tier] if tier else "manual"
-    method = _TIER_METHODS[tier] if tier else "layout_aware"
-    evidence = raw if tier else None
+    if conflict or priority_conflict:
+        explanation_parts.append("Sources disagree; verify the selected value.")
+    if filename_wins:
+        if conflict:
+            explanation_parts.append(
+                "The filename value was selected by the field's priority."
+            )
+        elif roi_value:
+            explanation_parts.append(
+                "The filename rule matched and the annotated region agrees."
+            )
+        else:
+            explanation_parts.append(
+                "Filename rule supplied this value; the annotated region "
+                "produced no candidate to cross-check it."
+            )
+    source = (
+        "filename"
+        if filename_wins
+        else _TIER_SOURCES[tier]
+        if tier and value
+        else "manual"
+    )
+    method = (
+        "regex_filename"
+        if filename_wins
+        else _TIER_METHODS[tier]
+        if tier and value
+        else "layout_aware"
+    )
+    # Evidence for the per-source fields stays the annotated read; the
+    # pattern only ever backs the diagnostic-level supportingEvidence.
+    tier_evidence = raw if tier else None
+    evidence = matched_pattern if filename_wins else tier_evidence
+    if priority_conflict:
+        selection_reason = (
+            f"The field's {priority} priority rejected conflicting filename "
+            "and document candidates."
+        )
+    elif filename_wins:
+        selection_reason = (
+            "The field's filename_first priority selected the filename value."
+            if priority == "filename_first"
+            else "No annotated value was read; the filename rule supplied the value."
+        )
+    elif tier:
+        selection_reason = f"The annotated box was read by the {tier} tier."
+    else:
+        selection_reason = "No annotated box for this field produced a value."
     return {
         "fieldId": field["id"],
         "fieldName": field.get("name", field["id"]),
         "status": status,
-        "statusBeforeValidation": None,
-        "filenameValue": None,
+        "statusBeforeValidation": (
+            status_before_validation if status == "INVALID" else None
+        ),
+        "filenameValue": filename_value,
         "pdfValue": raw if tier in ("textbox", "words") else None,
         "ocrValue": raw if tier == "ocr" else None,
         "ocrSpaceValue": None,
@@ -390,10 +501,10 @@ def _build_roi_diagnostic(field, raw, tier, page_number, confidence):
         "source": source,
         "method": method,
         "roiTier": tier,
-        "matchedPatternOrLabel": None,
+        "matchedPatternOrLabel": matched_pattern if filename_wins else None,
         "validationPassed": passed if value else False,
         "validationError": validation_error,
-        "confidenceScore": confidence if tier else 0.0,
+        "confidenceScore": confidence if tier and not filename_wins else 0.0,
         "pdfConfidenceScore": (
             confidence if tier in ("textbox", "words") else None
         ),
@@ -401,27 +512,23 @@ def _build_roi_diagnostic(field, raw, tier, page_number, confidence):
         "formConfidenceScore": confidence if tier == "widget" else None,
         "formMethod": "roi_widget" if tier == "widget" else None,
         "pdfEvidence": (
-            evidence if tier in ("textbox", "words") else None
+            tier_evidence if tier in ("textbox", "words") else None
         ),
         "pdfPageNumber": page_number if tier in ("textbox", "words") else None,
-        "ocrEvidence": evidence if tier == "ocr" else None,
+        "ocrEvidence": tier_evidence if tier == "ocr" else None,
         "ocrPageNumber": page_number if tier == "ocr" else None,
         "ocrSpaceEvidence": None,
         "ocrSpacePageNumber": None,
         "ocrSpaceConfidenceScore": None,
-        "formEvidence": evidence if tier == "widget" else None,
+        "formEvidence": tier_evidence if tier == "widget" else None,
         "formPageNumber": page_number if tier == "widget" else None,
         "aiPageNumber": None,
         "candidateScores": {source: confidence} if tier else {},
-        "selectionReason": (
-            f"The annotated box was read by the {tier} tier."
-            if tier
-            else "No annotated box for this field produced a value."
-        ),
+        "selectionReason": selection_reason,
         "supportingEvidence": evidence,
-        "pageNumber": page_number,
+        "pageNumber": page_number if tier and not filename_wins else None,
         "explanation": " ".join(explanation_parts),
-        "isConflict": False,
+        "isConflict": conflict,
         "reviewRequired": review_required,
         "isManuallyCorrected": False,
     }
@@ -441,9 +548,12 @@ def process_pdf_roi(pdf_bytes, filename, profile):
     the schema's, which is narrower than any page limit and is intentional
     performance behaviour rather than a regression.
 
-    `filename` is accepted for signature parity with `process_pdf`. Filename
-    rules are not consulted, so this mode cannot raise a filename-vs-content
-    conflict.
+    `filename` participates through the profile's filename rules, the second
+    conventional source this mode owns. `filename_first`, `strict_match` and
+    `consensus` therefore produce the same selection, conflict and MISMATCH
+    outcomes as `process_pdf`; see `_build_roi_diagnostic`. `consensus` is
+    currently identical to `strict_match` here because two sources (the
+    annotated box and the filename rule) are all this mode has.
     """
     total_started = time.perf_counter()
     timings = {
@@ -519,11 +629,6 @@ def process_pdf_roi(pdf_bytes, filename, profile):
 
         form_started = time.perf_counter()
         widgets_by_page = {}
-        # TODO(roi-filename): filename-vs-content reconciliation is deferred. ROI
-        # diagnostics therefore never produce a filename/PDF conflict or a
-        # MISMATCH priority outcome, even for `filename_first`/`strict_match`
-        # profiles. Correctness of the read is unaffected; only corroboration
-        # is missing. Add reconciliation in a follow-up.
         for widget in _collect_form_fields(document, schema_pages):
             widgets_by_page.setdefault(
                 widget["pageNumber"] - 1, []
@@ -542,16 +647,33 @@ def process_pdf_roi(pdf_bytes, filename, profile):
         for field in fields:
             field_id = field["id"]
             boxes = rois.get(field_id, [])
+            filename_value, matched_pattern = _extract_from_filename(
+                filename, field
+            )
             raw, tier, page_number, confidence = "", None, None, 0.0
             if not boxes:
-                diagnostics[field_id] = _build_roi_diagnostic(
-                    field, "", None, None, 0.0
+                diagnostic = _build_roi_diagnostic(
+                    field,
+                    "",
+                    None,
+                    None,
+                    0.0,
+                    filename_value,
+                    matched_pattern,
                 )
-                diagnostics[field_id]["explanation"] = (
-                    "No region is annotated for this field in the profile "
-                    "schema."
-                )
-                values[field_id] = ""
+                if diagnostic["finalValue"]:
+                    diagnostic["explanation"] = (
+                        "No region is annotated for this field in the profile "
+                        "schema; the filename rule supplied the value."
+                    )
+                else:
+                    diagnostic["explanation"] = (
+                        "No region is annotated for this field in the profile "
+                        "schema."
+                    )
+                diagnostics[field_id] = diagnostic
+                values[field_id] = diagnostic["finalValue"]
+                used_ocr = used_ocr or diagnostic["source"] == "ocr"
                 continue
             for page_index, rect in boxes:
                 page = document.load_page(page_index)
@@ -584,7 +706,13 @@ def process_pdf_roi(pdf_bytes, filename, profile):
                     confidence = candidate_confidence
                     break
             diagnostic = _build_roi_diagnostic(
-                field, raw, tier, page_number, confidence
+                field,
+                raw,
+                tier,
+                page_number,
+                confidence,
+                filename_value,
+                matched_pattern,
             )
             if not raw and ocr_error and _ocr_fallback_enabled(ocr_settings):
                 diagnostic["explanation"] = (
@@ -592,7 +720,7 @@ def process_pdf_roi(pdf_bytes, filename, profile):
                 )
             diagnostics[field_id] = diagnostic
             values[field_id] = diagnostic["finalValue"]
-            used_ocr = used_ocr or (tier == "ocr" and bool(raw))
+            used_ocr = used_ocr or diagnostic["source"] == "ocr"
         timings["field_extraction_ms"] = round(
             (time.perf_counter() - field_started) * 1000, 3
         )
