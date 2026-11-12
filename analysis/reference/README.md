@@ -1,5 +1,15 @@
 # ROI Extraction Reference Implementation
 
+**The supported way to author an ROI profile is the in-app blank-form
+wizard** (Profiles → From Blank Form). It draws the regions, writes
+`extractionSettings.annotationSchema` directly, and dry-runs the profile
+against the API before saving; see the region-of-interest section of the
+root `README.md`. Nothing below is needed for that path.
+
+The desktop annotator and `convert_schema.py` remain here as the
+fallback for environments without the wizard, and as the reference for
+how the shipped reader behaves.
+
 These files are the **reference implementation** of the ROI-based
 template extraction method described in the project's extraction
 specification. They are:
@@ -67,7 +77,9 @@ The names differ (`page` vs `pageNumber`, `bbox_pdf_pt` vs `rect`), the
 rect is an object rather than an ordered array, and an annotation name
 is free text while `fieldId` must match a field id in the profile.
 Run the export through `convert_schema.py` before using it as a profile
-schema:
+schema. This conversion only exists because the annotator writes its own
+shape; a profile authored in the wizard already carries the application
+shape above.
 
 ```
 python analysis/reference/convert_schema.py field_schema.json \
