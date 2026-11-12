@@ -29,9 +29,13 @@ from .services.document_extraction import (
     _choose_content_candidate,
     _drop_duplicate_form_widgets,
     _needs_selective_ai_review,
+    _normalize_date,
+    _normalize_field_config,
     _normalize_ocrspace_lines,
     _ocr_pdf,
     _ocr_pdf_ocrspace,
+    _validate_value,
+    normalize_value,
     process_pdf,
 )
 from .services.country_data import is_country_value
@@ -2499,6 +2503,55 @@ class ExtractionApiTests(APITestCase):
         self.assertEqual(diag["status"], "FILENAME_ONLY")
         self.assertEqual(diag["source"], "filename")
 
+    def test_invalid_status_preserves_the_hidden_conflict(self):
+        """Regression: validation overwrote MISMATCH, so a reviewer saw only
+        INVALID and lost the fact that the sources disagreed."""
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"][0]["filenameRules"] = {
+            "enabled": True,
+            "patterns": [r"^Applicant_(.*)$"],
+            "captureGroup": 1,
+            "caseInsensitive": True,
+        }
+        profile["fields"][0]["validation"] = {
+            "allowedValues": ["Approved"]
+        }
+        pdf_bytes = create_layout_pdf([("Full Name: Jane Doe", 40, 100)])
+
+        result = process_pdf(
+            pdf_bytes, "Applicant_John Doe.pdf", profile)
+
+        diag = result["diagnostics"]["full_name"]
+        self.assertEqual(diag["finalValue"], "Jane Doe")
+        self.assertEqual(diag["status"], "INVALID")
+        self.assertEqual(diag["statusBeforeValidation"], "MISMATCH")
+        self.assertTrue(diag["isConflict"])
+        # Both facts survive in the explanation instead of one overwriting
+        # the other.
+        self.assertIn("not in the allowed values", diag["explanation"])
+        self.assertIn("Sources disagree", diag["explanation"])
+
+    def test_strict_priority_alias_matches_strict_match(self):
+        """Regression: 'strict' (the specification's name) silently fell back
+        to pdf_first instead of the strict_match policy."""
+        profile = copy.deepcopy(PROFILE)
+        profile["fields"][0]["filenameRules"] = {
+            "enabled": True,
+            "patterns": [r"^Applicant_(.*)$"],
+            "captureGroup": 1,
+            "caseInsensitive": True,
+        }
+        profile["fields"][0]["priority"] = "strict"
+        pdf_bytes = create_layout_pdf([("Full Name: Jane Doe", 40, 100)])
+
+        result = process_pdf(
+            pdf_bytes, "Applicant_John Doe.pdf", profile)
+
+        diag = result["diagnostics"]["full_name"]
+        self.assertEqual(diag["status"], "MISMATCH")
+        self.assertEqual(diag["finalValue"], "")
+        self.assertIn("strict", diag["selectionReason"])
+
 
 class DurableJobExecutionTests(APITestCase):
     """Heartbeat recovery, cooperative cancel and retry of failed documents."""
@@ -2623,14 +2676,62 @@ class DurableJobExecutionTests(APITestCase):
         self.create_document(
             job, "doc-excluded", status="excluded", assignment_status="excluded"
         )
+        self.create_document(
+            job, "doc-unassigned", status="skipped_unassigned",
+            assignment_status="unassigned",
+        )
 
         _finalize_job(job)
 
         job.refresh_from_db()
         self.assertEqual(job.processed_count, 2)
         self.assertEqual(job.failed_count, 1)
+        # Both user-excluded and unassigned documents count as skipped.
+        self.assertEqual(job.skipped_count, 2)
+        self.assertEqual(job.status, "completed")
+
+    @override_settings(OCR_ENABLED=False, PDF_PROCESSING_WORKERS=1)
+    def test_unassigned_documents_are_skipped_not_failed(self):
+        job = self.create_job(job_id="job-unassigned")
+        document = self.create_document(
+            job, "doc-unassigned", assignment_status="unassigned"
+        )
+
+        with patch(
+            "extraction.services.job_processing._extract_document"
+        ) as extract:
+            process_job(job.id)
+
+        extract.assert_not_called()
+        document.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(document.processing_status, "skipped_unassigned")
+        self.assertEqual(document.assignment_status, "unassigned")
+        self.assertIn("profile", document.assignment_reason.lower())
+        self.assertEqual(job.failed_count, 0)
         self.assertEqual(job.skipped_count, 1)
         self.assertEqual(job.status, "completed")
+
+    def test_manual_assignment_queues_a_skipped_document(self):
+        job = self.create_job(job_id="job-assign", status="completed")
+        document = self.create_document(
+            job, "doc-unassigned", status="skipped_unassigned",
+            assignment_status="unassigned",
+        )
+        document.error_details = "No extraction profile could be matched."
+        document.save(update_fields=["error_details"])
+
+        response = self.client.patch(
+            f"/api/documents/{document.id}/",
+            {"profileId": self.profile.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        document.refresh_from_db()
+        self.assertEqual(document.processing_status, "pending")
+        self.assertEqual(document.assignment_status, "assigned")
+        self.assertEqual(document.error_details, "")
 
     def test_retry_requeues_failed_documents_and_keeps_finished_ones(self):
         job = self.create_job(job_id="job-retry", status="completed")
@@ -2638,6 +2739,16 @@ class DurableJobExecutionTests(APITestCase):
         done = self.create_document(job, "doc-done", status="completed")
         excluded = self.create_document(
             job, "doc-excluded", status="excluded", assignment_status="excluded"
+        )
+        reassigned = self.create_document(
+            job, "doc-reassigned", status="skipped_unassigned",
+            assignment_status="assigned",
+        )
+        reassigned.profile = self.profile
+        reassigned.save(update_fields=["profile"])
+        still_waiting = self.create_document(
+            job, "doc-waiting", status="skipped_unassigned",
+            assignment_status="unassigned",
         )
 
         with patch("extraction.views.launch_job_processing") as launch:
@@ -2652,9 +2763,15 @@ class DurableJobExecutionTests(APITestCase):
         failed.refresh_from_db()
         done.refresh_from_db()
         excluded.refresh_from_db()
+        reassigned.refresh_from_db()
+        still_waiting.refresh_from_db()
         self.assertEqual(failed.processing_status, "pending")
         self.assertEqual(done.processing_status, "completed")
         self.assertEqual(excluded.processing_status, "excluded")
+        # Only a skipped document that now has a profile can be processed;
+        # the other stays queued for assignment instead of looping.
+        self.assertEqual(reassigned.processing_status, "pending")
+        self.assertEqual(still_waiting.processing_status, "skipped_unassigned")
 
     def test_retry_rejects_jobs_with_nothing_to_requeue_or_already_running(self):
         nothing = self.create_job(job_id="job-nothing", status="completed")
@@ -3257,6 +3374,74 @@ class BlankFormAuthoringTests(APITestCase):
         saved = response.data["fields"][0]
         self.assertIn("Name:", saved["contentRules"]["labels"])
         self.assertIn("applicant_name", saved["contentRules"]["labels"])
+
+
+class FieldSemanticsTests(SimpleTestCase):
+    """Normalization and validation rules that were implicit before Phase 1."""
+
+    def test_checkbox_type_infers_boolean_and_maps_check_tokens(self):
+        field = _normalize_field_config(
+            {"type": "checkbox", "name": "Consent"})
+        self.assertEqual(field["validation"]["valueType"], "boolean")
+        self.assertTrue(field["normalization"]["checkbox"])
+        for token in ("X", "x", "✓", "[X]", "yes", "1"):
+            self.assertEqual(
+                normalize_value(token, field["normalization"]), "true", token
+            )
+        for token in ("0", "no", "off", "[]"):
+            self.assertEqual(
+                normalize_value(token, field["normalization"]), "false", token
+            )
+
+    def test_explicit_boolean_value_type_enables_checkbox_mapping(self):
+        field = _normalize_field_config(
+            {"name": "Consent", "validation": {"valueType": "boolean"}}
+        )
+        self.assertTrue(field["normalization"]["checkbox"])
+        self.assertEqual(normalize_value("X", field["normalization"]), "true")
+
+    def test_checkbox_mapping_never_fabricates_a_value(self):
+        normalization = {"checkbox": True, "trim": True}
+        # A missed box stays empty (reported NOT_FOUND), and free text is not
+        # coerced into a boolean.
+        self.assertEqual(normalize_value("", normalization), "")
+        self.assertEqual(normalize_value("initial", normalization), "initial")
+
+    def test_checkbox_mapping_is_opt_in(self):
+        # A bare "X" is a legitimate middle initial in a text field.
+        self.assertEqual(normalize_value("X", {"trim": True}), "X")
+
+    def test_checkbox_mapping_survives_case_transforms(self):
+        normalization = {"checkbox": True, "caseTransform": "uppercase"}
+        self.assertEqual(normalize_value("x", normalization), "true")
+        self.assertEqual(normalize_value("true", normalization), "true")
+
+    def test_allowed_values_are_case_insensitive(self):
+        rules = {"allowedValues": ["Yes", "No"]}
+        self.assertEqual(_validate_value("YES", rules), (True, None))
+        self.assertEqual(_validate_value(" no ", rules), (True, None))
+        self.assertFalse(_validate_value("maybe", rules)[0])
+
+    def test_date_order_controls_ambiguous_dates(self):
+        # 03/04/2026 is March 4 month-first and April 3 day-first.
+        self.assertEqual(
+            _normalize_date("03/04/2026", "YYYY-MM-DD"), "2026-03-04"
+        )
+        self.assertEqual(
+            _normalize_date("03/04/2026", "YYYY-MM-DD", "day_first"),
+            "2026-04-03",
+        )
+        self.assertEqual(
+            normalize_value(
+                "03/04/2026",
+                {"dateFormat": "YYYY-MM-DD", "dateOrder": "day_first"},
+            ),
+            "2026-04-03",
+        )
+        # A component above 12 resolves the order without configuration.
+        self.assertEqual(
+            _normalize_date("13/04/2026", "YYYY-MM-DD"), "2026-04-13"
+        )
 
 
 class CountryValueTests(SimpleTestCase):

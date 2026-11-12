@@ -12,21 +12,28 @@ export type ExtractionStatus =
   | 'AMBIGUOUS'
   | 'REVIEW_REQUIRED'
   | 'OCR_EXTRACTED'
+  | 'OCR_SPACE_EXTRACTED'
   | 'AI_EXTRACTED'
   | 'MANUALLY_CORRECTED'
   | 'EXTRACTION_ERROR';
 
-export type ExtractionSource = 'filename' | 'form_field' | 'pdf_text' | 'ocr' | 'ai' | 'manual';
+export type ExtractionSource = 'filename' | 'form_field' | 'pdf_text' | 'ocr' | 'ocr_space' | 'ai' | 'manual';
 export type ExtractionMethod = 'regex_filename' | 'label_proximity' | 'regex_content' | 'layout_aware' | 'acroform_name' | 'acroform_field' | 'acroform_pattern' | 'ocr_tesseract' | 'ollama_llm' | 'manual_override';
 
-export type SourcePriority = 'pdf_first' | 'filename_first' | 'strict_match' | 'consensus';
+/**
+ * Reconciliation policy. 'strict_match' is the canonical stored value;
+ * 'strict' is accepted as an alias (the specification's name) and is
+ * normalized by the backend before use. 'consensus' is an extension: every
+ * available source must agree or the value is flagged.
+ */
+export type SourcePriority = 'pdf_first' | 'filename_first' | 'strict_match' | 'strict' | 'consensus';
 
 export interface FieldDefinition {
   id: string;
   name: string;
   label: string;
   description?: string;
-  type: 'text' | 'date' | 'number' | 'status' | 'email' | 'phone' | 'address';
+  type: 'text' | 'date' | 'number' | 'status' | 'email' | 'phone' | 'address' | 'checkbox';
   required: boolean;
 
   // Filename extraction rules
@@ -52,6 +59,12 @@ export interface FieldDefinition {
     caseTransform: 'none' | 'uppercase' | 'lowercase' | 'titlecase';
     removeExtraSpaces: boolean;
     dateFormat?: 'YYYY-MM-DD' | 'DD/MM/YYYY' | 'MM/DD/YYYY' | 'MM-DD-YYYY' | 'as_is';
+    /**
+     * How ambiguous numeric dates (both components <= 12) are read.
+     * Defaults to 'month_first' (US forms). An explicit DD/MM/YYYY target
+     * format implies 'day_first' and wins over this setting.
+     */
+    dateOrder?: 'month_first' | 'day_first';
   };
 
   // Validation rules
@@ -140,9 +153,13 @@ export interface FieldDiagnostic {
   fieldId: string;
   fieldName: string;
   status: ExtractionStatus;
+  /** Status before validation replaced it with INVALID (e.g. MISMATCH).
+   *  Keeps source-disagreement visible when the value also fails validation. */
+  statusBeforeValidation?: ExtractionStatus | null;
   filenameValue?: string;
   pdfValue?: string;
   ocrValue?: string;
+  ocrSpaceValue?: string;
   formValue?: string | null;
   aiValue?: string | null;
   aiEvidence?: string | null;
@@ -165,6 +182,9 @@ export interface FieldDiagnostic {
   pdfPageNumber?: number | null;
   ocrEvidence?: string | null;
   ocrPageNumber?: number | null;
+  ocrSpaceEvidence?: string | null;
+  ocrSpacePageNumber?: number | null;
+  ocrSpaceConfidenceScore?: number | null;
   formEvidence?: string | null;
   formPageNumber?: number | null;
   aiPageNumber?: number | null;
@@ -188,7 +208,15 @@ export interface PDFDocumentRecord {
   processingMetrics?: Record<string, number | number[]>;
 
   // Status
-  processingStatus: 'pending' | 'processing' | 'completed' | 'failed' | 'excluded';
+  // 'skipped_unassigned' means the file was never extracted because no
+  // profile could be assigned to it - it is pending assignment, not a failure.
+  processingStatus:
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'excluded'
+  | 'skipped_unassigned';
   errorDetails?: string;
   isEncryptedOrCorrupted?: boolean;
   extractionMethodUsed: 'NATIVE_PDF_TEXT' | 'OCR_EXTRACTED' | 'AI_EXTRACTED' | 'FAILED';

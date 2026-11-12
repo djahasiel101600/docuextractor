@@ -153,8 +153,8 @@ const isTypingTarget = (el: EventTarget | null) => {
 const Kbd: React.FC<{ children: React.ReactNode; dark?: boolean }> = ({ children, dark }) => (
   <kbd
     className={`inline-flex min-w-[1.25rem] items-center justify-center rounded border px-1 py-px font-mono text-[10px] font-semibold leading-none ${dark
-        ? 'border-white/30 bg-white/10 text-white/90'
-        : 'border-neutral-300 bg-white text-neutral-600'
+      ? 'border-white/30 bg-white/10 text-white/90'
+      : 'border-neutral-300 bg-white text-neutral-600'
       }`}
   >
     {children}
@@ -371,11 +371,17 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     setIsRendering(true);
     setRenderError(null);
 
-    renderPdfPageToCanvas(pdfBuffer, currentPage, canvasRef.current, zoomScale, currentValue, {
-      filename: doc.filename,
-      finalValues: doc.finalValues,
-      rawText: doc.rawExtractedPdfText,
-    })
+    // A reviewer compares extracted values against this canvas, so a synthetic
+    // fallback page would falsely "confirm" the extraction. Fail visibly.
+    renderPdfPageToCanvas(
+      pdfBuffer,
+      currentPage,
+      canvasRef.current,
+      zoomScale,
+      currentValue,
+      undefined,
+      { allowFallback: false }
+    )
       .then(() => {
         if (isMounted) setIsRendering(false);
       })
@@ -389,7 +395,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [pdfBuffer, currentPage, zoomScale, viewMode, currentValue, doc.filename, doc.finalValues, doc.rawExtractedPdfText]);
+  }, [pdfBuffer, currentPage, zoomScale, viewMode, currentValue]);
 
   // Lock background scroll and move focus into the dialog while it is open.
   useEffect(() => {
@@ -749,8 +755,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
               type="button"
               onClick={() => onToggleReviewed(doc.id)}
               className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 ${doc.isReviewed
-                  ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
-                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                : 'bg-emerald-600 text-white hover:bg-emerald-700'
                 }`}
               title="Toggle reviewed (R)"
             >
@@ -825,8 +831,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   onClick={() => setViewMode('canvas')}
                   aria-pressed={viewMode === 'canvas'}
                   className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${viewMode === 'canvas'
-                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
-                      : 'text-neutral-600 hover:text-neutral-900'
+                    ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                    : 'text-neutral-600 hover:text-neutral-900'
                     }`}
                   title="PDF canvas rendering with active field highlighting"
                 >
@@ -838,8 +844,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   onClick={() => setViewMode('form')}
                   aria-pressed={viewMode === 'form'}
                   className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${viewMode === 'form'
-                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
-                      : 'text-neutral-600 hover:text-neutral-900'
+                    ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                    : 'text-neutral-600 hover:text-neutral-900'
                     }`}
                   title="Structured form layout with extracted fields"
                 >
@@ -997,10 +1003,10 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                           onClick={() => setActiveFieldId(field.id)}
                           aria-pressed={isSelected}
                           className={`rounded-lg border p-3 text-left transition-all ${isSelected
-                              ? 'border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900'
-                              : health === 'conflict' || health === 'invalid'
-                                ? 'border-amber-300 bg-amber-50/50 hover:bg-amber-50'
-                                : 'border-neutral-200 hover:bg-neutral-50/60'
+                            ? 'border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900'
+                            : health === 'conflict' || health === 'invalid'
+                              ? 'border-amber-300 bg-amber-50/50 hover:bg-amber-50'
+                              : 'border-neutral-200 hover:bg-neutral-50/60'
                             }`}
                         >
                           <div className="flex items-center justify-between gap-2">
@@ -1085,8 +1091,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                       ref={isActive ? activeChipRef : undefined}
                       onClick={() => setActiveFieldId(field.id)}
                       className={`flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${isActive
-                          ? 'bg-neutral-900 text-white shadow-xs'
-                          : 'border border-neutral-200 bg-white text-neutral-700 hover:bg-neutral-100'
+                        ? 'bg-neutral-900 text-white shadow-xs'
+                        : 'border border-neutral-200 bg-white text-neutral-700 hover:bg-neutral-100'
                         }`}
                     >
                       <span
@@ -1107,6 +1113,16 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
 
             {/* Scrollable detail panel */}
             <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
+              {doc.processingStatus === 'skipped_unassigned' && (
+                <div
+                  role="status"
+                  className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900"
+                >
+                  <span className="font-semibold">Skipped - no profile assigned: </span>
+                  This document was not extracted because no profile could be assigned to it.
+                  Assign one, then retry the job. {doc.assignmentReason}
+                </div>
+              )}
               {doc.processingStatus === 'excluded' && (
                 <div
                   role="status"
@@ -1117,7 +1133,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   {doc.assignmentReason}
                 </div>
               )}
-              {doc.errorDetails && (
+              {doc.errorDetails && doc.processingStatus !== 'skipped_unassigned' && (
                 <div
                   role="alert"
                   className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900"
@@ -1321,8 +1337,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                           <div
                             key={idx}
                             className={`flex items-center justify-between rounded border p-2.5 text-xs ${item.fieldId === activeFieldId
-                                ? 'border-neutral-300 bg-neutral-100'
-                                : 'border-neutral-200 bg-neutral-50'
+                              ? 'border-neutral-300 bg-neutral-100'
+                              : 'border-neutral-200 bg-neutral-50'
                               }`}
                           >
                             <div className="min-w-0 space-y-0.5">

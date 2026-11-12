@@ -209,7 +209,8 @@ def _finalize_job(job, cancelled=False):
     job.failed_count = sum(
         1 for doc in documents if doc.processing_status == "failed")
     job.skipped_count = sum(
-        1 for doc in documents if doc.processing_status == "excluded")
+        1 for doc in documents
+        if doc.processing_status in ("excluded", "skipped_unassigned"))
     job.review_required_count = sum(
         any(item.details.get("reviewRequired")
             for item in doc.field_diagnostics.all())
@@ -272,7 +273,8 @@ def process_job(job_id, entries=None):
         totals = _document_totals(job_id)
         processed_count = totals.get("completed", 0)
         failed_count = totals.get("failed", 0)
-        skipped_count = totals.get("excluded", 0)
+        skipped_count = totals.get("excluded", 0) + \
+            totals.get("skipped_unassigned", 0)
         ProcessingJob.objects.filter(pk=job_id).update(
             heartbeat_at=timezone.now(),
             processed_count=processed_count,
@@ -388,7 +390,11 @@ def process_job(job_id, entries=None):
                         effective_profile = None
 
                     if effective_profile is None:
-                        document.processing_status = "failed"
+                        # The file itself is fine; it simply has no profile to
+                        # extract against. Reporting it as failed made an
+                        # unassigned backlog look like extraction errors, so
+                        # it is counted as skipped and stays retryable.
+                        document.processing_status = "skipped_unassigned"
                         document.assignment_status = "unassigned"
                         document.assignment_reason = (
                             document.assignment_reason
@@ -399,7 +405,10 @@ def process_job(job_id, entries=None):
                             update_fields=[
                                 "processing_status", "assignment_status", "assignment_reason", "error_details"]
                         )
-                        failed_count += 1
+                        skipped_count += 1
+                        ProcessingJob.objects.filter(pk=job_id).update(
+                            skipped_count=skipped_count
+                        )
                         next_document += 1
                         continue
 

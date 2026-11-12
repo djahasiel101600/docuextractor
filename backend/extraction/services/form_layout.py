@@ -107,10 +107,12 @@ _FIELD_TYPE_TO_KIND = {
     "Signature": "signature",
 }
 
-_ALLOWED_PROFILE_TYPES = {"text", "date", "number",
-                          "status", "email", "phone", "address"}
+_ALLOWED_PROFILE_TYPES = {"text", "date", "number", "status",
+                          "email", "phone", "address", "checkbox"}
+# "strict" is accepted as the specification's alias for "strict_match";
+# existing profiles keep their stored name.
 _ALLOWED_PRIORITIES = {"pdf_first",
-                       "filename_first", "strict_match", "consensus"}
+                       "filename_first", "strict_match", "strict", "consensus"}
 
 
 def _widget_keywords(widget):

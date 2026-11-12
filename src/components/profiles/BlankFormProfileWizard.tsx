@@ -72,6 +72,7 @@ const FIELD_TYPE_OPTIONS: FieldDefinition['type'][] = [
     'email',
     'phone',
     'address',
+    'checkbox',
 ];
 
 /** Plain-language explanation of what each type does at extraction time.
@@ -85,6 +86,7 @@ const FIELD_TYPE_DESCRIPTIONS: Record<FieldDefinition['type'], string> = {
     email: 'Validates an email address format, catching typos and truncated values.',
     phone: 'Validates a phone number format and ignores harmless separators like spaces and dashes.',
     address: 'Multi-line street / city / postal value. Keeps line breaks instead of truncating.',
+    checkbox: 'Yes/No box. X, check marks and 1 normalize to true; 0 and off normalize to false.',
 };
 
 /** Tooltip describing how the two matching sources use the assigned widgets. */
@@ -418,7 +420,12 @@ export const BlankFormProfileWizard: React.FC<BlankFormProfileWizardProps> = ({
         let cancelled = false;
         setRendering(true);
         setRenderFailed(false);
-        renderPdfPageToCanvas(pdfBuffer, currentPage, canvas, zoom)
+        // This canvas is the measuring surface for PDF-point rectangles; a
+        // synthetic fallback page would yield real-looking but fabricated
+        // geometry, so a render failure must surface instead.
+        renderPdfPageToCanvas(pdfBuffer, currentPage, canvas, zoom, undefined, undefined, {
+            allowFallback: false,
+        })
             .then((size) => {
                 if (cancelled) return;
                 setRenderedSize(size);

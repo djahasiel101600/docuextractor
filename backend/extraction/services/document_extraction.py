@@ -72,6 +72,20 @@ _US_SSN_SEARCH_RE = re.compile(
 )
 
 
+# "strict" is the specification's name for the strict-match policy; profiles
+# saved before the rename store "strict_match". Both mean one policy: the
+# filename and the document must agree or the value is flagged, never picked.
+PRIORITY_ALIASES = {"strict": "strict_match"}
+
+# Checkbox-shaped tokens. Mapped only when the field declares a boolean value
+# type (`type: "checkbox"` or `validation.valueType: "boolean"`), because a
+# bare "X" is also a legitimate middle initial in a name field.
+_CHECKBOX_TRUE_TOKENS = {"x", "✓", "✔", "yes", "y",
+                         "true", "checked", "on", "1"}
+_CHECKBOX_FALSE_TOKENS = {"no", "n", "false",
+                          "unchecked", "off", "0"}
+
+
 def _infer_value_type(field):
     """Return the semantic value type for a field, explicit config first."""
     rules = field.get("validation")
@@ -79,6 +93,8 @@ def _infer_value_type(field):
         explicit = str(rules.get("valueType") or "").strip().casefold()
         if explicit:
             return explicit
+    if str(field.get("type") or "").strip().casefold() == "checkbox":
+        return "boolean"
     field_id = str(field.get("id") or "").strip().casefold()
     normalized_name = " ".join(str(field.get("name") or "").split()).casefold()
     if field_id in _COUNTRY_FIELD_IDS or normalized_name in {
@@ -115,6 +131,13 @@ def _normalize_field_config(field):
         if inferred:
             validation["valueType"] = inferred
     normalized["validation"] = validation
+    # A boolean value type implies checkbox token mapping during normalization.
+    # Injected on the copy so the persisted profile configuration is untouched
+    # and every normalize_value() call for this field sees the same rule.
+    if validation.get("valueType") == "boolean":
+        normalization = dict(field.get("normalization") or {})
+        normalization["checkbox"] = True
+        normalized["normalization"] = normalization
     return normalized
 
 
@@ -250,6 +273,23 @@ def _drop_duplicate_form_widgets(form_results):
                 form_results[field_id] = None
 
 
+def _normalize_checkbox(value):
+    """Map checkbox-shaped tokens to the boolean string, or pass value through.
+
+    Only applied for fields that declare a boolean value type. Unrecognized
+    values are returned untouched so a mis-captured box never becomes a
+    boolean, and an empty capture stays empty (a missed box is reported as
+    NOT_FOUND instead of being fabricated into "false").
+    """
+    token = " ".join(value.strip().split()).casefold()
+    compact = token.replace(" ", "")
+    if token in _CHECKBOX_TRUE_TOKENS or compact == "[x]":
+        return "true"
+    if token in _CHECKBOX_FALSE_TOKENS or compact == "[]":
+        return "false"
+    return value
+
+
 def normalize_value(value, normalization):
     if not value:
         return ""
@@ -261,7 +301,9 @@ def normalize_value(value, normalization):
     result = re.sub(r"^[:\-–—\s]+|[:\-–—\s]+$", "", result).strip()
     date_format = normalization.get("dateFormat")
     if date_format and date_format != "as_is":
-        result = _normalize_date(result, date_format)
+        result = _normalize_date(
+            result, date_format, normalization.get("dateOrder")
+        )
     transform = normalization.get("caseTransform")
     if transform == "uppercase":
         result = result.upper()
@@ -269,10 +311,22 @@ def normalize_value(value, normalization):
         result = result.lower()
     elif transform == "titlecase":
         result = result.title()
+    if normalization.get("checkbox"):
+        # Runs last so an incidental case transform cannot turn the canonical
+        # "true"/"false" into "TRUE"/"True".
+        result = _normalize_checkbox(result)
     return result
 
 
-def _normalize_date(value, date_format):
+def _normalize_date(value, date_format, date_order=None):
+    """Normalize a date to the configured target format.
+
+    Numeric dates where both components are <= 12 are ambiguous. The field's
+    `dateOrder` decides them ("day_first", or the documented default
+    "month_first" used by US forms); an explicit DD/MM/YYYY target format
+    implies day-first and wins. A component greater than 12 resolves the order
+    on its own regardless of the declared default.
+    """
     common_formats = (
         "%Y-%m-%d",
         "%Y/%m/%d",
@@ -283,7 +337,7 @@ def _normalize_date(value, date_format):
     day_first_formats = ("%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%m-%d-%Y")
     ambiguous_formats = (
         day_first_formats
-        if date_format in ("DD/MM/YYYY",)
+        if date_format == "DD/MM/YYYY" or date_order == "day_first"
         else month_first_formats
     )
     parsed = None
@@ -315,8 +369,16 @@ def _validate_value(value, rules):
         except re.error:
             return False, "The configured validation regex is invalid."
     allowed = rules.get("allowedValues")
-    if allowed and value not in allowed:
-        return False, "Value is not in the allowed values list."
+    if allowed:
+        # Enum checks are case-insensitive: profiles commonly list "Yes" while
+        # the form prints "YES", and both express the same decision.
+        allowed_folded = {
+            str(item).strip().casefold()
+            for item in allowed
+            if isinstance(item, str)
+        }
+        if value.strip().casefold() not in allowed_folded:
+            return False, "Value is not in the allowed values list."
     if len(value) < rules.get("minLength", 0):
         return False, "Value is shorter than the configured minimum."
     if rules.get("maxLength") is not None and len(value) > rules["maxLength"]:
@@ -2423,6 +2485,7 @@ def process_pdf(pdf_bytes, filename, profile):
                 )
             )
             priority = field.get("priority", "pdf_first")
+            priority = PRIORITY_ALIASES.get(priority, priority)
             priority_conflict = False
             selected_source = None
             selected_candidate = None
@@ -2574,7 +2637,12 @@ def process_pdf(pdf_bytes, filename, profile):
                 # all; they must never wear the same badge as a form-verified
                 # value (the old 'MATCHED @ 0% evidence' false positives).
                 status = "FILENAME_ONLY"
+            status_before_validation = status
             if value and not passed:
+                # Validation failure is orthogonal to source disagreement: the
+                # status becomes INVALID, but the pre-validation status (often
+                # MISMATCH) is kept in the diagnostic so a reviewer can still
+                # see that sources disagreed.
                 status = "INVALID"
             review_required = (
                 (field.get("required", False) and not value)
@@ -2588,20 +2656,46 @@ def process_pdf(pdf_bytes, filename, profile):
             extraction_errors = [
                 error for error in (ocr_error, ai_error) if error
             ]
-            explanation = (
-                " ".join(extraction_errors) if not value and extraction_errors else
-                "Extracted by Ollama; verify this value." if source == "ai" else
-                "Ollama disagrees with a conventional candidate; verify both candidates." if ai_conflict else
-                validation_error if validation_error else
-                "Sources disagree; verify the selected value." if conflict else
-                "Filename rule supplied this value; no document-side candidate existed to cross-check it." if status == "FILENAME_ONLY" else
-                "Value extracted and validated." if value else
-                "No matching value was found."
-            )
+            # Explanations accumulate instead of overwriting each other: a
+            # value can be invalid AND conflicting AND AI-assisted, and a
+            # reviewer needs every one of those facts from the report alone.
+            explanation_parts = []
+            if not value and extraction_errors:
+                explanation_parts.extend(extraction_errors)
+            if source == "ai":
+                explanation_parts.append(
+                    "Extracted by Ollama; verify this value.")
+            if ai_conflict:
+                explanation_parts.append(
+                    "Ollama disagrees with a conventional candidate; verify both candidates."
+                )
+            if value and not passed and validation_error:
+                explanation_parts.append(validation_error)
+            if conflict or priority_conflict:
+                explanation_parts.append(
+                    "Sources disagree; verify the selected value.")
+            if selection_ambiguous:
+                explanation_parts.append(
+                    "Conflicting candidates had similar evidence scores; no value was selected."
+                )
+            if status == "FILENAME_ONLY":
+                explanation_parts.append(
+                    "Filename rule supplied this value; no document-side candidate existed to cross-check it."
+                )
+            if not explanation_parts:
+                explanation_parts.append(
+                    "Value extracted and validated."
+                    if value
+                    else "No matching value was found."
+                )
+            explanation = " ".join(explanation_parts)
             diagnostic = {
                 "fieldId": field_id,
                 "fieldName": field.get("name", field_id),
                 "status": status,
+                "statusBeforeValidation": (
+                    status_before_validation if status == "INVALID" else None
+                ),
                 "filenameValue": filename_value,
                 "pdfValue": pdf_value,
                 "ocrValue": ocr_value,

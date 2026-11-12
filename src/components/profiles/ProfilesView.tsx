@@ -349,8 +349,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                   key={p.id}
                   onClick={() => handleSelectProfile(p.id)}
                   className={`p-3 rounded-lg border text-xs cursor-pointer transition-colors ${p.id === currentProfile.id
-                      ? 'border-neutral-900 bg-neutral-50 shadow-xs'
-                      : 'border-neutral-200 hover:bg-neutral-50/60'
+                    ? 'border-neutral-900 bg-neutral-50 shadow-xs'
+                    : 'border-neutral-200 hover:bg-neutral-50/60'
                     }`}
                 >
                   <div className="flex items-center justify-between">
@@ -666,8 +666,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                       <p
                         role="status"
                         className={`text-[10px] ${ollamaTestState.models.length
-                            ? 'text-emerald-700'
-                            : 'text-rose-700'
+                          ? 'text-emerald-700'
+                          : 'text-rose-700'
                           }`}
                       >
                         {ollamaTestState.message}
@@ -785,8 +785,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                   key={f.id}
                   onClick={() => setActiveFieldId(f.id)}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap transition-colors flex items-center gap-2 ${activeFieldId === f.id
-                      ? 'bg-neutral-900 text-white'
-                      : 'bg-neutral-50 text-neutral-700 hover:bg-neutral-100 border border-neutral-200'
+                    ? 'bg-neutral-900 text-white'
+                    : 'bg-neutral-50 text-neutral-700 hover:bg-neutral-100 border border-neutral-200'
                     }`}
                 >
                   <span>{f.name}</span>
@@ -828,6 +828,7 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                       <option value="email">Email</option>
                       <option value="phone">Phone / Contact</option>
                       <option value="address">Address</option>
+                      <option value="checkbox">Checkbox (True/False)</option>
                     </select>
                   </div>
 
@@ -1072,6 +1073,58 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                         <option value="titlecase">Title Case</option>
                       </select>
                     </div>
+
+                    {activeField.type === 'date' && (
+                      <>
+                        <div className="space-y-1 pt-1">
+                          <label className="text-[11px] text-neutral-500">Date Format</label>
+                          <select
+                            value={activeField.normalization.dateFormat || 'as_is'}
+                            onChange={(e) =>
+                              updateActiveField({
+                                normalization: {
+                                  ...activeField.normalization,
+                                  dateFormat: e.target.value as FieldDefinition['normalization']['dateFormat'],
+                                },
+                              })
+                            }
+                            className="w-full px-2 py-1 border border-neutral-300 rounded"
+                          >
+                            <option value="as_is">Keep as-is (no date parsing)</option>
+                            <option value="YYYY-MM-DD">YYYY-MM-DD (ISO)</option>
+                            <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                            <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                            <option value="MM-DD-YYYY">MM-DD-YYYY</option>
+                          </select>
+                        </div>
+
+                        <div className="space-y-1 pt-1">
+                          <label className="text-[11px] text-neutral-500">
+                            Ambiguous Date Order (day/month vs month/day)
+                          </label>
+                          <select
+                            value={activeField.normalization.dateOrder || 'month_first'}
+                            onChange={(e) =>
+                              updateActiveField({
+                                normalization: {
+                                  ...activeField.normalization,
+                                  dateOrder: e.target.value as FieldDefinition['normalization']['dateOrder'],
+                                },
+                              })
+                            }
+                            className="w-full px-2 py-1 border border-neutral-300 rounded"
+                          >
+                            <option value="month_first">Month first (US, default)</option>
+                            <option value="day_first">Day first (EU)</option>
+                          </select>
+                          <p className="text-[10px] text-neutral-400">
+                            Applied when a Date Format above is set. Only used when both
+                            readings are valid, e.g. 03/04/2026; an explicit DD/MM/YYYY
+                            format overrides this.
+                          </p>
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   {/* Validation */}

@@ -208,6 +208,12 @@ export async function performOcrFallback(
 /**
  * Fallback renderer that draws the document's structured vector layout and fields
  * directly onto HTML5 2D canvas if PDF.js worker is blocked by browser iframe sandboxing.
+ *
+ * @deprecated Delete by 2026-12-11 (30 days from 2026-11-11). Drawing a
+ * synthetic page turns a real render failure into something that looks like a
+ * correctly displayed document, so callers must surface the error instead.
+ * Reachable only through `renderPdfPageToCanvas(..., { allowFallback: true })`;
+ * remove that opt-in and this function together.
  */
 export function renderFallbackDocumentToCanvas(
   canvas: HTMLCanvasElement,
@@ -482,7 +488,13 @@ export function renderFallbackDocumentToCanvas(
 }
 
 /**
- * Render a single PDF page to a canvas element for document inspection
+ * Render a single PDF page to a canvas element for document inspection.
+ *
+ * `fallbackData`/`allowFallback` exist only for surfaces that intentionally
+ * accept a synthetic page. Callers that rely on the canvas geometry (the
+ * profile wizard's annotation surface, verification views) MUST leave
+ * `allowFallback` false: a synthetic page silently drawn over a broken render
+ * looks like real content while carrying fabricated geometry and values.
  */
 export async function renderPdfPageToCanvas(
   fileBuffer: ArrayBuffer,
@@ -490,7 +502,8 @@ export async function renderPdfPageToCanvas(
   canvas: HTMLCanvasElement,
   scale = 1.3,
   highlightText?: string,
-  fallbackData?: { filename?: string; finalValues?: Record<string, string>; rawText?: string }
+  fallbackData?: { filename?: string; finalValues?: Record<string, string>; rawText?: string },
+  options?: { allowFallback?: boolean }
 ): Promise<{ width: number; height: number }> {
   try {
     const bufferCopy = fileBuffer.slice(0);
@@ -563,7 +576,11 @@ export async function renderPdfPageToCanvas(
 
     return { width: viewport.width, height: viewport.height };
   } catch (err: unknown) {
-    // If PDF.js encounters any worker or iframe sandbox block, render clean visual fallback on canvas
-    return renderFallbackDocumentToCanvas(canvas, scale, highlightText, fallbackData);
+    if (options?.allowFallback) {
+      // Explicit opt-in only: draw the synthetic document instead of failing.
+      return renderFallbackDocumentToCanvas(canvas, scale, highlightText, fallbackData);
+    }
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`PDF page ${pageNumber} could not be rendered: ${reason}`);
   }
 }

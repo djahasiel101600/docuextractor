@@ -5,7 +5,7 @@ import re
 import uuid
 
 from django.db import IntegrityError, transaction
-from django.db.models import Avg
+from django.db.models import Avg, Q
 from django.db.utils import DatabaseError
 from django.core.files.base import ContentFile
 from django.http import FileResponse, Http404, StreamingHttpResponse
@@ -809,15 +809,17 @@ class JobRetryView(APIView):
                     status=status.HTTP_409_CONFLICT,
                 )
             # Retry re-queues exactly the documents that did not produce a
-            # result: failures, and anything a cancel left pending. Documents
-            # the user excluded stay excluded.
-            retryable = job.documents.filter(
-                processing_status__in=["failed", "pending"]
-            ).exclude(assignment_status="excluded")
+            # result: failures, anything a cancel left pending, and documents
+            # skipped for lack of a profile that has since been assigned one.
+            # Documents the user excluded stay excluded.
+            retryable = job.documents.exclude(assignment_status="excluded").filter(
+                Q(processing_status__in=["failed", "pending"])
+                | Q(processing_status="skipped_unassigned", profile__isnull=False)
+            )
             if not retryable.exists():
                 return Response(
-                    {"detail": "There are no failed or pending documents to "
-                               "retry."},
+                    {"detail": "There are no failed, pending or reassigned "
+                               "documents to retry."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             retryable.update(processing_status="pending", error_details="")
@@ -993,6 +995,7 @@ class DocumentDetailView(APIView):
             validated = serializer.validated_data
 
             update_fields = []
+            requeued_for_assignment = False
 
             if "profileId" in validated:
                 profile_id = validated["profileId"]
@@ -1017,6 +1020,12 @@ class DocumentDetailView(APIView):
                     document.assignment_rule = "manual_override"
                     document.assignment_confidence = 1.0
                     document.assignment_reason = "Manually assigned by user."
+                    if document.processing_status == "skipped_unassigned":
+                        # The document was only waiting for a profile; queue it
+                        # so the next retry actually extracts it.
+                        document.processing_status = "pending"
+                        document.error_details = ""
+                        requeued_for_assignment = True
                 update_fields.extend([
                     "profile",
                     "assignment_status",
@@ -1025,6 +1034,8 @@ class DocumentDetailView(APIView):
                     "assignment_confidence",
                     "assignment_reason",
                 ])
+                if requeued_for_assignment:
+                    update_fields.extend(["processing_status", "error_details"])
 
             if "assignmentStatus" in validated:
                 document.assignment_status = validated["assignmentStatus"]

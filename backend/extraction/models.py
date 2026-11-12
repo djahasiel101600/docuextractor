@@ -78,6 +78,9 @@ class PDFDocument(models.Model):
         ("completed", "Completed"),
         ("failed", "Failed"),
         ("excluded", "Excluded by user"),
+        # Not a failure: the document was never extracted because no profile
+        # could be assigned to it. Assign one and retry to process it.
+        ("skipped_unassigned", "Skipped - no profile assigned"),
     ]
     EXTRACTION_CHOICES = [
         ("NATIVE_PDF_TEXT", "Native PDF text"),

@@ -270,6 +270,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     let errors = 0;
     let queued = 0;
     let excluded = 0;
+    let skippedUnassigned = 0;
     let reviewRequired = 0;
     let conflicts = 0;
     let missingFields = 0;
@@ -298,6 +299,12 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
         excluded++;
         continue;
       }
+      // Same for documents skipped for lack of a profile: nothing was
+      // extracted, and reporting them as failures would misstate the batch.
+      if (doc.processingStatus === 'skipped_unassigned') {
+        skippedUnassigned++;
+        continue;
+      }
       completed++;
       if (!doc.isReviewed) reviewRequired++;
       if (doc.extractionMethodUsed === 'OCR_EXTRACTED') ocrUsed++;
@@ -320,6 +327,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       errors,
       queued,
       excluded,
+      skippedUnassigned,
       reviewRequired,
       conflicts,
       missingFields,
@@ -334,15 +342,18 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     [job.documents]
   );
 
-  // Documents a retry would re-queue server-side: failures plus anything a
-  // cooperative cancel left pending (user-excluded docs stay excluded).
+  // Documents a retry would re-queue server-side: failures, anything a
+  // cooperative cancel left pending, and documents skipped for lack of a
+  // profile that has since been assigned one (user-excluded docs stay
+  // excluded).
   const retryableCount = useMemo(
     () =>
       job.documents.filter(
         (doc) =>
           doc.processingStatus === 'failed' ||
           (doc.processingStatus === 'pending' &&
-            doc.assignmentStatus !== 'excluded')
+            doc.assignmentStatus !== 'excluded') ||
+          (doc.processingStatus === 'skipped_unassigned' && !!doc.profileId)
       ).length,
     [job.documents]
   );
@@ -406,7 +417,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       category !== 'all' &&
       (doc.processingStatus === 'pending' ||
         doc.processingStatus === 'processing' ||
-        doc.processingStatus === 'excluded')
+        doc.processingStatus === 'excluded' ||
+        doc.processingStatus === 'skipped_unassigned')
     ) {
       return false;
     }
@@ -532,7 +544,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   const isEditableDoc = (doc: PDFDocumentRecord) =>
     doc.processingStatus !== 'pending' &&
     doc.processingStatus !== 'processing' &&
-    doc.processingStatus !== 'excluded';
+    doc.processingStatus !== 'excluded' &&
+    doc.processingStatus !== 'skipped_unassigned';
 
   const getCellValue = (doc: PDFDocumentRecord, fieldId: string) =>
     doc.finalValues[fieldId] || doc.diagnostics[fieldId]?.finalValue || '';
@@ -598,7 +611,10 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
   };
 
   const batchEligible = filteredDocuments.filter(
-    (doc) => !doc.isReviewed && doc.processingStatus !== 'excluded'
+    (doc) =>
+      !doc.isReviewed &&
+      doc.processingStatus !== 'excluded' &&
+      doc.processingStatus !== 'skipped_unassigned'
   );
 
   const handleBatchMarkReviewed = () => {
@@ -610,7 +626,11 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     }
     const count = batchEligible.length;
     for (const doc of filteredDocuments) {
-      if (!doc.isReviewed && doc.processingStatus !== 'excluded') {
+      if (
+        !doc.isReviewed &&
+        doc.processingStatus !== 'excluded' &&
+        doc.processingStatus !== 'skipped_unassigned'
+      ) {
         onToggleReviewed(doc.id);
       }
     }
@@ -704,10 +724,19 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     const invalidDiagnostics = diagnostics.filter((d) => d.status === 'INVALID');
     const hasInvalid = invalidDiagnostics.length > 0;
     const invalidTooltip = invalidDiagnostics
-      .map((d) => `${d.fieldName || d.fieldId}: ${d.validationError || 'Validation failed'}`)
+      .map((d) => {
+        // Validation replaces the reconciliation status with INVALID; show what
+        // it was so a hidden MISMATCH/conflict stays visible to the reviewer.
+        const prior =
+          d.statusBeforeValidation && d.statusBeforeValidation !== 'MATCHED'
+            ? ` (was ${d.statusBeforeValidation})`
+            : '';
+        return `${d.fieldName || d.fieldId}: ${d.validationError || 'Validation failed'}${prior}`;
+      })
       .join('\n');
     const isPending = doc.processingStatus === 'pending' || doc.processingStatus === 'processing';
     const isExcluded = doc.processingStatus === 'excluded';
+    const isSkippedUnassigned = doc.processingStatus === 'skipped_unassigned';
     const hasMissingRequired = diagnostics.some(
       (d) =>
         d.status === 'NOT_FOUND' &&
@@ -732,6 +761,9 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     } else if (isExcluded) {
       title = 'Excluded from processing by the user';
       icon = <span className="inline-block h-3.5 w-3.5 rounded-full border-2 border-dashed border-neutral-400" />;
+    } else if (isSkippedUnassigned) {
+      title = 'Skipped - no profile assigned. Assign one, then retry the job.';
+      icon = <span className="inline-block h-3.5 w-3.5 rounded-full border-2 border-dashed border-amber-400" />;
     } else if (doc.errorDetails) {
       title = `Processing warning: ${doc.errorDetails}`;
       icon = <AlertTriangle className="h-4 w-4 text-amber-600" />;
@@ -823,6 +855,9 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
               </span>
               {summaryMetrics.excluded > 0 && (
                 <span>· {summaryMetrics.excluded} excluded from processing</span>
+              )}
+              {summaryMetrics.skippedUnassigned > 0 && (
+                <span>· {summaryMetrics.skippedUnassigned} awaiting profile assignment</span>
               )}
               {summaryMetrics.errors > 0 && (
                 <span className="font-medium text-rose-700">· {summaryMetrics.errors} failed</span>
@@ -1279,6 +1314,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                     doc.processingStatus === 'pending' ||
                     doc.processingStatus === 'processing';
                   const isExcluded = doc.processingStatus === 'excluded';
+                  const isSkippedUnassigned = doc.processingStatus === 'skipped_unassigned';
                   const isSelected = selectedDocId === doc.id;
                   const docFields = getDocFields(doc);
 
@@ -1290,7 +1326,7 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                       data-doc-id={doc.id}
                       aria-selected={isSelected}
                       onClick={() => setSelectedDocId(doc.id)}
-                      className={`group transition-colors ${isPending || isExcluded ? 'opacity-60' : ''
+                      className={`group transition-colors ${isPending || isExcluded || isSkippedUnassigned ? 'opacity-60' : ''
                         } ${isSelected ? 'bg-neutral-100' : 'hover:bg-neutral-50/70'}`}
                     >
                       {/* Status */}
@@ -1351,14 +1387,18 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                         const isCurrentlyEditing =
                           editingCell?.docId === doc.id && editingCell?.fieldId === field.id;
 
-                        // Excluded documents were never extracted, so there is
-                        // no value to show or edit.
-                        if (isExcluded) {
+                        // Documents that were never extracted (excluded, or
+                        // skipped for lack of a profile) have no value to show.
+                        if (isExcluded || isSkippedUnassigned) {
                           return (
                             <td key={field.id} className={`whitespace-nowrap ${cellPad}`}>
                               <span
                                 className="text-[11px] italic text-neutral-400"
-                                title="Excluded from processing - no extraction was run"
+                                title={
+                                  isSkippedUnassigned
+                                    ? 'Skipped - no profile assigned, so no extraction was run'
+                                    : 'Excluded from processing - no extraction was run'
+                                }
                               >
                                 —
                               </span>
