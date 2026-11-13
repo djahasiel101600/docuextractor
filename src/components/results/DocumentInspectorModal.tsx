@@ -3,7 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useCallback,
+  useRef,
+  memo,
+} from 'react';
 import {
   X,
   ChevronLeft,
@@ -37,8 +45,14 @@ import { PDFDocumentRecord, ExtractionProfile, FieldDefinition } from '../../typ
 import { renderPdfPageToCanvas } from '../../services/pdfService';
 
 /* -------------------------------------------------------------------------- */
-/*  Constants & helpers                                                       */
+/*  Constants                                                                 */
 /* -------------------------------------------------------------------------- */
+
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 2.5;
+const ZOOM_DEFAULT = 1.2;
+const ZOOM_STEP = 0.2;
+const FLASH_DURATION_MS = 2200;
 
 const ASSIGNMENT_BADGE_LABEL: Record<PDFDocumentRecord['assignmentStatus'], string> = {
   legacy: 'Job default',
@@ -150,6 +164,10 @@ const isTypingTarget = (el: EventTarget | null) => {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
 };
 
+/* -------------------------------------------------------------------------- */
+/*  Small presentational components (memoized)                                */
+/* -------------------------------------------------------------------------- */
+
 const Kbd: React.FC<{ children: React.ReactNode; dark?: boolean }> = ({ children, dark }) => (
   <kbd
     className={`inline-flex min-w-[1.25rem] items-center justify-center rounded border px-1 py-px font-mono text-[10px] font-semibold leading-none ${dark
@@ -161,11 +179,8 @@ const Kbd: React.FC<{ children: React.ReactNode; dark?: boolean }> = ({ children
   </kbd>
 );
 
-/* -------------------------------------------------------------------------- */
-/*  Source row (one candidate value from one extraction source)               */
-/* -------------------------------------------------------------------------- */
-
 interface SourceRowProps {
+  id: string;
   title: string;
   icon?: React.ReactNode;
   tone?: SourceTone;
@@ -176,10 +191,10 @@ interface SourceRowProps {
   isCurrent: boolean;
   shortcut?: number;
   details?: React.ReactNode[];
-  onUse: () => void;
+  onUse: (value: string) => void;
 }
 
-const SourceRow: React.FC<SourceRowProps> = ({
+const SourceRow = memo<SourceRowProps>(function SourceRow({
   title,
   icon,
   tone = 'neutral',
@@ -191,7 +206,7 @@ const SourceRow: React.FC<SourceRowProps> = ({
   shortcut,
   details,
   onUse,
-}) => {
+}) {
   const t = TONE_STYLES[tone];
   const hasValue = Boolean(value);
 
@@ -212,11 +227,17 @@ const SourceRow: React.FC<SourceRowProps> = ({
             </span>
           )}
         </div>
-        <div className={`break-words font-mono text-xs ${hasValue ? t.value : 'italic text-neutral-400'}`}>
+        <div
+          className={`break-words font-mono text-xs ${hasValue ? t.value : 'italic text-neutral-400'
+            }`}
+        >
           {hasValue ? value : emptyText}
         </div>
-        {details?.filter(Boolean).map((d, i) => (
-          <p key={i} className={`whitespace-pre-wrap break-words text-[11px] leading-relaxed ${t.meta}`}>
+        {details?.map((d, i) => (
+          <p
+            key={i}
+            className={`whitespace-pre-wrap break-words text-[11px] leading-relaxed ${t.meta}`}
+          >
             {d}
           </p>
         ))}
@@ -230,7 +251,7 @@ const SourceRow: React.FC<SourceRowProps> = ({
         ) : (
           <button
             type="button"
-            onClick={onUse}
+            onClick={() => value && onUse(value)}
             className="mt-0.5 flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded border border-neutral-300 bg-white px-2 py-1 text-[11px] font-medium text-neutral-800 transition-colors hover:border-neutral-900 hover:bg-neutral-900 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900"
           >
             Use this value
@@ -239,29 +260,50 @@ const SourceRow: React.FC<SourceRowProps> = ({
         ))}
     </div>
   );
-};
+});
 
-/* -------------------------------------------------------------------------- */
-/*  Collapsible section                                                       */
-/* -------------------------------------------------------------------------- */
-
-const Collapsible: React.FC<{
+interface CollapsibleProps {
   title: string;
   badge?: React.ReactNode;
   defaultOpen?: boolean;
   children: React.ReactNode;
-}> = ({ title, badge, defaultOpen = false, children }) => (
-  <details open={defaultOpen} className="group rounded-lg border border-neutral-200 bg-white">
-    <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3.5 py-2.5 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 [&::-webkit-details-marker]:hidden">
-      <span className="flex items-center gap-2">
-        {title}
-        {badge}
-      </span>
-      <ChevronDown className="h-3.5 w-3.5 text-neutral-400 transition-transform group-open:rotate-180" />
-    </summary>
-    <div className="border-t border-neutral-200 p-3.5">{children}</div>
-  </details>
-);
+}
+
+const Collapsible = memo<CollapsibleProps>(function Collapsible({
+  title,
+  badge,
+  defaultOpen = false,
+  children,
+}) {
+  return (
+    <details open={defaultOpen} className="group rounded-lg border border-neutral-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3.5 py-2.5 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 [&::-webkit-details-marker]:hidden">
+        <span className="flex items-center gap-2">
+          {title}
+          {badge}
+        </span>
+        <ChevronDown className="h-3.5 w-3.5 text-neutral-400 transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="border-t border-neutral-200 p-3.5">{children}</div>
+    </details>
+  );
+});
+
+/* -------------------------------------------------------------------------- */
+/*  Derived row types                                                         */
+/* -------------------------------------------------------------------------- */
+
+interface SourceRowModel {
+  key: string;
+  title: string;
+  icon: React.ReactNode;
+  tone?: SourceTone;
+  value?: string | null;
+  isSelectedSource?: boolean;
+  selectedLabel?: string;
+  details: React.ReactNode[];
+  shortcut?: number;
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Main component                                                            */
@@ -284,12 +326,10 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
 }) => {
   const [activeFieldId, setActiveFieldId] = useState<string>(profile.fields[0]?.id || '');
   const [currentPage, setCurrentPage] = useState<number>(1);
-  const [zoomScale, setZoomScale] = useState<number>(1.2);
+  const [zoomScale, setZoomScale] = useState<number>(ZOOM_DEFAULT);
   const [isRendering, setIsRendering] = useState<boolean>(false);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'canvas' | 'form'>('canvas');
-  const [pdfBuffer, setPdfBuffer] = useState<ArrayBuffer | null>(doc.fileData || null);
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
   // Field editing state
   const [editingValue, setEditingValue] = useState<string>('');
@@ -305,51 +345,54 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
   const editInputRef = useRef<HTMLInputElement | null>(null);
   const activeChipRef = useRef<HTMLButtonElement | null>(null);
   const flashTimerRef = useRef<number | null>(null);
+  const renderTokenRef = useRef<number>(0);
+  const mountedRef = useRef<boolean>(true);
 
-  const activeField: FieldDefinition | undefined = profile.fields.find((f) => f.id === activeFieldId);
+  /* ----------------------- Derived values (memoized) ---------------------- */
+
+  // The PDF buffer is authoritative from the parent; no need to duplicate in state.
+  const pdfBuffer = doc.fileData ?? null;
+
+  // Only recompute when the profile / diagnostics actually change.
+  const fieldHealth = useMemo<FieldHealth[]>(
+    () => profile.fields.map((f) => getFieldHealth(f, doc.diagnostics[f.id])),
+    [profile.fields, doc.diagnostics],
+  );
+
+  const { attentionCount, editedCount } = useMemo(() => {
+    let attention = 0;
+    let edited = 0;
+    for (const h of fieldHealth) {
+      if (needsAttention(h)) attention++;
+      else if (h === 'edited') edited++;
+    }
+    return { attentionCount: attention, editedCount: edited };
+  }, [fieldHealth]);
+
+  const fieldIndex = useMemo(
+    () => profile.fields.findIndex((f) => f.id === activeFieldId),
+    [profile.fields, activeFieldId],
+  );
+
+  const activeField = useMemo(
+    () => profile.fields.find((f) => f.id === activeFieldId),
+    [profile.fields, activeFieldId],
+  );
+
   const activeDiagnostic = doc.diagnostics[activeFieldId];
-  const currentValue = doc.finalValues[activeFieldId] || activeDiagnostic?.finalValue || '';
 
-  const fieldIndex = profile.fields.findIndex((f) => f.id === activeFieldId);
-  const fieldHealth = profile.fields.map((f) => getFieldHealth(f, doc.diagnostics[f.id]));
-  const attentionCount = fieldHealth.filter(needsAttention).length;
-  const editedCount = fieldHealth.filter((h) => h === 'edited').length;
+  const currentValue = useMemo(
+    () => doc.finalValues[activeFieldId] || activeDiagnostic?.finalValue || '',
+    [doc.finalValues, activeFieldId, activeDiagnostic?.finalValue],
+  );
+
   const isDirty = isEditing && editingValue !== currentValue;
 
-  /* ------------------------------- Effects -------------------------------- */
+  const totalPages = doc.pageCount || 1;
 
-  // A batch can mix profiles, so the fields offered here must belong to the
-  // profile this document was actually extracted with.
-  useEffect(() => {
-    if (!profile.fields.some((field) => field.id === activeFieldId)) {
-      setActiveFieldId(profile.fields[0]?.id || '');
-    }
-  }, [profile.fields, activeFieldId]);
+  /* ----------------------------- Blob URL -------------------------------- */
 
-  useEffect(() => {
-    setEditingValue(currentValue);
-    setIsEditing(false);
-  }, [activeFieldId, currentValue]);
-
-  // When active field has a specific page number, jump to that page
-  useEffect(() => {
-    if (activeDiagnostic?.pageNumber && activeDiagnostic.pageNumber !== currentPage) {
-      setCurrentPage(activeDiagnostic.pageNumber);
-    }
-  }, [activeFieldId]);
-
-  // The parent loads the PDF from the backend API before opening the inspector.
-  useEffect(() => {
-    if (!doc.fileData) {
-      setPdfBuffer(null);
-      setRenderError('The PDF file is unavailable from the local service.');
-    } else {
-      setPdfBuffer(doc.fileData);
-      setRenderError(null);
-    }
-  }, [doc.fileData]);
-
-  // Create persistent Blob URL for direct download or local opening
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
   useEffect(() => {
     if (!pdfBuffer) {
       setBlobUrl(null);
@@ -363,16 +406,49 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     };
   }, [pdfBuffer]);
 
-  // Render PDF to Canvas with live active field highlighting and accurate document fallbackData
+  /* --------------------------- Mount tracking ---------------------------- */
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /* ----------------------------- Effects --------------------------------- */
+
+  // A batch can mix profiles, so the fields offered here must belong to the
+  // profile this document was actually extracted with.
+  useEffect(() => {
+    if (!profile.fields.some((field) => field.id === activeFieldId)) {
+      setActiveFieldId(profile.fields[0]?.id || '');
+    }
+  }, [profile.fields, activeFieldId]);
+
+  // Keep local editing state in sync when the active field or its value changes.
+  useEffect(() => {
+    setEditingValue(currentValue);
+    setIsEditing(false);
+  }, [activeFieldId, currentValue]);
+
+  // Show an error banner if the PDF isn't available.
+  useEffect(() => {
+    if (!pdfBuffer) {
+      setRenderError('The PDF file is unavailable from the local service.');
+    } else {
+      setRenderError(null);
+    }
+  }, [pdfBuffer]);
+
+  // Render PDF to canvas with cancellation so rapid zoom / page changes
+  // can't paint a stale frame over a newer one.
   useEffect(() => {
     if (!pdfBuffer || !canvasRef.current || viewMode !== 'canvas') return;
 
-    let isMounted = true;
+    const token = ++renderTokenRef.current;
     setIsRendering(true);
     setRenderError(null);
 
-    // A reviewer compares extracted values against this canvas, so a synthetic
-    // fallback page would falsely "confirm" the extraction. Fail visibly.
     renderPdfPageToCanvas(
       pdfBuffer,
       currentPage,
@@ -380,22 +456,25 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
       zoomScale,
       currentValue,
       undefined,
-      { allowFallback: false }
+      { allowFallback: false },
     )
       .then(() => {
-        if (isMounted) setIsRendering(false);
+        if (renderTokenRef.current === token) setIsRendering(false);
       })
       .catch((err) => {
-        if (isMounted) {
+        if (renderTokenRef.current === token) {
           setIsRendering(false);
-          setRenderError(err instanceof Error ? err.message : 'Unable to render PDF preview');
+          setRenderError(
+            err instanceof Error ? err.message : 'Unable to render PDF preview',
+          );
         }
       });
 
     return () => {
-      isMounted = false;
+      // Invalidate any in-flight render.
+      if (renderTokenRef.current === token) renderTokenRef.current++;
     };
-  }, [pdfBuffer, currentPage, zoomScale, viewMode, currentValue]);
+  }, [pdfBuffer, currentPage, zoomScale, viewMode]);
 
   // Lock background scroll and move focus into the dialog while it is open.
   useEffect(() => {
@@ -409,9 +488,16 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     };
   }, []);
 
-  // Keep the active field chip visible in the horizontal selector.
+  // Keep the active field chip visible inside the tablist (not the page).
   useEffect(() => {
-    activeChipRef.current?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+    const chip = activeChipRef.current;
+    const list = chip?.parentElement;
+    if (!chip || !list) return;
+    const chipRect = chip.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    if (chipRect.left < listRect.left || chipRect.right > listRect.right) {
+      chip.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
   }, [activeFieldId]);
 
   // Focus the input when editing begins.
@@ -429,21 +515,31 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     [],
   );
 
-  /* ------------------------------ Actions --------------------------------- */
+  /* ------------------------------ Actions -------------------------------- */
 
-  const showFlash = (message: string) => {
+  const showFlash = useCallback((message: string) => {
+    if (!mountedRef.current) return;
     setFlash(message);
     if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
-    flashTimerRef.current = window.setTimeout(() => setFlash(null), 2200);
-  };
+    flashTimerRef.current = window.setTimeout(() => {
+      if (mountedRef.current) setFlash(null);
+    }, FLASH_DURATION_MS);
+  }, []);
 
-  const goToField = (index: number) => {
-    const f = profile.fields[index];
-    if (f) setActiveFieldId(f.id);
-  };
+  const goToField = useCallback(
+    (index: number) => {
+      const f = profile.fields[index];
+      if (!f) return;
+      setActiveFieldId(f.id);
+      // Move to the field's page as part of the navigation action, not an effect.
+      const page = doc.diagnostics[f.id]?.pageNumber;
+      if (page && page !== currentPage) setCurrentPage(page);
+    },
+    [profile.fields, doc.diagnostics, currentPage],
+  );
 
   /** Jumps to the next field (after the current one, wrapping) that needs a look. */
-  const goToNextIssue = (): boolean => {
+  const goToNextIssue = useCallback((): boolean => {
     const n = profile.fields.length;
     for (let step = 1; step < n; step++) {
       const idx = (fieldIndex + step) % n;
@@ -453,30 +549,37 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
       }
     }
     return false;
-  };
+  }, [profile.fields.length, fieldIndex, fieldHealth, goToField]);
 
-  const commitValue = (val: string) => {
-    onUpdateFieldValue(doc.id, activeFieldId, val);
-    setEditingValue(val);
-    setIsEditing(false);
-    showFlash(`${activeField?.name ?? 'Field'} saved`);
-    if (autoAdvance) goToNextIssue();
-  };
+  const jumpToNextIssue = useCallback(() => {
+    if (!goToNextIssue()) showFlash('No other fields need attention');
+  }, [goToNextIssue, showFlash]);
 
-  const handleSaveCorrection = () => commitValue(editingValue);
-  const handleQuickAccept = (val: string) => commitValue(val);
+  const commitValue = useCallback(
+    (val: string) => {
+      onUpdateFieldValue(doc.id, activeFieldId, val);
+      setEditingValue(val);
+      setIsEditing(false);
+      showFlash(`${activeField?.name ?? 'Field'} saved`);
+      if (autoAdvance) goToNextIssue();
+    },
+    [onUpdateFieldValue, doc.id, activeFieldId, activeField?.name, showFlash, autoAdvance, goToNextIssue],
+  );
 
-  const startEditing = () => {
+  const handleSaveCorrection = useCallback(() => commitValue(editingValue), [commitValue, editingValue]);
+  const handleQuickAccept = useCallback((val: string) => commitValue(val), [commitValue]);
+
+  const startEditing = useCallback(() => {
     setEditingValue(currentValue);
     setIsEditing(true);
-  };
+  }, [currentValue]);
 
-  const cancelEditing = () => {
+  const cancelEditing = useCallback(() => {
     setIsEditing(false);
     setEditingValue(currentValue);
-  };
+  }, [currentValue]);
 
-  const handleCopy = async () => {
+  const handleCopy = useCallback(async () => {
     if (!currentValue) return;
     try {
       await navigator.clipboard.writeText(currentValue);
@@ -484,184 +587,204 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     } catch {
       showFlash('Copy is not available in this browser');
     }
-  };
+  }, [currentValue, showFlash]);
 
-  const handleRequestClose = () => {
+  const handleRequestClose = useCallback(() => {
     if (isDirty && !window.confirm('Discard your unsaved edit?')) return;
     onClose();
-  };
+  }, [isDirty, onClose]);
 
-  const totalPages = doc.pageCount || 1;
+  const handleToggleReviewed = useCallback(() => onToggleReviewed(doc.id), [onToggleReviewed, doc.id]);
 
-  /* --------------------- Source candidates (data-driven) ------------------- */
+  /* --------------------- Source candidates (data-driven) ------------------ */
 
-  const d = activeDiagnostic;
-  const sourceRows: (Omit<SourceRowProps, 'isCurrent' | 'shortcut' | 'onUse'> & { key: string })[] = d
-    ? [
-      {
-        key: 'filename',
-        title: 'Filename pattern',
-        icon: <FileType2 className="h-3.5 w-3.5" />,
-        value: d.filenameValue,
-        isSelectedSource: d.source === 'filename',
-        details: [activeField?.filenameRules.patterns[0] ? `Rule: ${activeField.filenameRules.patterns[0]}` : null],
-      },
-      ...(d.formValue
-        ? [
-          {
-            key: 'form',
-            title: 'Form field value',
-            icon: <FileInput className="h-3.5 w-3.5" />,
-            tone: 'emerald' as SourceTone,
-            value: d.formValue,
-            isSelectedSource: d.source === 'form_field',
-            details: [
-              d.formConfidenceScore !== undefined
-                ? `Evidence score: ${Math.round((d.formConfidenceScore ?? 0) * 100)}%${d.formMethod ? ` · ${d.formMethod.replace('acroform_', 'AcroForm ')}` : ''
-                }${d.formPageNumber ? ` · Page ${d.formPageNumber}` : ''}`
-                : null,
-              d.formEvidence ? `Evidence: ${d.formEvidence}` : null,
-            ],
-          },
-        ]
-        : []),
-      {
-        key: 'pdf',
-        title: 'PDF text',
-        icon: <FileSearch className="h-3.5 w-3.5" />,
-        value: d.pdfValue,
-        isSelectedSource: d.source === 'pdf_text',
+  const sourceRows = useMemo<SourceRowModel[]>(() => {
+    const d = activeDiagnostic;
+    if (!d) return [];
+    const rows: SourceRowModel[] = [];
+
+    rows.push({
+      key: 'filename',
+      title: 'Filename pattern',
+      icon: <FileType2 className="h-3.5 w-3.5" />,
+      value: d.filenameValue,
+      isSelectedSource: d.source === 'filename',
+      details: [
+        activeField?.filenameRules.patterns[0]
+          ? `Rule: ${activeField.filenameRules.patterns[0]}`
+          : null,
+      ].filter((x): x is string => x != null),
+    });
+
+    if (d.formValue) {
+      rows.push({
+        key: 'form',
+        title: 'Form field value',
+        icon: <FileInput className="h-3.5 w-3.5" />,
+        tone: 'emerald',
+        value: d.formValue,
+        isSelectedSource: d.source === 'form_field',
         details: [
-          d.candidateScores?.pdf_text !== undefined
-            ? `Evidence score: ${Math.round(d.candidateScores.pdf_text * 100)}%${d.pdfPageNumber ? ` · Page ${d.pdfPageNumber}` : ''
+          d.formConfidenceScore !== undefined
+            ? `Evidence score: ${Math.round((d.formConfidenceScore ?? 0) * 100)}%${d.formMethod ? ` · ${d.formMethod.replace('acroform_', 'AcroForm ')}` : ''
+            }${d.formPageNumber ? ` · Page ${d.formPageNumber}` : ''}`
+            : null,
+          d.formEvidence ? `Evidence: ${d.formEvidence}` : null,
+        ].filter((x): x is string => x != null),
+      });
+    }
+
+    rows.push({
+      key: 'pdf',
+      title: 'PDF text',
+      icon: <FileSearch className="h-3.5 w-3.5" />,
+      value: d.pdfValue,
+      isSelectedSource: d.source === 'pdf_text',
+      details: [
+        d.candidateScores?.pdf_text !== undefined
+          ? `Evidence score: ${Math.round(d.candidateScores.pdf_text * 100)}%${d.pdfPageNumber ? ` · Page ${d.pdfPageNumber}` : ''
+          }`
+          : null,
+        d.pdfEvidence ? `Evidence: ${d.pdfEvidence}` : null,
+        d.matchedPatternOrLabel ? `Label/Pattern: ${d.matchedPatternOrLabel}` : null,
+      ].filter((x): x is string => x != null),
+    });
+
+    if (d.ocrValue) {
+      rows.push({
+        key: 'ocr',
+        title: 'OCR candidate',
+        icon: <ScanText className="h-3.5 w-3.5" />,
+        tone: 'purple',
+        value: d.ocrValue,
+        details: [
+          d.candidateScores?.ocr !== undefined
+            ? `Evidence score: ${Math.round(d.candidateScores.ocr * 100)}%${d.ocrPageNumber ? ` · Page ${d.ocrPageNumber}` : ''
             }`
             : null,
-          d.pdfEvidence ? `Evidence: ${d.pdfEvidence}` : null,
-          d.matchedPatternOrLabel ? `Label/Pattern: ${d.matchedPatternOrLabel}` : null,
-        ],
-      },
-      ...(d.ocrValue
-        ? [
-          {
-            key: 'ocr',
-            title: 'OCR candidate',
-            icon: <ScanText className="h-3.5 w-3.5" />,
-            tone: 'purple' as SourceTone,
-            value: d.ocrValue,
-            details: [
-              d.candidateScores?.ocr !== undefined
-                ? `Evidence score: ${Math.round(d.candidateScores.ocr * 100)}%${d.ocrPageNumber ? ` · Page ${d.ocrPageNumber}` : ''
-                }`
-                : null,
-              d.ocrEvidence ? `Evidence: ${d.ocrEvidence}` : null,
-            ],
-          },
-        ]
-        : []),
-      ...(d.aiValue
-        ? [
-          {
-            key: 'ai',
-            title: 'AI candidate (Ollama)',
-            icon: <Sparkles className="h-3.5 w-3.5" />,
-            tone: 'sky' as SourceTone,
-            value: d.aiValue,
-            isSelectedSource: d.source === 'ai',
-            selectedLabel: 'Selected source · verify',
-            details: [
-              d.aiEvidence
-                ? `${d.aiSourceKind ? `Source: ${d.aiSourceKind} · ` : ''}Evidence: ${d.aiEvidence}${d.source === 'ai' && d.pageNumber ? ` (page ${d.pageNumber})` : ''
-                }`
-                : null,
-            ],
-          },
-        ]
-        : []),
-    ]
-    : [];
+          d.ocrEvidence ? `Evidence: ${d.ocrEvidence}` : null,
+        ].filter((x): x is string => x != null),
+      });
+    }
 
-  // Number only the rows that actually have a value, in display order.
-  let shortcutCounter = 0;
-  const numberedRows = sourceRows.map((row) => ({
-    ...row,
-    shortcut: row.value ? ++shortcutCounter : undefined,
-  }));
+    if (d.aiValue) {
+      rows.push({
+        key: 'ai',
+        title: 'AI candidate (Ollama)',
+        icon: <Sparkles className="h-3.5 w-3.5" />,
+        tone: 'sky',
+        value: d.aiValue,
+        isSelectedSource: d.source === 'ai',
+        selectedLabel: 'Selected source · verify',
+        details: [
+          d.aiEvidence
+            ? `${d.aiSourceKind ? `Source: ${d.aiSourceKind} · ` : ''}Evidence: ${d.aiEvidence}${d.source === 'ai' && d.pageNumber ? ` (page ${d.pageNumber})` : ''
+            }`
+            : null,
+        ].filter((x): x is string => x != null),
+      });
+    }
+
+    // Number only the rows that actually have a value, in display order.
+    let counter = 0;
+    for (const row of rows) {
+      if (row.value) row.shortcut = ++counter;
+    }
+    return rows;
+  }, [activeDiagnostic, activeField?.filenameRules]);
+
+  // Stable per-row "use this value" callbacks keyed by row id so memoized
+  // SourceRow instances don't see a new handler identity every render.
+  const handleUseByRow = useMemo<Record<string, (value: string) => void>>(() => {
+    const map: Record<string, (value: string) => void> = {};
+    for (const row of sourceRows) {
+      map[row.key] = handleQuickAccept;
+    }
+    return map;
+  }, [sourceRows, handleQuickAccept]);
 
   /* --------------------------- Keyboard shortcuts -------------------------- */
 
   // Latest-closure pattern: one stable listener always sees fresh state.
+  // The ref is updated in a layout effect (not during render) to stay
+  // StrictMode-safe.
   const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => undefined);
-  keyHandlerRef.current = (e) => {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      if (showShortcuts) setShowShortcuts(false);
-      else if (isEditing) cancelEditing();
-      else handleRequestClose();
-      return;
-    }
+  useLayoutEffect(() => {
+    keyHandlerRef.current = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-    if (isTypingTarget(e.target)) return;
-
-    const key = e.key.toLowerCase();
-
-    if (/^[1-9]$/.test(key)) {
-      const row = numberedRows.find((r) => r.shortcut === Number(key));
-      if (row?.value) {
+      if (e.key === 'Escape') {
         e.preventDefault();
-        if (row.value === currentValue) showFlash('Already using this value');
-        else handleQuickAccept(row.value);
+        if (showShortcuts) setShowShortcuts(false);
+        else if (isEditing) cancelEditing();
+        else handleRequestClose();
+        return;
       }
-      return;
-    }
 
-    switch (key) {
-      case 'j':
-        e.preventDefault();
-        if (fieldIndex < profile.fields.length - 1) goToField(fieldIndex + 1);
-        break;
-      case 'k':
-        e.preventDefault();
-        if (fieldIndex > 0) goToField(fieldIndex - 1);
-        break;
-      case 'n':
-        e.preventDefault();
-        if (!goToNextIssue()) showFlash('No other fields need attention');
-        break;
-      case 'e':
-        if (activeField) {
+      if (isTypingTarget(e.target)) return;
+
+      const key = e.key.toLowerCase();
+
+      if (/^[1-9]$/.test(key)) {
+        const row = sourceRows.find((r) => r.shortcut === Number(key));
+        if (row?.value) {
           e.preventDefault();
-          startEditing();
+          if (row.value === currentValue) showFlash('Already using this value');
+          else handleQuickAccept(row.value);
         }
-        break;
-      case 'r':
-        e.preventDefault();
-        onToggleReviewed(doc.id);
-        break;
-      case '[':
-        if (viewMode === 'canvas') setCurrentPage((p) => Math.max(1, p - 1));
-        break;
-      case ']':
-        if (viewMode === 'canvas') setCurrentPage((p) => Math.min(totalPages, p + 1));
-        break;
-      case '+':
-      case '=':
-        if (viewMode === 'canvas') setZoomScale((z) => Math.min(2.5, z + 0.2));
-        break;
-      case '-':
-        if (viewMode === 'canvas') setZoomScale((z) => Math.max(0.6, z - 0.2));
-        break;
-      case '0':
-        if (viewMode === 'canvas') setZoomScale(1.2);
-        break;
-      case '?':
-        setShowShortcuts((s) => !s);
-        break;
-      default:
-        break;
-    }
-  };
+        return;
+      }
+
+      switch (key) {
+        case 'j':
+          e.preventDefault();
+          if (fieldIndex < profile.fields.length - 1) goToField(fieldIndex + 1);
+          break;
+        case 'k':
+          e.preventDefault();
+          if (fieldIndex > 0) goToField(fieldIndex - 1);
+          break;
+        case 'n':
+          e.preventDefault();
+          jumpToNextIssue();
+          break;
+        case 'e':
+          if (activeField) {
+            e.preventDefault();
+            startEditing();
+          }
+          break;
+        case 'r':
+          e.preventDefault();
+          handleToggleReviewed();
+          break;
+        case '[':
+          if (viewMode === 'canvas') setCurrentPage((p) => Math.max(1, p - 1));
+          break;
+        case ']':
+          if (viewMode === 'canvas') setCurrentPage((p) => Math.min(totalPages, p + 1));
+          break;
+        case '+':
+        case '=':
+          if (viewMode === 'canvas')
+            setZoomScale((z) => Math.min(ZOOM_MAX, z + ZOOM_STEP));
+          break;
+        case '-':
+          if (viewMode === 'canvas')
+            setZoomScale((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP));
+          break;
+        case '0':
+          if (viewMode === 'canvas') setZoomScale(ZOOM_DEFAULT);
+          break;
+        case '?':
+          setShowShortcuts((s) => !s);
+          break;
+        default:
+          break;
+      }
+    };
+  }); // no dep array → fresh every render
 
   useEffect(() => {
     const listener = (e: KeyboardEvent) => keyHandlerRef.current(e);
@@ -679,7 +802,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/60 p-2 backdrop-blur-xs sm:p-4"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) handleRequestClose();
+        if (e.target === e.currentTarget && !isEditing) handleRequestClose();
       }}
     >
       <div
@@ -690,6 +813,11 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
         tabIndex={-1}
         className="relative flex h-[96vh] w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-2xl outline-hidden animate-in fade-in zoom-in-98 duration-150 sm:h-[92vh]"
       >
+        {/* Persistent live region for flash messages (works with screen readers). */}
+        <div role="status" aria-live="polite" className="sr-only">
+          {flash ?? ''}
+        </div>
+
         {/* ---------------------------- Top bar ---------------------------- */}
         <div className="flex shrink-0 items-center justify-between gap-4 border-b border-neutral-200 bg-neutral-50/70 px-4 py-3 sm:px-6">
           <div className="flex min-w-0 items-center gap-3">
@@ -698,7 +826,10 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
             </div>
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <h3 id="inspector-title" className="max-w-lg truncate text-sm font-semibold text-neutral-900">
+                <h3
+                  id="inspector-title"
+                  className="max-w-lg truncate text-sm font-semibold text-neutral-900"
+                >
                   {doc.filename}
                 </h3>
                 {doc.isReviewed ? (
@@ -713,7 +844,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                 {attentionCount > 0 ? (
                   <button
                     type="button"
-                    onClick={goToNextIssue}
+                    onClick={jumpToNextIssue}
                     className="flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900 transition-colors hover:bg-amber-100"
                     title="Jump to the next field that needs attention (N)"
                   >
@@ -729,18 +860,23 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
               </div>
               <div className="mt-0.5 flex flex-wrap items-center gap-2">
                 <p className="truncate font-mono text-xs text-neutral-500" title={doc.relativePath}>
-                  {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount} page(s) · Method:{' '}
-                  {doc.extractionMethodUsed}
+                  {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB · {doc.pageCount}{' '}
+                  page(s) · Method: {doc.extractionMethodUsed}
                 </p>
                 <span
                   className="inline-flex items-center gap-1 rounded border border-neutral-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-neutral-700"
-                  title={doc.assignmentRule || doc.assignmentReason || 'Extraction Profile used for this document'}
+                  title={
+                    doc.assignmentRule ||
+                    doc.assignmentReason ||
+                    'Extraction Profile used for this document'
+                  }
                 >
                   <LayoutTemplate className="h-3 w-3" />
-                  {doc.profileName || (doc.profileId ? profile.name : 'No profile assigned')}
+                  {doc.profileName || profile.name || 'No profile assigned'}
                 </span>
                 <span
-                  className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${ASSIGNMENT_BADGE_STYLES[doc.assignmentStatus]}`}
+                  className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${ASSIGNMENT_BADGE_STYLES[doc.assignmentStatus]
+                    }`}
                   title={doc.assignmentReason || undefined}
                 >
                   {doc.assignmentStatus === 'excluded' && <Ban className="h-3 w-3" />}
@@ -753,7 +889,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
           <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
-              onClick={() => onToggleReviewed(doc.id)}
+              onClick={handleToggleReviewed}
               className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 ${doc.isReviewed
                 ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
                 : 'bg-emerald-600 text-white hover:bg-emerald-700'
@@ -806,7 +942,10 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
             </div>
             <ul className="space-y-1.5">
               {SHORTCUTS.map((s) => (
-                <li key={s.label} className="flex items-center justify-between gap-3 text-xs text-neutral-600">
+                <li
+                  key={s.label}
+                  className="flex items-center justify-between gap-3 text-xs text-neutral-600"
+                >
                   <span>{s.label}</span>
                   <span className="flex shrink-0 gap-1">
                     {s.keys.map((k) => (
@@ -895,7 +1034,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => setZoomScale((z) => Math.max(0.6, z - 0.2))}
+                    onClick={() => setZoomScale((z) => Math.max(ZOOM_MIN, z - ZOOM_STEP))}
                     className="rounded p-1 hover:bg-neutral-100"
                     title="Zoom out ( − )"
                     aria-label="Zoom out"
@@ -907,7 +1046,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   </span>
                   <button
                     type="button"
-                    onClick={() => setZoomScale((z) => Math.min(2.5, z + 0.2))}
+                    onClick={() => setZoomScale((z) => Math.min(ZOOM_MAX, z + ZOOM_STEP))}
                     className="rounded p-1 hover:bg-neutral-100"
                     title="Zoom in ( + )"
                     aria-label="Zoom in"
@@ -916,7 +1055,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setZoomScale(1.2)}
+                    onClick={() => setZoomScale(ZOOM_DEFAULT)}
                     className="ml-0.5 rounded p-1 text-neutral-500 hover:bg-neutral-100"
                     title="Reset zoom ( 0 )"
                     aria-label="Reset zoom"
@@ -937,7 +1076,9 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                       className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-neutral-200 bg-white/95 px-3 py-1.5 shadow-md"
                     >
                       <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-900 border-t-transparent motion-reduce:animate-none" />
-                      <span className="text-xs font-medium text-neutral-700">Rendering page {currentPage}…</span>
+                      <span className="text-xs font-medium text-neutral-700">
+                        Rendering page {currentPage}…
+                      </span>
                     </div>
                   )}
 
@@ -945,7 +1086,9 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                     <div className="my-auto max-w-md space-y-4 rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-md">
                       <AlertCircle className="mx-auto h-8 w-8 text-rose-500" />
                       <div className="space-y-1">
-                        <p className="text-sm font-semibold text-neutral-900">Can’t show the PDF preview</p>
+                        <p className="text-sm font-semibold text-neutral-900">
+                          Can’t show the PDF preview
+                        </p>
                         <p className="text-xs leading-relaxed text-neutral-600">{renderError}</p>
                       </div>
                       <div className="flex items-center justify-center gap-2 pt-2">
@@ -985,7 +1128,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                       {doc.filename.replace(/\.pdf$/i, '').replace(/[-_]/g, ' ')}
                     </h2>
                     <p className="font-mono text-[11px] text-neutral-500">
-                      Relative Archive Path: {doc.relativePath} · {Math.round(doc.fileSizeBytes / 1024)} KB
+                      Relative Archive Path: {doc.relativePath} ·{' '}
+                      {Math.round(doc.fileSizeBytes / 1024)} KB
                     </p>
                   </div>
 
@@ -1018,11 +1162,17 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                               {field.label || field.name}
                             </span>
                             {isSelected && (
-                              <span className="text-[10px] font-bold uppercase text-neutral-900">Selected</span>
+                              <span className="text-[10px] font-bold uppercase text-neutral-900">
+                                Selected
+                              </span>
                             )}
                           </div>
                           <div className="mt-1 break-words font-mono text-sm font-bold text-neutral-900">
-                            {val || <span className="font-normal italic text-neutral-400">Not specified</span>}
+                            {val || (
+                              <span className="font-normal italic text-neutral-400">
+                                Not specified
+                              </span>
+                            )}
                           </div>
                         </button>
                       );
@@ -1062,9 +1212,7 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                 </span>
                 <button
                   type="button"
-                  onClick={() => {
-                    if (!goToNextIssue()) showFlash('No other fields need attention');
-                  }}
+                  onClick={jumpToNextIssue}
                   disabled={attentionCount === 0}
                   className="flex items-center gap-1.5 rounded-md border border-neutral-200 bg-white px-2 py-1 text-[11px] font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
                   title="Jump to the next field that needs attention (N)"
@@ -1101,7 +1249,10 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                       />
                       <span>{field.name}</span>
                       {field.required && (
-                        <span className={isActive ? 'text-white/60' : 'text-rose-500'} title="Required">
+                        <span
+                          className={isActive ? 'text-white/60' : 'text-rose-500'}
+                          title="Required"
+                        >
                           *
                         </span>
                       )}
@@ -1129,8 +1280,8 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   className="rounded-lg border border-neutral-300 bg-neutral-100 px-4 py-3 text-xs text-neutral-700"
                 >
                   <span className="font-semibold">Excluded from processing: </span>
-                  This document was intentionally skipped, so no fields were extracted for {profile.name}.{' '}
-                  {doc.assignmentReason}
+                  This document was intentionally skipped, so no fields were extracted for{' '}
+                  {profile.name}. {doc.assignmentReason}
                 </div>
               )}
               {doc.errorDetails && doc.processingStatus !== 'skipped_unassigned' && (
@@ -1205,7 +1356,11 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                     ) : (
                       <div className="flex items-start justify-between gap-2">
                         <span className="break-words font-mono text-lg font-semibold leading-snug text-neutral-900">
-                          {currentValue || <span className="text-sm font-normal italic text-neutral-400">No value yet</span>}
+                          {currentValue || (
+                            <span className="text-sm font-normal italic text-neutral-400">
+                              No value yet
+                            </span>
+                          )}
                         </span>
                         <div className="flex shrink-0 items-center gap-0.5">
                           <button
@@ -1235,7 +1390,9 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                     {/* Status & explanation */}
                     <div className="space-y-1.5 border-t border-neutral-200/80 pt-3">
                       <div className="flex flex-wrap items-center gap-2 text-xs">
-                        <span className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold ${statusBadgeClass}`}>
+                        <span
+                          className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold ${statusBadgeClass}`}
+                        >
                           {activeDiagnostic.status}
                         </span>
                         {activeDiagnostic.confidenceScore !== undefined && (
@@ -1244,7 +1401,9 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                           </span>
                         )}
                         <span
-                          className={`ml-auto flex items-center gap-1 text-[11px] font-semibold ${activeDiagnostic.validationPassed ? 'text-emerald-700' : 'text-rose-700'
+                          className={`ml-auto flex items-center gap-1 text-[11px] font-semibold ${activeDiagnostic.validationPassed
+                            ? 'text-emerald-700'
+                            : 'text-rose-700'
                             }`}
                         >
                           {activeDiagnostic.validationPassed ? (
@@ -1253,12 +1412,15 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                             </>
                           ) : (
                             <>
-                              <AlertCircle className="h-3 w-3" /> {activeDiagnostic.validationError || 'Validation failed'}
+                              <AlertCircle className="h-3 w-3" />{' '}
+                              {activeDiagnostic.validationError || 'Validation failed'}
                             </>
                           )}
                         </span>
                       </div>
-                      <p className="text-xs leading-relaxed text-neutral-600">{activeDiagnostic.explanation}</p>
+                      <p className="text-xs leading-relaxed text-neutral-600">
+                        {activeDiagnostic.explanation}
+                      </p>
                       {activeDiagnostic.selectionReason && (
                         <p className="text-[11px] leading-relaxed text-neutral-500">
                           Why this value: {activeDiagnostic.selectionReason}
@@ -1271,15 +1433,25 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                   <section aria-label="Extraction sources" className="space-y-2">
                     <div className="flex items-baseline justify-between">
                       <h4 className="text-xs font-semibold text-neutral-700">Compare sources</h4>
-                      <span className="text-[11px] text-neutral-400">Pick the value that matches the PDF</span>
+                      <span className="text-[11px] text-neutral-400">
+                        Pick the value that matches the PDF
+                      </span>
                     </div>
                     <div className="overflow-hidden rounded-lg border border-neutral-200 text-xs">
-                      {numberedRows.map(({ key, ...row }) => (
+                      {sourceRows.map((row) => (
                         <SourceRow
-                          key={key}
-                          {...row}
+                          key={row.key}
+                          id={row.key}
+                          title={row.title}
+                          icon={row.icon}
+                          tone={row.tone}
+                          value={row.value}
+                          isSelectedSource={row.isSelectedSource}
+                          selectedLabel={row.selectedLabel}
+                          details={row.details}
+                          shortcut={row.shortcut}
                           isCurrent={Boolean(row.value) && row.value === currentValue}
-                          onUse={() => row.value && handleQuickAccept(row.value)}
+                          onUse={handleUseByRow[row.key]}
                         />
                       ))}
                     </div>
@@ -1302,7 +1474,9 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                     <div className="grid grid-cols-2 gap-3 text-xs text-neutral-600">
                       <div>
                         <span className="block text-[11px] text-neutral-400">Priority</span>
-                        <span className="font-medium text-neutral-800">{activeField.priority.replace('_', ' ')}</span>
+                        <span className="font-medium text-neutral-800">
+                          {activeField.priority.replace('_', ' ')}
+                        </span>
                       </div>
                       <div>
                         <span className="block text-[11px] text-neutral-400">Normalization</span>
@@ -1343,14 +1517,17 @@ export const DocumentInspectorModal: React.FC<DocumentInspectorModalProps> = ({
                           >
                             <div className="min-w-0 space-y-0.5">
                               <span className="font-medium text-neutral-800">
-                                {profile.fields.find((f) => f.id === item.fieldId)?.name || item.fieldId}
+                                {profile.fields.find((f) => f.id === item.fieldId)?.name ||
+                                  item.fieldId}
                               </span>
                               <div className="flex items-center gap-1.5 font-mono text-[11px] text-neutral-600">
                                 <span className="break-all text-neutral-400 line-through">
                                   {item.previousValue || '(empty)'}
                                 </span>
                                 <ArrowRight className="h-3 w-3 shrink-0 text-neutral-400" />
-                                <span className="break-all font-semibold text-neutral-900">{item.newValue}</span>
+                                <span className="break-all font-semibold text-neutral-900">
+                                  {item.newValue}
+                                </span>
                               </div>
                             </div>
                             <span className="ml-2 shrink-0 font-mono text-[10px] text-neutral-400">
