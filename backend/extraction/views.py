@@ -12,7 +12,7 @@ from django.http import FileResponse, Http404, StreamingHttpResponse
 from django.utils import timezone
 from django.conf import settings
 from rest_framework import serializers, status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ParseError, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -49,6 +49,61 @@ from .services.ollama import test_ollama_connection
 from .services.form_layout import analyze_blank_form, validate_profile_config
 from .services.zip_processing import discover_pdf_files
 from .services.document_assignment import classify_document_assignment
+
+# Multipart envelope overhead (boundary markers, part headers, field names) is
+# a few hundred bytes. Allow 1 MiB of slack so a body exactly at the configured
+# archive cap is not rejected for its headers alone.
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+
+
+def _oversized_body_response(request):
+    """Return a 413 response when the declared body exceeds the archive cap.
+
+    DRF parses the multipart body lazily, so the first access to
+    ``request.FILES`` streams the entire payload off the socket. A size check
+    after that point has already paid for the whole transfer, which is how a
+    large upload used to hold a request handler until gunicorn's master aborted
+    it. Reading ``CONTENT_LENGTH`` is free and lets the client fail fast.
+
+    Returns None when the body is acceptable or its length is unknown.
+    """
+    try:
+        declared_bytes = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        return None
+    if declared_bytes <= settings.MAX_UPLOAD_SIZE_BYTES + MULTIPART_OVERHEAD_BYTES:
+        return None
+    return Response(
+        {
+            "detail": (
+                "The uploaded archive exceeds the configured size limit of "
+                f"{settings.MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB."
+            )
+        },
+        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+    )
+
+
+def _parse_upload(request):
+    """Return ``(upload, error_response)`` for the request's ``file`` field.
+
+    A truncated or reset body (client disconnect, tunnel reset) makes DRF's
+    MultiPartParser wrap the read error in ParseError. DRF would answer 400 on
+    its own, but its message embeds the internal exception text; a stable
+    message keeps the client contract clean and the logs quiet.
+    """
+    try:
+        return request.FILES.get("file"), None
+    except ParseError:
+        return None, Response(
+            {
+                "detail": (
+                    "The upload was interrupted before it completed. "
+                    "Please retry the archive."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
 
 @method_decorator(ensure_csrf_cookie, name="dispatch")
@@ -286,7 +341,13 @@ class JobListCreateView(APIView):
         responses={202: ProcessingJobResponseSerializer},
     )
     def post(self, request):
-        upload = request.FILES.get("file")
+        # Reject before the body is streamed: see _oversized_body_response.
+        oversized = _oversized_body_response(request)
+        if oversized is not None:
+            return oversized
+        upload, parse_error = _parse_upload(request)
+        if parse_error is not None:
+            return parse_error
         profile_id = request.data.get("profileId")
         if upload is None:
             return Response({"file": ["This field is required."]}, status=400)
@@ -389,7 +450,13 @@ class JobArchiveAppendView(APIView):
         },
     )
     def post(self, request, job_id):
-        upload = request.FILES.get("file")
+        # Reject before the body is streamed: see _oversized_body_response.
+        oversized = _oversized_body_response(request)
+        if oversized is not None:
+            return oversized
+        upload, parse_error = _parse_upload(request)
+        if parse_error is not None:
+            return parse_error
         if upload is None:
             return Response({"file": ["This field is required."]}, status=400)
         try:
@@ -1035,7 +1102,8 @@ class DocumentDetailView(APIView):
                     "assignment_reason",
                 ])
                 if requeued_for_assignment:
-                    update_fields.extend(["processing_status", "error_details"])
+                    update_fields.extend(
+                        ["processing_status", "error_details"])
 
             if "assignmentStatus" in validated:
                 document.assignment_status = validated["assignmentStatus"]

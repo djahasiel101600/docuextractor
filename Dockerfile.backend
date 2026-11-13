@@ -47,6 +47,11 @@ ENV DJANGO_SETTINGS_MODULE=config.settings \
 
 EXPOSE 8000
 
-# Serve over the internal Docker network only. Gunicorn worker count is tuned
-# via GUNICORN_WORKERS in .env. Timeouts are generous for large PDF work.
-CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers ${GUNICORN_WORKERS:-3} --timeout 120 --access-logfile - --error-logfile -"]
+# Serve over the internal Docker network only. Worker count, thread pool and
+# timeouts are tuned via GUNICORN_* in .env. gthread (not sync) is required: a
+# sync worker stops heartbeating while it is blocked reading an upload body, so
+# a slow multi-hundred-MB POST looked like a wedged worker and the master
+# SIGABRT'd it (WORKER TIMEOUT). `sh -c` exists only for ${VAR:-default}
+# expansion; `exec` keeps gunicorn as PID 1 so `docker stop`'s SIGTERM reaches
+# the master instead of the shell that would swallow it.
+CMD ["sh", "-c", "exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --worker-class gthread --workers ${GUNICORN_WORKERS:-3} --threads ${GUNICORN_THREADS:-4} --timeout ${GUNICORN_TIMEOUT:-180} --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT:-30} --keep-alive ${GUNICORN_KEEPALIVE:-5} --max-requests ${GUNICORN_MAX_REQUESTS:-800} --max-requests-jitter ${GUNICORN_MAX_REQUESTS_JITTER:-100} --access-logfile - --error-logfile - --log-level info"]

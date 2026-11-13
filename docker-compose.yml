@@ -58,11 +58,21 @@ services:
     # block scalar (command: >) would turn these indented continuation lines into
     # literal newlines, dropping the gunicorn flags after `exec` and leaving it
     # bound to 127.0.0.1 (nginx would then 502). $$ escapes compose interpolation
-    # so the container shell reads GUNICORN_WORKERS from env_file at runtime.
+    # so the container shell reads GUNICORN_* from env_file at runtime.
+    #
+    # gthread + a real timeout backstop: a sync worker cannot answer requests
+    # while it is reading an upload body, so a large ZIP upload tripped WORKER
+    # TIMEOUT and got SIGABRT'd mid-parse. Keep this list identical to the
+    # Dockerfile CMD - this command is what actually runs.
     command:
       - sh
       - -c
-      - python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${GUNICORN_WORKERS:-3} --timeout 120 --access-logfile - --error-logfile -
+      - python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --worker-class gthread --workers $${GUNICORN_WORKERS:-3} --threads $${GUNICORN_THREADS:-4} --timeout $${GUNICORN_TIMEOUT:-180} --graceful-timeout $${GUNICORN_GRACEFUL_TIMEOUT:-30} --keep-alive $${GUNICORN_KEEPALIVE:-5} --max-requests $${GUNICORN_MAX_REQUESTS:-800} --max-requests-jitter $${GUNICORN_MAX_REQUESTS_JITTER:-100} --access-logfile - --error-logfile - --log-level info
+    # Spool incoming uploads onto the mounted storage volume. Without this a
+    # 500 MB ZIP temp file lands in the container's writable layer. Set here
+    # rather than in .env so local development keeps Django's default temp dir.
+    environment:
+      FILE_UPLOAD_TEMP_DIR: /app/storage/tmp
     healthcheck:
       # /api/ is the app's health endpoint: 200 when the DB is reachable, 503 otherwise.
       test: [ "CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/api/', timeout=5)" ]

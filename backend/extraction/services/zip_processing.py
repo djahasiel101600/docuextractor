@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import PurePosixPath
 import zipfile
 
@@ -34,7 +33,11 @@ def discover_pdf_files(upload) -> list[PdfEntry]:
         raise ValidationError("Upload a ZIP archive containing PDF files.")
 
     try:
-        archive = zipfile.ZipFile(BytesIO(upload.read()))
+        # Read from the upload's own spooled file instead of materialising the
+        # whole archive in memory (upload.read() copied a 500 MB ZIP into RAM
+        # inside a worker that is already holding PDF buffers). ZipFile seeks
+        # as needed, so only the member being read is buffered.
+        archive = zipfile.ZipFile(upload)
     except (OSError, zipfile.BadZipFile) as exc:
         raise ValidationError("The uploaded file is not a valid ZIP archive.") from exc
 

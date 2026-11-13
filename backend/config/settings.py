@@ -225,6 +225,43 @@ MAX_ARCHIVE_FILES = int(os.getenv("MAX_ARCHIVE_FILES", "1500"))
 # that a multi-archive batch cannot silently exceed.
 MAX_JOB_DOCUMENTS = int(os.getenv("MAX_JOB_DOCUMENTS", "2000"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
+
+# --- Upload spooling and request-body limits --------------------------------
+# DATA_UPLOAD_MAX_MEMORY_SIZE caps the NON-file portion of a request (form
+# fields, JSON). Django deliberately excludes uploaded file data from this
+# check, so it CANNOT reject an oversized ZIP; its only job here is stopping a
+# request whose form fields alone are huge. Exceeding it raises
+# RequestDataTooBig, which Django renders as 400 - not a dead worker.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.getenv("DATA_UPLOAD_MAX_MEMORY_MB", "4")) * 1024 * 1024
+DATA_UPLOAD_MAX_NUMBER_FIELDS = int(
+    os.getenv("DATA_UPLOAD_MAX_NUMBER_FIELDS", "200"))
+# One upload field per endpoint (``file``); the Django default of 100 lets a
+# multipart body carry a hundred parts before anything notices.
+DATA_UPLOAD_MAX_NUMBER_FILES = int(
+    os.getenv("DATA_UPLOAD_MAX_NUMBER_FILES", "5"))
+
+# Threshold above which an upload is spooled to a temp file instead of RAM.
+# When a request's CONTENT_LENGTH exceeds this value Django skips its in-memory
+# handler entirely and every file in the request becomes a
+# TemporaryUploadedFile, which is what we want for a 500 MB ZIP. Never raise
+# this toward MAX_UPLOAD_SIZE_BYTES: the whole body would be held in memory.
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.getenv("FILE_UPLOAD_MAX_MEMORY_MB", "2")) * 1024 * 1024
+
+# Spool uploads onto the storage volume rather than the container's writable
+# layer, where a 500 MB temp file can exhaust the image's disk. Only honoured
+# when the environment provides it (docker-compose does), so local development
+# keeps Django's default temp directory.
+_upload_temp_dir = os.getenv("FILE_UPLOAD_TEMP_DIR", "").strip()
+if _upload_temp_dir:
+    try:
+        os.makedirs(_upload_temp_dir, exist_ok=True)
+    except OSError:
+        _upload_temp_dir = ""
+if _upload_temp_dir:
+    FILE_UPLOAD_TEMP_DIR = _upload_temp_dir
+
 PDF_PROCESSING_WORKERS = max(
     1,
     min(
