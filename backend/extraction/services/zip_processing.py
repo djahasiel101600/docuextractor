@@ -28,7 +28,8 @@ def _safe_member_path(raw_path: str) -> str:
 
 def discover_pdf_files(upload) -> list[PdfEntry]:
     if upload.size > settings.MAX_UPLOAD_SIZE_BYTES:
-        raise ValidationError("The uploaded archive exceeds the configured size limit.")
+        raise ValidationError(
+            "The uploaded archive exceeds the configured size limit.")
     if not upload.name.lower().endswith(".zip"):
         raise ValidationError("Upload a ZIP archive containing PDF files.")
 
@@ -39,14 +40,17 @@ def discover_pdf_files(upload) -> list[PdfEntry]:
         # as needed, so only the member being read is buffered.
         archive = zipfile.ZipFile(upload)
     except (OSError, zipfile.BadZipFile) as exc:
-        raise ValidationError("The uploaded file is not a valid ZIP archive.") from exc
+        raise ValidationError(
+            "The uploaded file is not a valid ZIP archive.") from exc
 
     with archive:
         entries = [item for item in archive.infolist() if not item.is_dir()]
         if len(entries) > settings.MAX_ARCHIVE_FILES:
-            raise ValidationError("The archive contains more files than allowed.")
+            raise ValidationError(
+                "The archive contains more files than allowed.")
         if sum(item.file_size for item in entries) > settings.MAX_ARCHIVE_UNCOMPRESSED_BYTES:
-            raise ValidationError("The uncompressed archive exceeds the configured size limit.")
+            raise ValidationError(
+                "The uncompressed archive exceeds the configured size limit.")
 
         pdfs = []
         for item in entries:
@@ -57,17 +61,21 @@ def discover_pdf_files(upload) -> list[PdfEntry]:
             if path.suffix.lower() != ".pdf":
                 continue
             if item.file_size > settings.MAX_UPLOAD_SIZE_BYTES:
-                raise ValidationError(f"{path.name} exceeds the per-file size limit.")
+                raise ValidationError(
+                    f"{path.name} exceeds the per-file size limit.")
             if item.file_size / max(item.compress_size, 1) > 1000:
-                raise ValidationError(f"{path.name} has an unsafe compression ratio.")
+                raise ValidationError(
+                    f"{path.name} has an unsafe compression ratio.")
             try:
                 content = archive.read(item)
             except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
-                raise ValidationError(f"Could not read {path.name} from the archive.") from exc
+                raise ValidationError(
+                    f"Could not read {path.name} from the archive.") from exc
             if not content.startswith(b"%PDF-"):
                 raise ValidationError(f"{path.name} is not a valid PDF file.")
             pdfs.append(PdfEntry(path.name, safe_path, content))
 
     if not pdfs:
-        raise ValidationError("The archive does not contain any valid PDF files.")
+        raise ValidationError(
+            "The archive does not contain any valid PDF files.")
     return pdfs
