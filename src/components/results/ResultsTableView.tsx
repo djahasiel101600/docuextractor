@@ -753,8 +753,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
       icon = (
         <span
           className={`inline-block h-3.5 w-3.5 rounded-full border-2 ${doc.processingStatus === 'processing'
-              ? 'animate-spin border-neutral-300 border-t-neutral-700 motion-reduce:animate-none'
-              : 'border-neutral-200'
+            ? 'animate-spin border-neutral-300 border-t-neutral-700 motion-reduce:animate-none'
+            : 'border-neutral-200'
             }`}
         />
       );
@@ -767,12 +767,12 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
     } else if (doc.errorDetails) {
       title = `Processing warning: ${doc.errorDetails}`;
       icon = <AlertTriangle className="h-4 w-4 text-amber-600" />;
-    } else if (hasInvalid) {
-      title = `Invalid values hidden from export:\n${invalidTooltip}`;
-      icon = <AlertCircle className="h-4 w-4 text-rose-600" />;
     } else if (doc.isReviewed) {
       title = 'Reviewed and verified';
       icon = <CheckCircle2 className="h-4 w-4 text-emerald-600" />;
+    } else if (hasInvalid) {
+      title = `Invalid values hidden from export:\n${invalidTooltip}`;
+      icon = <AlertCircle className="h-4 w-4 text-rose-600" />;
     } else if (hasConflict) {
       title = 'Conflict detected between filename and PDF';
       icon = <AlertTriangle className="h-4 w-4 text-amber-500" />;
@@ -1101,8 +1101,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                   key={tab.id}
                   onClick={() => setActiveFilter(tab.id)}
                   className={`flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 transition-colors ${isActive
-                      ? 'bg-white font-semibold text-neutral-900 shadow-xs'
-                      : 'text-neutral-600 hover:text-neutral-900'
+                    ? 'bg-white font-semibold text-neutral-900 shadow-xs'
+                    : 'text-neutral-600 hover:text-neutral-900'
                     }`}
                 >
                   {tab.label}
@@ -1462,14 +1462,14 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                               {val ? (
                                 <span
                                   className={`font-mono text-xs ${!fieldAppliesToDoc
-                                      ? 'text-neutral-500 opacity-60'
-                                      : isConflictCell
-                                        ? 'rounded bg-amber-50 px-1.5 py-0.5 font-semibold text-amber-800'
-                                        : isInvalidCell
-                                          ? 'rounded bg-rose-50 px-1.5 py-0.5 font-semibold text-rose-800'
-                                          : isCorrected
-                                            ? 'font-medium text-blue-800'
-                                            : 'text-neutral-800'
+                                    ? 'text-neutral-500 opacity-60'
+                                    : isConflictCell
+                                      ? 'rounded bg-amber-50 px-1.5 py-0.5 font-semibold text-amber-800'
+                                      : isInvalidCell
+                                        ? 'rounded bg-rose-50 px-1.5 py-0.5 font-semibold text-rose-800'
+                                        : isCorrected
+                                          ? 'font-medium text-blue-800'
+                                          : 'text-neutral-800'
                                     }`}
                                   title={
                                     isInvalidCell
@@ -1482,10 +1482,10 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                               ) : (
                                 <span
                                   className={`text-[11px] italic ${!fieldAppliesToDoc
-                                      ? 'text-neutral-400'
-                                      : field.required
-                                        ? 'font-medium text-rose-500'
-                                        : 'text-neutral-400'
+                                    ? 'text-neutral-400'
+                                    : field.required
+                                      ? 'font-medium text-rose-500'
+                                      : 'text-neutral-400'
                                     }`}
                                   title={
                                     !fieldAppliesToDoc
@@ -1563,8 +1563,8 @@ export const ResultsTableView: React.FC<ResultsTableViewProps> = ({
                             aria-pressed={doc.isReviewed}
                             aria-label={doc.isReviewed ? 'Mark unreviewed' : 'Mark reviewed'}
                             className={`rounded p-1.5 transition-colors ${doc.isReviewed
-                                ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                                : 'text-neutral-400 hover:bg-neutral-100 hover:text-neutral-900'
+                              ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                              : 'text-neutral-400 hover:bg-neutral-100 hover:text-neutral-900'
                               }`}
                             title={doc.isReviewed ? 'Mark unreviewed (R)' : 'Mark reviewed (R)'}
                           >
